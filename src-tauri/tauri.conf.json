@@ -1,0 +1,12 @@
+{
+  "productName": "Semantic Reader",
+  "version": "0.20.4",
+  "identifier": "local.semanticreader.desktop",
+  "build": {"frontendDist": "../dist"},
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{"title":"Semantic Reader","width":1280,"height":850,"minWidth":850,"minHeight":600}],
+    "security": {"csp":"default-src 'self'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; object-src 'none'; base-uri 'none'"}
+  },
+  "bundle": {"active":false,"icon":["icons/icon.png","icons/icon.icns"]}
+}
