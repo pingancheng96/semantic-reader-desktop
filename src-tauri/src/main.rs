@@ -16,14 +16,8 @@ use tauri::{Manager, State};
 struct Database(PathBuf);
 
 #[tauri::command]
-async fn request(
-    state: State<'_, Database>,
-    credentials: State<'_, ai::Credentials>,
-    op: String,
-    payload: Value,
-) -> Result<Value> {
+async fn request(state: State<'_, Database>, op: String, payload: Value) -> Result<Value> {
     let path = state.0.clone();
-    let credentials = credentials.inner().clone();
     match op.as_str() {
         "dictionary_lookup" | "dictionary_status" => {
             tauri::async_runtime::spawn_blocking(move || {
@@ -48,7 +42,7 @@ async fn request(
                 )?;
                 let needs_ai = !dictionary::has_pronunciation(&local);
                 let key = if needs_ai {
-                    credentials.for_request(&params)?
+                    ai::request_key(&source_path, &params)?
                 } else {
                     None
                 };
@@ -113,7 +107,7 @@ async fn request(
             let (local, key) = tauri::async_runtime::spawn_blocking(move || {
                 let db = Db::open(&read_path)?;
                 let local = db.snapshot(|| store::candidates(&db, &params))?;
-                let key = credentials.for_request(&params)?;
+                let key = ai::request_key(&read_path, &params)?;
                 Ok::<_, String>((local, key))
             })
             .await
@@ -135,11 +129,13 @@ async fn request(
             }
             Ok(response)
         }
-        "key_status" => tauri::async_runtime::spawn_blocking(move || ai::key_status(&payload))
-            .await
-            .map_err(|_| "无法检查密钥状态")?,
+        "key_status" => {
+            tauri::async_runtime::spawn_blocking(move || ai::key_status(&path, &payload))
+                .await
+                .map_err(|_| "无法检查密钥状态")?
+        }
         "key_save" | "key_remove" => tauri::async_runtime::spawn_blocking(move || {
-            ai::key_action(&credentials, &payload, op == "key_remove")
+            ai::key_action(&path, &payload, op == "key_remove")
         })
         .await
         .map_err(|_| "密钥操作失败")?,
@@ -273,7 +269,6 @@ async fn export_file(
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(ai::Credentials::default())
         .setup(|app| {
             let directory = match std::env::var_os("SEMANTIC_READER_DATA_DIR") {
                 Some(path) => PathBuf::from(path),
@@ -316,7 +311,6 @@ mod tests {
         store::init(&Db::open(&path).unwrap()).unwrap();
         let app = test::mock_builder()
             .manage(Database(path.clone()))
-            .manage(ai::Credentials::default())
             .invoke_handler(tauri::generate_handler![request])
             .build(test::mock_context(test::noop_assets()))
             .unwrap();

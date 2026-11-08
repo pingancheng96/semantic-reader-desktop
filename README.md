@@ -1,4 +1,4 @@
-# Semantic Reader 0.20.4
+# Semantic Reader 0.20.7
 
 本地优先的英语阅读与语义词汇库。应用由 Tauri 2、React、TypeScript 和 SQLite 组成。AI 可选，阅读、查找、收录和语义库维护都可以离线使用。
 
@@ -38,11 +38,11 @@ npm start
 
 ## 配置 AI
 
-在「设置」里填入服务商提供的完整 OpenAI-compatible `/chat/completions` 地址和模型名，然后保存。远程地址使用 HTTPS，本机回环地址可使用 HTTP。macOS 的 API Key 通过系统钥匙串保存，并与完整 API 地址绑定。也支持从进程环境读取 `SEMANTIC_READER_AI_KEY`，同时必须设置与界面配置完全对应的 `SEMANTIC_READER_AI_ENDPOINT`。无密钥的本机回环服务可直接使用。
+在「设置」里填入服务商提供的完整 OpenAI-compatible `/chat/completions` 地址和模型名，然后保存。远程地址使用 HTTPS，本机回环地址可使用 HTTP。Windows 和 macOS 都可在应用内保存 API Key。密钥保存在当前用户应用数据目录中的独立数据库中，未加密，并与完整 API 地址绑定。也支持从进程环境读取 `SEMANTIC_READER_AI_KEY`，同时必须设置与界面配置完全对应的 `SEMANTIC_READER_AI_ENDPOINT`。无密钥的本机回环服务可直接使用。
 
 点击「请求 AI 建议」或「补充用法与相关表达」时，应用会向该地址发送选区、所在行附近的文字和最多五个本地候选组。补充提示时也会发送该标注保存的义项。候选优先来自已收录的同形表达和相同语境，随后使用 SQLite FTS5 补充。AI 返回的组 ID 必须在候选中，建议可先修改再确认收录。若响应包含用量，面板会显示该次调用的 token 数。打开文章、点击标注和调整语义组均由本地数据库完成。
 
-设置页会显示已保存的完整地址、模型和密钥状态。保存密钥也会保存对应的地址与模型，密钥本身保存在系统钥匙串。首次请求可能需要授权，成功读取的密钥会在本次运行中缓存于内存，并在更换或清除密钥时同步更新。请求失败时，应用会在 HTTP 状态后显示服务商返回的错误说明（若有）。
+设置页会显示已保存的完整地址、模型和密钥状态。保存密钥也会保存对应的地址与模型，重启后可以继续使用。原来保存在 macOS 钥匙串里的密钥需要在应用内重新输入一次。请求失败时，应用会在 HTTP 状态后显示服务商返回的错误说明（若有）。
 
 AI 建议创建新组时，会填入可编辑的组说明和核心词与搭配。词义建议包含当前语境的词性和语境释义、用法、英文例句，以及有区别说明的近义表达、相关概念或搭配。确认收录会把学习提示随标注存到本地。点击已有标注，可补充语境词性或学习提示。已有释义和学习提示会保留。
 
@@ -105,4 +105,4 @@ rustup target add x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 ```
 
-打包过程需要联网。生成的 `*-setup.exe` 位于 `src-tauri/target/windows-package/x86_64-pc-windows-msvc/release/bundle/nsis/`，安装程序包含 WebView2 离线安装组件。SQLite 静态链接并启用 FTS5。Windows 上可设置 `SEMANTIC_READER_AI_ENDPOINT` 和 `SEMANTIC_READER_AI_KEY` 环境变量后启动应用，再在应用设置里填写相同的 API 地址和模型。
+打包过程需要联网。生成的 `*-setup.exe` 位于 `src-tauri/target/windows-package/x86_64-pc-windows-msvc/release/bundle/nsis/`，安装程序包含 WebView2 离线安装组件。SQLite 静态链接并启用 FTS5。Windows 和 macOS 均可在应用设置中直接保存密钥。

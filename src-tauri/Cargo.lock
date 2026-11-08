@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "semantic-reader"
-version = "0.20.4"
+version = "0.20.7"
 dependencies = [
  "base64 0.22.1",
  "cc",
@@ -2894,7 +2894,6 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "reqwest",
- "security-framework",
  "serde",
  "serde_json",
  "tauri",

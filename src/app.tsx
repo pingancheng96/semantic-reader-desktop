@@ -4,7 +4,7 @@ import {articleMatches, readingLines, selectedOffsets, type Piece} from './readi
 import {captionNodes, type WebNode} from './web-captions.js';
 import {facets, type Tag, type TagLink} from './tag-filters.js';
 import {dictionaryLookupWord} from './dictionary-word.js';
-const {useState, useEffect, useMemo, useRef} = React;
+const {useState, useEffect, useLayoutEffect, useMemo, useRef} = React;
 
 type Item = {id: string; title: string; format: 'md' | 'txt'; source_url?: string | null};
 type Group = {id: string; name: string; description: string};
@@ -31,14 +31,47 @@ type Suggestion = {suggestion: {lemma: string; meaning: string; group_id: string
 const blank = (): GroupFields => ({name: '', description: '', vocabulary: '', tags:[]});
 const empty: Library = {documents: [], groups: [], undo: 0, tags:[], tag_links:[]};
 
-function LearningPanel({learning}: {learning: Learning}) {
+function Pronunciation({ipa, word, locale}: {ipa?:string|null; word:string; locale?:'en-GB'|'en-US'}) {
+  const [error,setError] = useState('');
+  if (!ipa) return <>—</>;
+  if (!locale || !word.trim()) return <>{ipa}</>;
+  const label = locale === 'en-GB' ? '播放英式读音' : '播放美式读音';
+  function play() {
+    const speech = window.speechSynthesis;
+    const voice = speech?.getVoices().find(voice => voice.localService && voice.lang.replace('_','-').toLowerCase() === locale?.toLowerCase());
+    if (!voice) {
+      setError('未找到对应的本地语音。请检查系统语音设置后重试。');
+      return;
+    }
+    setError('');
+    speech.cancel();
+    const utterance = new SpeechSynthesisUtterance(word.trim());
+    utterance.lang = voice.lang;
+    utterance.voice = voice;
+    utterance.onerror = event => {
+      if (event.error !== 'canceled' && event.error !== 'interrupted') setError('读音播放失败，请重试。');
+    };
+    speech.speak(utterance);
+  }
+  return <>
+    <span>{ipa}</span>{' '}
+    <button className="pronunciation-play" type="button" aria-label={label + ' · ' + word} title={label} onClick={play}>
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M11 5 6 9H3v6h3l5 4V5Zm4 4a4 4 0 0 1 0 6m3-9a8 8 0 0 1 0 12"/>
+      </svg>
+    </button>
+    {error && <small className="error" role="status">{error}</small>}
+  </>;
+}
+
+function LearningPanel({learning, word}: {learning: Learning; word:string}) {
   const kinds = {synonym:'近义表达', related:'相关概念', collocation:'常见搭配'};
   return <section className="learning">
     {learning.part_of_speech && <p className="muted">语境词性（AI） · {learning.part_of_speech}</p>}
     {(learning.ipa_uk || learning.ipa_us) && <details className="legacy-ipa">
       <summary>笔记保存的 AI 音标</summary>
-      <dl className="word-details"><dt>英式</dt><dd>{learning.ipa_uk || '—'}</dd>
-        <dt>美式</dt><dd>{learning.ipa_us || '—'}</dd></dl>
+      <dl className="word-details"><dt>英式</dt><dd><Pronunciation ipa={learning.ipa_uk} word={word} locale="en-GB"/></dd>
+        <dt>美式</dt><dd><Pronunciation ipa={learning.ipa_us} word={word} locale="en-US"/></dd></dl>
     </details>}
     {(learning.usage_note || learning.example || learning.related.length>0) && <>
     <h3>用法与相关表达</h3>
@@ -80,8 +113,8 @@ function DictionaryPanel({word, revision, fallback, verified}: {word:string; rev
   const supplement = (ipa || pos) && <div className="dictionary-entry">
     <h3>AI 补充{fallback?.word ? ` · ${fallback.word}` : ''}</h3>
     <dl className="word-details">
-      {ipa && <><dt>英式 IPA</dt><dd>{fallback?.ipa_uk || '—'}</dd>
-        <dt>美式 IPA</dt><dd>{fallback?.ipa_us || '—'}</dd></>}
+      {ipa && <><dt>英式 IPA</dt><dd><Pronunciation ipa={fallback?.ipa_uk} word={fallback?.word || lookup} locale="en-GB"/></dd>
+        <dt>美式 IPA</dt><dd><Pronunciation ipa={fallback?.ipa_us} word={fallback?.word || lookup} locale="en-US"/></dd></>}
       {pos && <><dt>语境词性</dt><dd>{pos}</dd></>}
     </dl>
   </div>;
@@ -104,7 +137,7 @@ function DictionaryPanel({word, revision, fallback, verified}: {word:string; rev
       const render = (region:DictionaryEntry['region'])=> {
         const sounds = rows.filter(row=>row.region===region && row.ipa);
         return sounds.length ? <ul>{sounds.map(row=><li key={row.ipa+row.labels}>
-          <span>{row.ipa}</span>{row.labels && <small>{row.labels}</small>}
+          <Pronunciation ipa={row.ipa} word={row.word} locale={region==='UK' ? 'en-GB' : region==='US' ? 'en-US' : undefined}/>{row.labels && <small>{row.labels}</small>}
         </li>)}</ul> : '—';
       };
       return <div key={key} className="dictionary-entry">
@@ -172,7 +205,7 @@ const webTags = new Set(['div','section','article','header','p','h1','h2','h3','
   'ul','ol','li','blockquote','figure','figcaption','table','thead','tbody','tfoot','tr','th','td',
   'pre','dl','dt','dd','strong','b','em','i','code','s','sub','sup','mark','br','hr']);
 
-function Reader({data, focused, onMark, onSelect}: {data: Read; focused: string; onMark: (m: Mark) => void; onSelect: (s: Selection) => void}) {
+function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible: boolean; focused: string; onMark: (m: Mark) => void; onSelect: (s: Selection) => void}) {
   const ref = useRef<HTMLDivElement>(null);
   const {content, format, id, web_layout} = data.document;
   const web = useMemo(() => web_layout ? JSON.parse(web_layout) as WebLayout : null,[web_layout]);
@@ -221,6 +254,7 @@ function Reader({data, focused, onMark, onSelect}: {data: Read; focused: string;
     ref.current?.focus({preventScroll:true});
   }
   useEffect(() => {
+    if (!visible) return;
     function find(event: KeyboardEvent) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
         event.preventDefault();
@@ -231,7 +265,7 @@ function Reader({data, focused, onMark, onSelect}: {data: Read; focused: string;
     }
     window.addEventListener('keydown',find);
     return () => window.removeEventListener('keydown',find);
-  }, []);
+  }, [visible]);
   function move(step: number) {
     if (matches.length) setCurrent((active + step + matches.length) % matches.length);
   }
@@ -351,6 +385,11 @@ function App() {
   const [confirmTagMerge,setConfirmTagMerge] = useState(false);
   const [search,setSearch] = useState<Library | null>(null);
   const [read,setRead] = useState<Read | null>(null);
+  const readerPage = useRef<HTMLElement>(null);
+  const readerScroll = useRef(0);
+  useLayoutEffect(() => {
+    if (mode === 'reader' && readerPage.current) readerPage.current.scrollTop = readerScroll.current;
+  }, [mode, read?.document.id]);
   const [detail,setDetail] = useState<Detail | null>(null);
   const [bulkMode,setBulkMode] = useState(false);
   const [bulkGroups,setBulkGroups] = useState<string[]>([]);
@@ -423,8 +462,8 @@ function App() {
     let current = true;
     if (!aiConfigured) { setKeyState('尚未配置'); return; }
     setKeyState('正在检查…');
-    void call<'keychain'|'environment'|'missing'>('key_status',savedAi).then(
-      saved => { if (current) setKeyState(saved === 'keychain' ? '已配置（钥匙串）' : saved === 'environment' ? '已配置（环境变量）' : '未配置'); },
+    void call<'local'|'environment'|'missing'>('key_status',savedAi).then(
+      saved => { if (current) setKeyState(saved === 'local' ? '已配置（本机）' : saved === 'environment' ? '已配置（环境变量）' : '未配置'); },
       () => { if (current) setKeyState('无法读取密钥状态'); }
     );
     return () => { current = false; };
@@ -497,6 +536,7 @@ function App() {
   }
   async function openDoc(id: string, markId = '') {
     const data = await call<Read>('document',{id});
+    if (read?.document.id !== id) readerScroll.current = 0;
     setDeleteDocId(''); setRead(data); setFocus(markId); setMode('reader'); resetSelection();
   }
   function clearGroup() {
@@ -574,7 +614,7 @@ function App() {
   return <div className="app">
     <header className="top"><div className="brand"><img src="./icon.png" alt=""/> Semantic Reader</div>
       <nav aria-label="工作区">
-        <button className={mode==='reader'?'current':''} onClick={() => void task(async () => { if (read) await openDoc(read.document.id,focus); else setMode('reader'); })}>阅读器</button>
+        <button className={mode==='reader'?'current':''} onClick={() => void task(async () => { if (read) await openDoc(read.document.id); else setMode('reader'); })}>阅读器</button>
         <button className={mode==='library'?'current':''} onClick={() => setMode('library')}>语义库</button>
         <button className={mode==='settings'?'current':''} onClick={() => setMode('settings')}>设置</button>
       </nav>
@@ -670,8 +710,8 @@ function App() {
         </div>
       </aside>
 
-      {mode==='reader' && <>
-        <main className="page">
+        <main className="page" hidden={mode!=='reader'} ref={readerPage}
+          onScroll={e=>{if (mode==='reader') readerScroll.current = e.currentTarget.scrollTop;}}>
           {read ? <>
             <p className="eyebrow">READING ROOM · {read.document.source_url ? 'WEB' : read.document.format.toUpperCase()}</p>
             <h1>{read.document.title.replace(/\.(md|markdown|txt)$/i,'')}</h1>
@@ -693,12 +733,12 @@ function App() {
                 <button className="delete-document" disabled={busy} onClick={()=>void task(()=>deleteDocument(read.document.id))}>确认删除文章</button>
               </div>
             </section>}
-            <Reader key={read.document.id} data={read} focused={focus} onSelect={capture} onMark={mark=>{setActiveMark(mark);setSelection(null);setMarkSuggestion(null);}}/>
+            <Reader key={read.document.id} data={read} visible={mode==='reader'} focused={focus} onSelect={capture} onMark={mark=>{setActiveMark(mark);setSelection(null);setMarkSuggestion(null);}}/>
           </> : <div className="welcome"><p className="eyebrow">YOUR READING ROOM</p><h1>从一篇文章开始</h1>
             <p>在原文中选中词或短语，保存它在这个语境中的含义。以后点击标注即可回到语义组。</p>
             <button className="primary" onClick={()=>file.current?.click()}>导入第一篇文章</button></div>}
         </main>
-        <aside className="inspector">
+        {mode==='reader' && <aside className="inspector">
           <p className="eyebrow">CONTEXT PANEL</p>
           {activeMark ? <>
 
@@ -706,7 +746,7 @@ function App() {
             <p className="muted">{activeMark.lemma}</p><p>{activeMark.meaning}</p>
             <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
             <DictionaryPanel word={activeMark.lemma || activeMark.surface} revision={dictionaryRevision} fallback={activeLearning}/>
-            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel learning={activeLearning}/>}
+            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
             {(!activeLearning?.part_of_speech || !activeLearning.usage_note) && markSuggestion?.id !== activeMark.id && <p>
               <button disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
                 const result = await call<Suggestion>('suggest',{
@@ -723,7 +763,7 @@ function App() {
               })}>{activeLearning?.usage_note ? '补充语境词性' : '补充词性和用法'}</button>
             </p>}
             {markSuggestion?.id === activeMark.id && <>
-              <LearningPanel learning={markSuggestion.learning}/>
+              <LearningPanel learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
               <button disabled={busy} onClick={()=>void task(async()=>{
                 const updated = {...activeMark,learning:JSON.stringify(markSuggestion.learning)};
                 await call('learning_save',{id:activeMark.id,learning:markSuggestion.learning});
@@ -744,7 +784,7 @@ function App() {
               {candidate.notes.length > 1 && <p className="muted">找到多个义项，请按当前语境查看。</p>}
               {candidate.notes.map(note=><div className="saved-note" key={note.id}>
                 <b>{note.lemma}</b><p>{note.meaning}</p>
-                {note.learning && <LearningPanel learning={readLearning(note.learning)!}/>}
+                {note.learning && <LearningPanel learning={readLearning(note.learning)!} word={note.lemma}/>}
                 <div className="row">
                   <button className="quiet" disabled={busy} onClick={()=>void task(()=>openGroup(note.group_id))}>{note.group_name} →</button>
                   <button disabled={busy} onClick={()=>{setAttachSense(note.id);setLearning(null);}}>复用此义项</button>
@@ -774,7 +814,7 @@ function App() {
             })}>请求 AI 建议</button>
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
             {aiNote && <p className="muted">{aiNote}</p>}
-            {learning && <LearningPanel learning={learning}/>}
+            {learning && <LearningPanel learning={learning} word={lookupWord}/>}
             <form onSubmit={e=>submit(e,async ()=>{
               let savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
               if (!attachSense && lexicalFallback?.word?.toLowerCase()===lemma.trim().toLowerCase()) {
@@ -804,8 +844,7 @@ function App() {
               <button className="primary full" disabled={busy}>确认收录</button>
             </form>
           </> : <p className="muted">双击词语查看词库笔记，或选中短语开始收录。</p>}
-        </aside>
-      </>}
+        </aside>}
 
       {mode==='library' && manageTags && <main className="page manage">
         <p className="eyebrow">SEMANTIC LIBRARY</p><h1>管理标签</h1>
@@ -962,11 +1001,12 @@ function App() {
           <label>完整 API 地址<input value={endpoint} onChange={e=>setEndpoint(e.target.value.trim())} placeholder="https://provider.example/v1/chat/completions"/></label>
           <label>模型<input value={model} onChange={e=>setModel(e.target.value.trim())} placeholder="服务提供方的模型名称"/></label>
           <button onClick={()=>{saveAi();setNotice('地址和模型已保存');}}>保存地址和模型</button>
-          <label>API Key（macOS 钥匙串）<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)}/></label>
+          <label>API Key<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)}/></label>
+          <p className="muted">密钥保存在当前用户的应用数据中，未加密，也不会包含在词库导出中。旧版钥匙串密钥需要重新保存一次。</p>
           <div className="row"><button disabled={busy || !key} onClick={()=>void task(async()=>{
-            await call('key_save',{endpoint,model,key});saveAi();setKeyRevision(v=>v+1);setKey('');setNotice('密钥已写入 macOS 钥匙串');
+            await call('key_save',{endpoint,model,key});saveAi();setKeyRevision(v=>v+1);setKey('');setNotice('密钥已保存到本机');
           })}>保存密钥</button>
-          <button disabled={busy || !aiConfigured || keyState!=='已配置（钥匙串）'} onClick={()=>void task(async()=>{
+          <button disabled={busy || !aiConfigured || keyState!=='已配置（本机）'} onClick={()=>void task(async()=>{
             await call('key_remove',savedAi);setKeyRevision(v=>v+1);setKey('');setNotice('已清除当前地址的密钥');
           })}>清除密钥</button></div>
         </section>

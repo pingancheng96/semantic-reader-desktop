@@ -1,39 +1,45 @@
 use crate::{sqlite::Result, store::field};
 use reqwest::{redirect::Policy, Client, Url};
 use serde_json::{json, Value as V};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{fs::OpenOptions, path::Path, time::Duration};
 
-const SERVICE: &str = "local.semanticreader.desktop";
-
-#[derive(Clone, Default)]
-pub struct Credentials(Arc<Mutex<HashMap<Url, String>>>);
-
-impl Credentials {
-    fn load(
-        &self,
-        url: &Url,
-        read: impl FnOnce(&Url) -> Result<Option<String>>,
-    ) -> Result<Option<String>> {
-        let mut cache = self.0.lock().map_err(|_| "无法读取会话密钥")?;
-        if let Some(key) = cache.get(url) {
-            return Ok(Some(key.clone()));
-        }
-        let key = read(url)?;
-        if let Some(key) = &key {
-            cache.insert(url.clone(), key.clone());
-        }
-        Ok(key)
+fn credential_db(library: &Path) -> Result<crate::sqlite::Db> {
+    let path = library.with_file_name("ai-credentials.sqlite3");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    options.open(&path).map_err(|_| "无法打开本地密钥存储")?;
+    let db = crate::sqlite::Db::open(&path)?;
+    db.batch(
+        "CREATE TABLE IF NOT EXISTS credentials (endpoint TEXT PRIMARY KEY, secret TEXT NOT NULL)",
+    )?;
+    Ok(db)
+}
 
-    pub fn for_request(&self, p: &V) -> Result<Option<String>> {
-        let (url, _) = settings(p)?;
-        self.load(&url, keychain_credential)
-            .map(|key| key.or_else(|| environment_credential(&url)))
+fn local_credential(library: &Path, url: &Url) -> Result<Option<String>> {
+    if !library
+        .with_file_name("ai-credentials.sqlite3")
+        .try_exists()
+        .map_err(|_| "无法检查本地密钥存储")?
+    {
+        return Ok(None);
     }
+    Ok(credential_db(library)?
+        .query(
+            "SELECT secret FROM credentials WHERE endpoint=?1",
+            &[json!(url.as_str())],
+        )?
+        .into_iter()
+        .find_map(|row| row["secret"].as_str().map(str::to_owned)))
+}
+
+pub fn request_key(library: &Path, p: &V) -> Result<Option<String>> {
+    let (url, _) = settings(p)?;
+    Ok(local_credential(library, &url)?.or_else(|| environment_credential(&url)))
 }
 
 fn settings(p: &V) -> Result<(Url, &str)> {
@@ -52,47 +58,23 @@ fn settings(p: &V) -> Result<(Url, &str)> {
     Ok((url, field(p, "model", 150, true)?))
 }
 
-pub fn key_action(credentials: &Credentials, p: &V, remove: bool) -> Result<V> {
+pub fn key_action(library: &Path, p: &V, remove: bool) -> Result<V> {
     let (url, _) = settings(p)?;
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords::{delete_generic_password, set_generic_password};
-        let mut cache = credentials.0.lock().map_err(|_| "无法更新会话密钥")?;
-        if remove {
-            match delete_generic_password(SERVICE, url.as_str()) {
-                Ok(()) => (),
-                Err(e) if e.code() == -25300 => (),
-                Err(_) => return Err("无法删除钥匙串中的密钥".into()),
-            }
-            cache.remove(&url);
-        } else {
-            let key = field(p, "key", 4096, true)?;
-            set_generic_password(SERVICE, url.as_str(), key.as_bytes())
-                .map_err(|_| "无法写入 macOS 钥匙串")?;
-            cache.insert(url, key.to_owned());
-        }
-        Ok(V::Null)
+    let db = credential_db(library)?;
+    db.batch("PRAGMA secure_delete=ON")?;
+    if remove {
+        db.query(
+            "DELETE FROM credentials WHERE endpoint=?1",
+            &[json!(url.as_str())],
+        )?;
+    } else {
+        let key = field(p, "key", 4096, true)?;
+        db.query(
+            "INSERT INTO credentials VALUES(?1,?2) ON CONFLICT(endpoint) DO UPDATE SET secret=excluded.secret",
+            &[json!(url.as_str()), json!(key)],
+        )?;
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (url, remove, credentials);
-        Err("此平台请使用启动进程的环境变量配置密钥".into())
-    }
-}
-
-fn keychain_credential(url: &Url) -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    match security_framework::passwords::get_generic_password(SERVICE, url.as_str()) {
-        Ok(bytes) => {
-            return String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| "钥匙串密钥无效".into())
-        }
-        Err(e) if e.code() == -25300 => (),
-        Err(_) => return Err("无法读取 macOS 钥匙串".into()),
-    }
-    let _ = url;
-    Ok(None)
+    Ok(V::Null)
 }
 
 fn environment_credential(url: &Url) -> Option<String> {
@@ -108,34 +90,10 @@ fn environment_credential(url: &Url) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn keychain_contains(url: &Url) -> Result<bool> {
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::item::{ItemClass, ItemSearchOptions};
-        // Metadata lookup leaves the protected password untouched.
-        match ItemSearchOptions::new()
-            .class(ItemClass::generic_password())
-            .service(SERVICE)
-            .account(url.as_str())
-            .load_attributes(true)
-            .search()
-        {
-            Ok(items) => return Ok(!items.is_empty()),
-            Err(e) if e.code() == -25300 => return Ok(false),
-            Err(_) => return Err("无法读取 macOS 钥匙串状态".into()),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = url;
-        Ok(false)
-    }
-}
-
-pub fn key_status(p: &V) -> Result<V> {
+pub fn key_status(library: &Path, p: &V) -> Result<V> {
     let (url, _) = settings(p)?;
-    let status = if keychain_contains(&url)? {
-        "keychain"
+    let status = if local_credential(library, &url)?.is_some() {
+        "local"
     } else if environment_credential(&url).is_some() {
         "environment"
     } else {
@@ -328,32 +286,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caches_keychain_read_per_endpoint_but_not_denials() {
-        let cache = Credentials::default();
-        let first = Url::parse("https://example.org/chat/completions").unwrap();
-        let second = Url::parse("https://example.net/chat/completions").unwrap();
-        assert!(cache.load(&first, |_| Err("denied".into())).is_err());
+    fn persists_replaces_and_removes_keys_by_endpoint() {
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&directory).unwrap();
+        let library = directory.join("library.sqlite3");
+        let mut first =
+            json!({"endpoint":"https://example.org/chat/completions","model":"test","key":"one"});
+        let second = json!({"endpoint":"https://example.org/v1/chat/completions","model":"test"});
+        key_action(&library, &first, false).unwrap();
+        assert_eq!(key_status(&library, &first).unwrap(), "local");
         assert_eq!(
-            cache
-                .load(&first, |_| Ok(Some("one".into())))
-                .unwrap()
-                .as_deref(),
+            request_key(&library, &first).unwrap().as_deref(),
             Some("one")
         );
+        assert!(local_credential(&library, &settings(&second).unwrap().0)
+            .unwrap()
+            .is_none());
+        first["key"] = json!("two");
+        key_action(&library, &first, false).unwrap();
         assert_eq!(
-            cache
-                .load(&first, |_| panic!("unexpected keychain read"))
-                .unwrap()
-                .as_deref(),
-            Some("one")
-        );
-        assert_eq!(
-            cache
-                .load(&second, |_| Ok(Some("two".into())))
-                .unwrap()
-                .as_deref(),
+            request_key(&library, &first).unwrap().as_deref(),
             Some("two")
         );
+        key_action(&library, &first, true).unwrap();
+        assert!(local_credential(&library, &settings(&first).unwrap().0)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -149,3 +149,5 @@ button.delete-document { color: #a22f29; }
 .article-search [role="status"] { font-variant-numeric: tabular-nums; }
 .article-hit { background: #fceaa4; color: #262319; }
 .article-hit.active { background: #ffc464; color: #262319; }
+
+.pronunciation-play { display: inline-flex; vertical-align: middle; align-items: center; padding: .2rem; }
