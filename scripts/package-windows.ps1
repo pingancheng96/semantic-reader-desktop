@@ -21,13 +21,26 @@ try {
     Invoke-Checked node @('-e', $verify)
     Invoke-Checked npm.cmd @('ci')
     Invoke-Checked npm.cmd @('run', 'build')
-    $cli = '@tauri-apps/cli@2.12.4'
-    & curl.exe -fsIL --max-time 20 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip' | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        $cli = '@tauri-apps/cli@2.11.3'
-        Invoke-Checked curl.exe @('-fsIL', '--max-time', '30', 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip')
+    $nsisArchive = Join-Path $buildDir 'nsis.zip'
+    $nsisPlugin = Join-Path $buildDir 'nsis_tauri_utils.dll'
+    $assets = @(
+        @{ Url = 'https://api.github.com/repos/tauri-apps/binary-releases/releases/assets/623832696?download=1'; Path = $nsisArchive; Sha1 = 'DB14F8AF2EA346B786C6AE19343F61AAF5E09B8E' },
+        @{ Url = 'https://api.github.com/repos/tauri-apps/nsis-tauri-utils/releases/assets/345882097?download=1'; Path = $nsisPlugin; Sha1 = '75197FEE3C6A814FE035788D1C34EAD39349B860' }
+    )
+    foreach ($asset in $assets) {
+        Invoke-Checked curl.exe @('-fsSL', '--retry', '2', '--max-time', '60', '-H', 'Accept: application/octet-stream', $asset.Url, '-o', $asset.Path)
+        if ((Get-FileHash -LiteralPath $asset.Path -Algorithm SHA1).Hash -ne $asset.Sha1) {
+            throw "NSIS download checksum mismatch: $($asset.Path)"
+        }
     }
-    Invoke-Checked npx.cmd @('--yes', $cli, 'build', '--target', 'x86_64-pc-windows-msvc', '--bundles', 'nsis', '--', '--locked')
+    Expand-Archive -LiteralPath $nsisArchive -DestinationPath $buildDir -Force
+    $tools = Join-Path $env:LOCALAPPDATA 'tauri/NSIS'
+    New-Item -ItemType Directory -Force $tools | Out-Null
+    Copy-Item (Join-Path $buildDir 'nsis-3.13/*') $tools -Recurse -Force
+    $pluginDir = Join-Path $tools 'Plugins/x86-unicode/additional'
+    New-Item -ItemType Directory -Force $pluginDir | Out-Null
+    Copy-Item $nsisPlugin $pluginDir -Force
+    Invoke-Checked npx.cmd @('--yes', '@tauri-apps/cli@2.12.4', 'build', '--target', 'x86_64-pc-windows-msvc', '--bundles', 'nsis', '--', '--locked')
     Get-ChildItem (Join-Path $buildDir 'x86_64-pc-windows-msvc/release/bundle/nsis') -Filter '*-setup.exe'
 } finally {
     $env:SEMANTIC_READER_SQLITE_SOURCE = $previousSource
