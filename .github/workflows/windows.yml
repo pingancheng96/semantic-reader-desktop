@@ -8,13 +8,56 @@ permissions:
 jobs:
   package:
     runs-on: windows-2025
+    env:
+      CARGO_CACHE_PATHS: |
+        ~/.cargo/registry
+        src-tauri/target/windows-package/*/release/.fingerprint
+        src-tauri/target/windows-package/*/release/build
+        src-tauri/target/windows-package/*/release/deps
+        src-tauri/target/windows-package/release/.fingerprint
+        src-tauri/target/windows-package/release/build
+        src-tauri/target/windows-package/release/deps
+        src-tauri/target/windows-package/sqlite-amalgamation-3500400
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: rustup target add x86_64-pc-windows-msvc
-      - run: ./scripts/package-windows.ps1
+      - name: Identify Rust toolchain
+        id: rust
+        run: |
+          $version = (rustc --version).Split(' ')[1]
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - uses: actions/cache/restore@v4
+        id: cargo-cache
+        with:
+          path: ${{ env.CARGO_CACHE_PATHS }}
+          key: windows-2025-x64-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            windows-2025-x64-rust-${{ steps.rust.outputs.version }}-${{ hashFiles('src-tauri/Cargo.lock') }}-
+      - name: Compile application
+        run: ./scripts/package-windows.ps1 -Phase Compile
+      - uses: actions/cache/save@v4
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.CARGO_CACHE_PATHS }}
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            src-tauri/target/windows-package/nsis.zip
+            src-tauri/target/windows-package/nsis_tauri_utils.dll
+          key: windows-x64-nsis-${{ hashFiles('scripts/package-windows.ps1') }}
+      - name: Package installer
+        run: |
+          try {
+            ./scripts/package-windows.ps1 -Phase Bundle
+          } catch {
+            Write-Warning "Installer packaging failed. Retrying without recompiling."
+            ./scripts/package-windows.ps1 -Phase Bundle
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: Semantic-Reader-Windows-x64
