@@ -21,7 +21,13 @@ try {
     Invoke-Checked node @('-e', $verify)
     Invoke-Checked npm.cmd @('ci')
     Invoke-Checked npm.cmd @('run', 'build')
-    Invoke-Checked npx.cmd @('--yes', '@tauri-apps/cli@2.12.4', 'build', '--target', 'x86_64-pc-windows-msvc', '--bundles', 'nsis', '--', '--locked')
+    $cli = '@tauri-apps/cli@2.12.4'
+    & curl.exe -fsIL --max-time 20 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.13/nsis-3.13.zip' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $cli = '@tauri-apps/cli@2.11.3'
+        Invoke-Checked curl.exe @('-fsIL', '--max-time', '30', 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip')
+    }
+    Invoke-Checked npx.cmd @('--yes', $cli, 'build', '--target', 'x86_64-pc-windows-msvc', '--bundles', 'nsis', '--', '--locked')
     Get-ChildItem (Join-Path $buildDir 'x86_64-pc-windows-msvc/release/bundle/nsis') -Filter '*-setup.exe'
 } finally {
     $env:SEMANTIC_READER_SQLITE_SOURCE = $previousSource
