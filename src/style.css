@@ -151,3 +151,10 @@ button.delete-document { color: #a22f29; }
 .article-hit.active { background: #ffc464; color: #262319; }
 
 .pronunciation-play { display: inline-flex; vertical-align: middle; align-items: center; padding: .2rem; }
+
+.annotation-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+
+.help-page { grid-column: 1 / -1; padding-inline: max(1.5rem, calc((100% - 48rem) / 2)); }
+.help-page section { margin-top: 1.8rem; }
+.help-page li + li { margin-top: .35rem; }
+.help-page kbd { background: #e9eee5; border-radius: .25rem; padding: .08rem .28rem; }

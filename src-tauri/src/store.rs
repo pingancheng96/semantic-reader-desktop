@@ -115,6 +115,13 @@ fn groups(db: &Db, q: &str, limit: Option<i64>) -> Result<Vec<V>> {
         &[json!(query),json!(q)])
 }
 
+fn group_senses(db: &Db, key: &V) -> Result<Vec<V>> {
+    db.query(
+        &format!("{SENSES} WHERE s.group_id=?1 ORDER BY e.lemma,s.meaning,s.id"),
+        std::slice::from_ref(key),
+    )
+}
+
 fn group(db: &Db, key: &V) -> Result<V> {
     db.one("SELECT * FROM semantic_groups WHERE id=?1", &[key.clone()])
 }
@@ -871,13 +878,14 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             )?;
             Ok(json!({"document":doc,"marks":marks}))
         }
+        "group_senses" => {
+            let key = id(p, "id")?;
+            Ok(json!(group_senses(db, &key)?))
+        },
         "group" => {
             let key = id(p, "id")?;
             let g = group(db, &key)?;
-            let senses = db.query(
-                &format!("{SENSES} WHERE s.group_id=?1 ORDER BY e.lemma,s.meaning"),
-                &[key.clone()],
-            )?;
+            let senses = group_senses(db, &key)?;
             let vocab = vocabulary(db, &key)?;
             let group_tags = tags::group_tags(db,&key)?;
             let marks = db.query(
@@ -1057,6 +1065,7 @@ mod tests {
         let target = create(&db, "Decline");
         let mark = annotate_at(&db, anchor, &target, "下降");
         let learning = json!({"usage_note":"常用于价格急跌","example":"Prices plunged.",
+            "etymology":"源自古法语。","mnemonic":"联想物体突然落入水中。",
             "related":[{"expression":"plummet","kind":"synonym","note":"同样强调急跌"}]});
         run(
             &db,
@@ -1071,6 +1080,9 @@ mod tests {
 
         let other = import(&db, "Later.txt", "txt", "They plunged again.").unwrap();
         let lookup = candidates(&db, &json!({"document_id":other,"start":5,"end":12})).unwrap();
+        let saved = run(&db, "group_senses", &json!({"id":target})).unwrap();
+        assert_eq!(saved.as_array().unwrap().len(), 1);
+        assert_eq!(saved[0]["lemma"], "plunge");
         assert_eq!(lookup["notes"][0]["meaning"], "下降");
         assert_eq!(lookup["notes"][0]["group_name"], "Decline");
         assert_eq!(

@@ -1,6 +1,6 @@
 [package]
 name = "semantic-reader"
-version = "0.20.7"
+version = "0.20.10"
 edition = "2021"
 
 [build-dependencies]
