@@ -28,8 +28,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Semantic Reader</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>SemanticReader.icns</string>
-<key>CFBundleShortVersionString</key><string>0.20.10</string>
-<key>CFBundleVersion</key><string>34</string>
+<key>CFBundleShortVersionString</key><string>0.20.18</string>
+<key>CFBundleVersion</key><string>42</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST

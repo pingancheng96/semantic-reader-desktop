@@ -366,6 +366,72 @@ pub fn group_with_name(db: &Db, name: &str) -> Result<Option<V>> {
         .map(|group| group["id"].clone()))
 }
 
+pub fn comparison_input(db: &Db, p: &V) -> Result<V> {
+    let id = id(p, "id")?;
+    let current = group(db, &id)?;
+    let exclude = p["exclude"].as_str();
+    let senses: Vec<_> = group_senses(db, &id)?.into_iter()
+        .filter(|sense| sense["id"].as_str() != exclude)
+        .take(12)
+        .map(|sense| json!({"id":sense["id"],"lemma":sense["lemma"],
+            "meaning":sense["meaning"].as_str().unwrap_or_default().chars().take(240).collect::<String>()}))
+        .collect();
+    Ok(
+        json!({"group":current["name"],"lemma":field(p,"lemma",240,true)?,
+        "meaning":field(p,"meaning",1200,true)?,"senses":senses}),
+    )
+}
+
+pub fn organization_input(db: &Db, p: &V) -> Result<V> {
+    let id = id(p, "id")?;
+    let current = group(db, &id)?;
+    let words = vocabulary(db, &id)?;
+    let terms = words
+        .iter()
+        .take(4)
+        .map(|row| row["expression"].clone())
+        .collect::<Vec<_>>();
+    let terms = std::iter::once(current["name"].clone())
+        .chain(terms)
+        .collect::<Vec<_>>();
+    let matches = followup_groups(db, &json!(terms), &json!([{"id":id}]))?;
+    let senses = group_senses(db, &id)?;
+    let allow_split = (2..=60).contains(&senses.len());
+    let senses: Vec<_> = senses.into_iter().take(60).map(|sense| json!({
+        "id":sense["id"],"lemma":sense["lemma"],
+        "meaning":sense["meaning"].as_str().unwrap_or_default().chars().take(240).collect::<String>()
+    })).collect();
+    Ok(json!({"current":current,"senses":senses,"allow_split":allow_split,"candidates":matches}))
+}
+
+pub fn followup_groups(db: &Db, terms: &V, previous: &V) -> Result<Vec<V>> {
+    let query = terms
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(5)
+        .filter_map(V::as_str)
+        .filter(|term| term.len() <= 80 && term.chars().any(char::is_alphanumeric))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let previous = previous.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut matches = Vec::new();
+    for mut group in groups(db, &query, Some(5 + previous.len() as i64))? {
+        if previous.iter().any(|seen| seen["id"] == group["id"]) {
+            continue;
+        }
+        group["vocabulary"] = json!(vocabulary(db, &group["id"])?);
+        matches.push(group);
+        if matches.len() == 5 {
+            break;
+        }
+    }
+    Ok(matches)
+}
+
 pub fn candidates(db: &Db, p: &V) -> Result<V> {
     let (doc, start, end, surface, context) = selection(db, p)?;
     let saved_sense = db.query(
@@ -597,6 +663,18 @@ fn regroup(db: &Db, op: &str, p: &V) -> Result<V> {
                 &[target.clone(),source.clone()])?;
             db.write("DELETE FROM semantic_groups WHERE id=?1", &[source.clone()])?;
         }
+    }
+    if op == "split" && field(&p["new_group"], "vocabulary", 6000, false)?.is_empty() {
+        db.query(
+            "INSERT INTO group_vocabulary(group_id,expression,nuance)
+             SELECT ?1,e.lemma,coalesce(
+               (SELECT nullif(v.nuance,'') FROM group_vocabulary v
+                WHERE v.group_id=?2 AND v.expression=e.lemma COLLATE NOCASE
+                ORDER BY (v.expression=e.lemma) DESC,v.expression LIMIT 1),min(s.meaning))
+             FROM senses s JOIN expressions e ON e.id=s.expression_id
+             WHERE s.group_id=?1 GROUP BY e.id,e.lemma",
+            &[target.clone(), source.clone()],
+        )?;
     }
     reindex(db, &source)?;
     reindex(db, &target)?;
@@ -1006,6 +1084,54 @@ mod tests {
     }
 
     #[test]
+    fn semantic_terms_find_groups_missed_by_the_surface_and_exclude_previous_candidates() {
+        let db = memory();
+        let siege = create(&db, "Military siege and capture");
+        let pressure = create(&db, "Siege and Hostile Pressure");
+        assert!(groups(&db, "beleaguered", Some(5)).unwrap().is_empty());
+        let found = followup_groups(
+            &db,
+            &json!(["under siege", "military"]),
+            &json!([{"id":pressure}]),
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["id"], siege);
+        assert!(followup_groups(&db, &json!(["!"]), &V::Null)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn reused_sense_links_another_document_without_creating_another_sense() {
+        let db = memory();
+        let group = create(&db, "Writing systems");
+        let content = "They studied cuneiform.";
+        let first = import(&db, "First.txt", "txt", content).unwrap();
+        run(
+            &db,
+            "annotate",
+            &json!({"document_id":first,"start":13,"end":22,
+            "lemma":"cuneiform","meaning":"楔形文字","group_id":group}),
+        )
+        .unwrap();
+        let saved = group_senses(&db, &group).unwrap();
+        let second = import(&db, "Second.txt", "txt", "They decoded cuneiform.").unwrap();
+        run(
+            &db,
+            "annotate",
+            &json!({"document_id":second,"start":13,"end":22,
+            "sense_id":saved[0]["id"]}),
+        )
+        .unwrap();
+        assert_eq!(group_senses(&db, &group).unwrap(), saved);
+        assert_eq!(
+            db.query("SELECT sense_id FROM occurrences", &[]).unwrap(),
+            vec![json!({"sense_id":saved[0]["id"]}); 2]
+        );
+    }
+
+    #[test]
     fn annotation_reuses_group_with_same_normalized_name() {
         let db = memory();
         let group = create(&db, "Ancient Writing Systems");
@@ -1157,6 +1283,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read()["marks"][0]["group_id"], split);
+        assert_eq!(
+            vocabulary(&db, &split).unwrap(),
+            vec![json!({"expression":"plunge","nuance":"急剧下降"})]
+        );
         run(&db, "undo", &V::Null).unwrap();
         assert_eq!(read(), before);
         let merge = json!({"source":fall,"target":duplicate});

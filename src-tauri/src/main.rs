@@ -101,6 +101,28 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             .await
             .map_err(|_| "无法保存补图结果")?
         }
+        "compare_group_senses" => {
+            let params = payload.clone();
+            let (input, key) = tauri::async_runtime::spawn_blocking(move || {
+                let db = Db::open(&path)?;
+                let input = db.snapshot(|| store::comparison_input(&db, &params))?;
+                Ok::<_, String>((input, ai::request_key(&path, &params)?))
+            })
+            .await
+            .map_err(|_| "读取同组词项失败")??;
+            ai::compare_group_senses(&payload, key, input).await
+        }
+        "organize_group" => {
+            let params = payload.clone();
+            let (input, key) = tauri::async_runtime::spawn_blocking(move || {
+                let db = Db::open(&path)?;
+                let input = db.snapshot(|| store::organization_input(&db, &params))?;
+                Ok::<_, String>((input, ai::request_key(&path, &params)?))
+            })
+            .await
+            .map_err(|_| "读取整理候选失败")??;
+            ai::organize_group(&payload, key, input).await
+        }
         "suggest" => {
             let params = payload.clone();
             let read_path = path.clone();
@@ -112,19 +134,58 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             })
             .await
             .map_err(|_| "读取候选失败")??;
-            let mut response = ai::suggest(payload, local, key).await?;
-            let suggestion = &mut response["suggestion"];
-            if suggestion["group_id"].is_null() {
-                if let Some(name) = suggestion["group_name"].as_str() {
-                    let name = name.to_owned();
-                    let existing = tauri::async_runtime::spawn_blocking(move || {
-                        store::group_with_name(&Db::open(&path)?, &name)
+            let previous = local["groups"].clone();
+            let context = local["context"].clone();
+            let saved = !local["saved_sense"].is_null();
+            let mut response = ai::suggest(payload.clone(), local, key.clone()).await?;
+            if !saved && response["suggestion"]["group_id"].is_null() {
+                let name = response["suggestion"]["group_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let terms = response["suggestion"]["group_search_terms"].clone();
+                let lookup = tauri::async_runtime::spawn_blocking(move || {
+                    let db = Db::open(&path)?;
+                    db.snapshot(|| {
+                        let exact = store::group_with_name(&db, &name)?;
+                        let groups = if exact.is_some() {
+                            Vec::new()
+                        } else {
+                            store::followup_groups(&db, &terms, &previous)?
+                        };
+                        Ok::<_, String>((exact, groups))
                     })
-                    .await
-                    .map_err(|_| "检查同名语义组失败")??;
-                    if let Some(id) = existing {
-                        suggestion["group_id"] = id;
+                })
+                .await;
+                match lookup {
+                    Ok(Ok((Some(id), _))) => {
+                        response["suggestion"]["group_id"] = id;
+                        response["suggestion"]["group_reason"] =
+                            serde_json::json!("与已有语义组同名。");
                     }
+                    Ok(Ok((None, groups))) if !groups.is_empty() => {
+                        match ai::reconsider_group(
+                            &payload,
+                            key,
+                            &response["suggestion"],
+                            &context,
+                            &groups,
+                        )
+                        .await
+                        {
+                            Ok((decision, usage)) => {
+                                response["usage"] = ai::combined_usage(&response["usage"], &usage);
+                                response["suggestion"]["group_id"] = decision["group_id"].clone();
+                                response["suggestion"]["group_reason"] = decision["reason"].clone();
+                            }
+                            Err(_) => {
+                                response["usage"] = Value::Null;
+                                response["group_check_failed"] = Value::Bool(true);
+                            }
+                        }
+                    }
+                    Ok(Ok(_)) => (),
+                    _ => response["group_check_failed"] = Value::Bool(true),
                 }
             }
             Ok(response)

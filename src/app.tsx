@@ -1,3 +1,4 @@
+import {waitForVoice} from './speech-voices.js';
 import type {FormEvent, ReactNode} from 'react';
 import {React, ReactDOM, call, exportFile, installDictionary, type DictionaryStatus, type DictionaryProgress} from './runtime.js';
 import {articleMatches, readingLines, selectedOffsets, type Piece} from './reading.js';
@@ -19,6 +20,11 @@ type Detail = {group: Group; senses: Sense[]; marks: Mark[]; vocabulary: Vocabul
 type Selection = {document_id: string; start: number; end: number; surface: string};
 type SavedNote = Sense & {group_name:string; learning?:string|null};
 type Candidates = {context: string; exact: Sense[]; reused: Sense[]; groups: Group[]; notes:SavedNote[]};
+type OrganizationPlan = {
+  merge?: {target_id:string; reason:string} | null;
+  split?: {sense_ids:string[]; name:string; description:string; reason:string} | null;
+  split_checked:boolean;
+};
 type GroupFields = {name: string; description: string; vocabulary: string; tags:string[]};
 type Learning = {usage_note: string; example: string; etymology?:string|null; mnemonic?:string|null;
   ipa_uk?:string|null; ipa_us?:string|null; part_of_speech?:string|null;
@@ -26,40 +32,57 @@ type Learning = {usage_note: string; example: string; etymology?:string|null; mn
 type LexicalFallback = Pick<Learning,'ipa_uk'|'ipa_us'|'part_of_speech'> & {word?:string};
 type LemmaResult = {lemma:string|null; dictionary?:DictionaryResult|null; fallback?:LexicalFallback|null};
 type VerifiedDictionary = {word:string; data:DictionaryResult; revision:number};
-type Suggestion = {suggestion: {lemma: string; meaning: string; group_id: string | null;
-  group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}};
+type Suggestion = {suggestion: {lemma: string; meaning: string; group_id: string | null; sense_id?: string | null; group_reason?: string | null;
+  group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean};
 const blank = (): GroupFields => ({name: '', description: '', vocabulary: '', tags:[]});
 const empty: Library = {documents: [], groups: [], undo: 0, tags:[], tag_links:[]};
 
+let pendingPronunciation: AbortController | undefined;
+
 function Pronunciation({ipa, word, locale}: {ipa?:string|null; word:string; locale?:'en-GB'|'en-US'}) {
   const [error,setError] = useState('');
+  const [loading,setLoading] = useState(false);
+  const request = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => request.current?.abort(), [word,locale,ipa]);
   if (!ipa) return <>—</>;
   if (!locale || !word.trim()) return <>{ipa}</>;
   const label = locale === 'en-GB' ? '播放英式读音' : '播放美式读音';
-  function play() {
+  async function play() {
     const speech = window.speechSynthesis;
-    const voice = speech?.getVoices().find(voice => voice.localService && voice.lang.replace('_','-').toLowerCase() === locale?.toLowerCase());
+    if (!speech || typeof SpeechSynthesisUtterance === 'undefined' || !locale) {
+      setError('当前系统无法播放本地语音。');
+      return;
+    }
+    pendingPronunciation?.abort();
+    const controller = new AbortController();
+    request.current = pendingPronunciation = controller;
+    setError('');
+    setLoading(true);
+    const voice = await waitForVoice(speech, locale, controller.signal);
+    if (request.current !== controller) return;
+    setLoading(false);
+    if (controller.signal.aborted) return;
     if (!voice) {
       setError('未找到对应的本地语音。请检查系统语音设置后重试。');
       return;
     }
-    setError('');
     speech.cancel();
     const utterance = new SpeechSynthesisUtterance(word.trim());
     utterance.lang = voice.lang;
     utterance.voice = voice;
     utterance.onerror = event => {
-      if (event.error !== 'canceled' && event.error !== 'interrupted') setError('读音播放失败，请重试。');
+      if (!controller.signal.aborted && event.error !== 'canceled' && event.error !== 'interrupted') setError('读音播放失败，请重试。');
     };
     speech.speak(utterance);
   }
   return <>
     <span>{ipa}</span>{' '}
-    <button className="pronunciation-play" type="button" aria-label={label + ' · ' + word} title={label} onClick={play}>
+    <button className="pronunciation-play" type="button" aria-label={label + ' · ' + word} title={label} disabled={loading} onClick={()=>void play()}>
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d="M11 5 6 9H3v6h3l5 4V5Zm4 4a4 4 0 0 1 0 6m3-9a8 8 0 0 1 0 12"/>
       </svg>
     </button>
+    {loading && <small role="status">正在载入语音…</small>}
     {error && <small className="error" role="status">{error}</small>}
   </>;
 }
@@ -89,7 +112,23 @@ function LearningPanel({learning, word}: {learning: Learning; word:string}) {
   </section>;
 }
 
-function GroupSenses({groupId, exclude}: {groupId:string; exclude?:string}) {
+function GroupSenses({groupId, exclude, lemma, meaning, ai}: {
+  groupId:string; exclude?:string; lemma:string; meaning:string; ai?:{endpoint:string;model:string}
+}) {
+  const comparisonKey = JSON.stringify([groupId,exclude,lemma,meaning,ai]);
+  const [comparison,setComparison] = useState<{key:string; rows?:{id:string;note:string}[]; error?:string}>();
+  const currentComparison = comparison?.key === comparisonKey ? comparison : undefined;
+  const request = useRef(0);
+  async function compare() {
+    const ticket = ++request.current;
+    setComparison({key:comparisonKey});
+    try {
+      const rows = await call<{id:string;note:string}[]>('compare_group_senses',{...ai,id:groupId,exclude,lemma,meaning});
+      if (request.current===ticket) setComparison({key:comparisonKey,rows});
+    } catch (error) {
+      if (request.current===ticket) setComparison({key:comparisonKey,error:String(error)});
+    }
+  }
   const [result,setResult] = useState<Sense[] | null>();
   useEffect(()=>{
     let current = true;
@@ -102,9 +141,20 @@ function GroupSenses({groupId, exclude}: {groupId:string; exclude?:string}) {
   const senses = result?.filter(sense=>sense.id!==exclude);
   return <section className="related-senses">
     <h3>同组已收录词项</h3>
-    {senses?.length ? <ul>{senses.map(sense=><li key={sense.id}>
-      <b lang="en">{sense.lemma}</b> · {sense.meaning}
-    </li>)}</ul> : <p className="muted" role="status">{senses ? '该组暂无其他已收录词项。' :
+    {ai && lemma.trim() && meaning.trim() && Boolean(senses?.length) && <>
+      <button type="button" disabled={Boolean(currentComparison && !currentComparison.rows && !currentComparison.error)}
+        onClick={()=>void compare()}>比较用法</button>
+      <p className="muted">以「{lemma}」的当前释义为参照，AI 比较{(senses?.length ?? 0)>12 ? '前 12 个' : '这些'}同组词项。</p>
+    </>}
+    {currentComparison && <p className="muted" role="status">{currentComparison.error ||
+      (currentComparison.rows ? (currentComparison.rows.length ? '以下为 AI 用法比较。' : 'AI 未返回用法比较。') : '正在比较用法…')}</p>}
+    {senses?.length ? <ul>{senses.map(sense=>{
+      const difference = currentComparison?.rows?.find(row=>row.id===sense.id);
+      return <li key={sense.id}>
+        <b lang="en">{sense.lemma}</b> · {sense.meaning}
+        {difference && <div className="muted">{difference.note}</div>}
+      </li>;
+    })}</ul> : <p className="muted" role="status">{senses ? '该组暂无其他已收录词项。' :
       result === null ? '暂时无法读取同组词项。' : '正在读取同组词项…'}</p>}
   </section>;
 }
@@ -448,6 +498,12 @@ function App() {
   const [markFilter,setMarkFilter] = useState('');
   const [reclassMeaning,setReclassMeaning] = useState('');
   const [target,setTarget] = useState('');
+  const [organizing,setOrganizing] = useState(false);
+  const [organizationPlan,setOrganizationPlan] = useState<OrganizationPlan|null>(null);
+  const [showLibraryScan,setShowLibraryScan] = useState(false);
+  const [libraryPlans,setLibraryPlans] = useState<{group:Group;plan:OrganizationPlan}[]>([]);
+  const [scanProgress,setScanProgress] = useState<{done:number;total:number;failed:number;running:boolean}|null>(null);
+  const stopLibraryScan = useRef(false);
   const [operation,setOperation] = useState('move');
   const [splitFields,setSplitFields] = useState(blank);
   const [savedAi,setSavedAi] = useState(() => ({
@@ -581,8 +637,42 @@ function App() {
   function clearGroup() {
     setDeleteGroupId('');
     setDetail(null); setGroupFields(blank()); setSelectedSenses([]); setSelectedMarks([]);
-    setTarget(''); setOperation('move'); setSplitFields(blank()); setMarkSense(''); setMarkFilter(''); setReclassMeaning('');
+    setOrganizing(false); setOrganizationPlan(null); setTarget(''); setOperation('move'); setSplitFields(blank()); setMarkSense(''); setMarkFilter(''); setReclassMeaning('');
   }
+  function scanLibrary() {
+    void task(async()=>{
+      const groups = [...lib.groups];
+      const pairs = new Set<string>();
+      const plans: typeof libraryPlans = [];
+      let done = 0, failed = 0, consecutiveFailures = 0;
+      stopLibraryScan.current = false;
+      setLibraryPlans([]);
+      setScanProgress({done,total:groups.length,failed,running:true});
+      for (const group of groups) {
+        if (stopLibraryScan.current || consecutiveFailures >= 3) break;
+        try {
+          const plan = await call<OrganizationPlan>('organize_group',{...savedAi,id:group.id});
+          consecutiveFailures = 0;
+          if (plan.merge) {
+            const pair = [group.id,plan.merge.target_id].sort().join(':');
+            if (pairs.has(pair)) plan.merge = null;
+            else pairs.add(pair);
+          }
+          if (plan.merge || plan.split) {
+            plans.push({group,plan});
+            setLibraryPlans([...plans]);
+          }
+        } catch {
+          failed++;
+          consecutiveFailures++;
+        }
+        setScanProgress({done:++done,total:groups.length,failed,running:true});
+      }
+      setScanProgress({done,total:groups.length,failed,running:false});
+      if (consecutiveFailures >= 3) setNotice('连续三组扫描失败，已停止。请检查 AI 配置后重试。');
+    });
+  }
+
   async function openGroup(id: string) {
     const data = await call<Detail>('group',{id});
     clearGroup(); setManageTags(false); setDetail(data); setMode('library');
@@ -611,7 +701,7 @@ function App() {
       if (selectionRequest.current !== request) return;
       const s = response.suggestion;
       setLearning(s.learning);
-      setLemma(s.lemma);setMeaning(s.meaning);setAttachSense('');setAttachGroup(s.group_id ?? '');
+      setLemma(s.lemma);setMeaning(s.meaning);setAttachSense(s.sense_id ?? '');setAttachGroup(s.group_id ?? '');
       if (!s.group_id) {
         const terms = s.group_vocabulary?.length ? s.group_vocabulary : [
           {expression:s.lemma,note:s.meaning}, ...s.learning.related
@@ -622,8 +712,10 @@ function App() {
         setNewFields(previous=>({name:s.group_name ?? '',description:s.group_description || s.meaning,
           vocabulary:[...new Set(lines)].join('\n'),tags:previous.tags}));
       }
-      setAiNote('AI 建议 · 置信度 ' + Math.round(s.confidence*100) + '%' +
-        (typeof response.usage?.total_tokens === 'number' ? ' · ' + response.usage.total_tokens + ' tokens' : ''));
+      setAiNote((s.sense_id ? 'AI 建议复用已有义项 · 置信度 ' : 'AI 建议 · 置信度 ') + Math.round(s.confidence*100) + '%' +
+        (typeof response.usage?.total_tokens === 'number' ? ' · ' + response.usage.total_tokens + ' tokens' : '') +
+        (s.group_reason ? ' · ' + s.group_reason : '') +
+        (response.group_check_failed ? ' · 语义组补查未完成，请核对归组。' : ''));
     } catch (error) {
       if (selectionRequest.current === request) {
         setAiNote(error instanceof Error ? error.message : String(error));
@@ -666,7 +758,8 @@ function App() {
   }
   const listed = search ?? lib;
   const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()];
-  const selectedGroup = attachSense ? candidateSenses.find(sense=>sense.id===attachSense)?.group_id : attachGroup;
+  const selectedSense = candidateSenses.find(sense=>sense.id===attachSense);
+  const selectedGroup = attachSense ? selectedSense?.group_id : attachGroup;
   const verifiedWord = verifiedDictionary?.revision===dictionaryRevision ? verifiedDictionary.word : undefined;
   const lookupWord = selection ? dictionaryLookupWord(selection.surface,lemma,
     candidateSenses.find(sense=>sense.id===attachSense)?.lemma,verifiedWord) : '';
@@ -749,6 +842,22 @@ function App() {
             {manageTags ? '返回语义组' : '管理标签'}
           </button>
         </section>}
+        {mode==='library' && <section className="tag-navigation" aria-label="AI 整理全库">
+          <button type="button" aria-expanded={showLibraryScan}
+            onClick={()=>setShowLibraryScan(!showLibraryScan)}>AI 整理全库</button>
+          {showLibraryScan && <>
+            <p className="muted">逐组扫描当前词库。每组最多一次 AI 请求，结果由你逐条确认。</p>
+            <button type="button" disabled={busy || !aiConfigured || !lib.groups.length} onClick={scanLibrary}>开始扫描</button>
+            {scanProgress?.running && <button type="button" onClick={()=>{stopLibraryScan.current=true;}}>本组完成后停止</button>}
+            {scanProgress && <p role="status">已扫描 {scanProgress.done}/{scanProgress.total} 组，{libraryPlans.length} 组有建议
+              {scanProgress.failed ? '，失败 '+scanProgress.failed+' 组' : ''}
+              {!scanProgress.running && scanProgress.done < scanProgress.total ? ' · 已停止' : ''}</p>}
+            {libraryPlans.filter(({group})=>lib.groups.some(item=>item.id===group.id)).map(({group,plan})=>
+              <button className="quiet full" type="button" key={group.id} disabled={busy} onClick={()=>void task(async()=>{
+                await openGroup(group.id);setOrganizationPlan(plan);setOrganizing(true);
+              })}>{group.name} · {plan.merge && plan.split ? '合并、拆分' : plan.merge ? '合并' : '拆分'}</button>)}
+          </>}
+        </section>}
         {mode==='library' && <div className="bulk-controls">
           <button className="quiet" disabled={busy} onClick={()=>{
             setBulkMode(!bulkMode);setBulkGroups([]);setBulkConfirm(false);
@@ -830,7 +939,7 @@ function App() {
             <p className="muted">{activeMark.lemma}</p><p>{activeMark.meaning}</p>
             <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
             <DictionaryPanel word={activeMark.lemma || activeMark.surface} revision={dictionaryRevision} fallback={activeLearning}/>
-            <GroupSenses key={activeMark.group_id} groupId={activeMark.group_id} exclude={activeMark.sense_id}/>
+            <GroupSenses key={activeMark.group_id} groupId={activeMark.group_id} exclude={activeMark.sense_id} lemma={activeMark.lemma} meaning={activeMark.meaning} ai={aiConfigured ? savedAi : undefined}/>
             {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
             {(!activeLearning?.part_of_speech || !activeLearning.usage_note || (activeLearning.etymology === undefined && activeLearning.mnemonic === undefined)) && markSuggestion?.id !== activeMark.id && <p>
               <button disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
@@ -887,7 +996,8 @@ function App() {
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
             {aiNote && <p className="muted" role="status">{aiNote}</p>}
             {learning && <LearningPanel learning={learning} word={lookupWord}/>}
-            {selectedGroup && <GroupSenses key={selectedGroup} groupId={selectedGroup} exclude={attachSense}/>}
+            {selectedGroup && <GroupSenses key={selectedGroup} groupId={selectedGroup} exclude={attachSense} lemma={selectedSense?.lemma ?? lemma} meaning={selectedSense?.meaning ?? meaning}
+              ai={aiConfigured ? savedAi : undefined}/>}
             <form onSubmit={e=>submit(e,async ()=>{
               let savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
               if (!attachSense && lexicalFallback?.word?.toLowerCase()===lemma.trim().toLowerCase()) {
@@ -997,6 +1107,83 @@ function App() {
       {mode==='library' && !manageTags && <main className="page manage">
         <p className="eyebrow">SEMANTIC LIBRARY</p>
         <h1>{detail?.group.name ?? '新建语义组'}</h1>
+        {detail && <button type="button" aria-expanded={organizing} onClick={()=>setOrganizing(!organizing)}>
+          {organizing ? '收起整理' : '整理语义组'}
+        </button>}
+        {detail && organizing && <section aria-label="整理语义组">
+          <button type="button" disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
+            setOrganizationPlan(null);
+            setOrganizationPlan(await call<OrganizationPlan>('organize_group',{...savedAi,id:detail.group.id}));
+          })}>AI 扫描</button>
+          <p className="muted">扫描会发送当前组的资料、最多 60 条义项摘要和最多 5 个候选组。建议可预填到下方表单，由你确认。</p>
+          {organizationPlan && <div className="action" aria-label="AI 整理建议">
+            <h3>AI 整理建议</h3>
+            {!organizationPlan.merge && !organizationPlan.split && <p>没有找到明确的整理建议。</p>}
+            {!organizationPlan.split_checked && detail.senses.length > 60 && <p>该组超过 60 条义项，拆分请手动选择。</p>}
+            {organizationPlan.merge && <section>
+              <h4>建议合并到「{lib.groups.find(group=>group.id===organizationPlan.merge?.target_id)?.name}」</h4>
+              <p>{organizationPlan.merge.reason}</p>
+              <button type="button" disabled={busy} onClick={()=>{
+                if (!organizationPlan.merge) return;
+                setOperation('merge');setTarget(organizationPlan.merge.target_id);
+              }}>填入合并建议</button>
+            </section>}
+            {organizationPlan.split && <section>
+              <h4>建议拆出「{organizationPlan.split.name}」</h4>
+              <p>{organizationPlan.split.reason}</p>
+              <ul>{detail.senses.filter(sense=>organizationPlan.split?.sense_ids.includes(sense.id)).map(sense=>
+                <li key={sense.id}><b>{sense.lemma}</b> · {sense.meaning}</li>)}</ul>
+              <button type="button" disabled={busy} onClick={()=>{
+                const split = organizationPlan.split;
+                if (!split) return;
+                setOperation('split');setSelectedSenses(split.sense_ids);
+                setSplitFields({...blank(),name:split.name,description:split.description});
+              }}>填入拆分建议</button>
+            </section>}
+          </div>}
+
+            <form className="action" onSubmit={e=>submit(e,async()=>{
+              const id=await call<string>(operation,{source:detail.group.id,target,sense_ids:selectedSenses,new_group:splitFields});
+              setLibraryPlans(plans=>plans.filter(({group,plan})=>
+                group.id!==detail.group.id && group.id!==id && plan.merge?.target_id!==detail.group.id && plan.merge?.target_id!==id));
+              await refresh(); await openGroup(id);setNotice('关系调整已保存');
+            })}>
+              <label>操作<select value={operation} onChange={e=>setOperation(e.target.value)}>
+                <option value="move">移动所选义项</option><option value="split">将所选义项拆到新组</option><option value="merge">将整个当前组合并到目标组</option>
+              </select></label>
+              {operation!=='merge' && <fieldset className="annotation-fields">
+                <legend>选择义项</legend>
+                {detail.senses.length === 0 && <p className="muted">还没有收录义项。</p>}
+                {detail.senses.map(s=><label className="check" key={s.id}>
+                  <input type="checkbox" checked={selectedSenses.includes(s.id)} onChange={()=>setSelectedSenses(toggle(selectedSenses,s.id))}/>
+                  <b>{s.lemma}</b> <span>{s.meaning}</span>
+                </label>)}
+              </fieldset>}
+              {operation==='split' ? <>
+                <GroupEditor value={splitFields} change={setSplitFields} tags={lib.tags}/>
+                <p className="muted">核心词与搭配留空时，会用拆出的义项生成核心词。也可以先填入，再补充搭配。</p>
+                <button type="button" disabled={busy || !selectedSenses.length || Boolean(splitFields.vocabulary.trim())}
+                  onClick={()=>{
+                    const selected = detail.senses.filter(sense=>selectedSenses.includes(sense.id));
+                    const rows = new Map<string,string>();
+                    for (const sense of selected) {
+                      if (rows.has(sense.lemma)) continue;
+                      const original = detail.vocabulary.find(word=>word.expression.toLowerCase()===sense.lemma.toLowerCase());
+                      const clean = (text:string)=>text.replace(/[|\r\n]+/g,' ').trim();
+                      rows.set(sense.lemma, clean(sense.lemma)+' | '+clean(original?.nuance || sense.meaning));
+                    }
+                    const vocabulary = [...rows.values()].join('\n');
+                    if (vocabulary.length > 6000) {
+                      setNotice('所选核心词超过编辑框上限。留空确认拆分时，应用会自动生成完整列表。');
+                    } else setSplitFields({...splitFields,vocabulary});
+                  }}>填入所选核心词</button>
+              </> :
+                <GroupPicker groups={lib.groups.filter(g=>g.id!==detail.group.id)} value={target} change={setTarget}/>}
+              <p className="muted">{operation==='merge' ? '当前组将移除，全部义项和核心词并入目标组。同名核心词保留目标组版本。' :
+                `已选 ${selectedSenses.length} 个义项，其下的原文链接将随义项一起更新。`}</p>
+              <button disabled={busy || (operation!=='merge' && !selectedSenses.length) || (operation!=='split' && !target)}>{operation==='merge' ? '确认合并' : operation==='split' ? '确认拆分' : '确认移动'}</button>
+            </form>
+        </section>}
         <form onSubmit={e=>submit(e,async()=>{
           const id=await call<string>('group_save',{...groupFields,id:detail?.group.id});
           await refresh();await openGroup(id);setNotice('语义组已保存');
@@ -1022,27 +1209,11 @@ function App() {
           const source=await call<string>('undo');await refresh();await openGroup(source);setNotice('已撤销上次关系调整');
         })}>撤销上次关系调整</button>}
         {detail && <>
-          <section>
-            <h2>义项与组关系</h2>
-            {detail.senses.length === 0 && <p className="muted">还没有收录义项。</p>}
-            {detail.senses.map(s=><label className="check" key={s.id}>
-              <input type="checkbox" checked={selectedSenses.includes(s.id)} onChange={()=>setSelectedSenses(toggle(selectedSenses,s.id))}/>
-              <b>{s.lemma}</b> <span>{s.meaning}</span>
-            </label>)}
-            <form className="action" onSubmit={e=>submit(e,async()=>{
-              const id=await call<string>(operation,{source:detail.group.id,target,sense_ids:selectedSenses,new_group:splitFields});
-              await refresh(); await openGroup(id);setNotice('关系调整已保存');
-            })}>
-              <label>操作<select value={operation} onChange={e=>setOperation(e.target.value)}>
-                <option value="move">移动所选义项</option><option value="split">将所选义项拆到新组</option><option value="merge">将整个当前组合并到目标组</option>
-              </select></label>
-              {operation==='split' ? <GroupEditor value={splitFields} change={setSplitFields} tags={lib.tags}/> :
-                <GroupPicker groups={lib.groups.filter(g=>g.id!==detail.group.id)} value={target} change={setTarget}/>}
-              <p className="muted">{operation==='merge' ? '当前组将移除，全部义项和核心词并入目标组。同名核心词保留目标组版本。' :
-                `已选 ${selectedSenses.length} 个义项，其下的原文链接将随义项一起更新。`}</p>
-              <button disabled={busy || (operation!=='merge' && !selectedSenses.length) || (operation!=='split' && !target)}>应用关系调整</button>
-            </form>
-          </section>
+          {!organizing && <section>
+            <h2>已收录义项</h2>
+            {detail.senses.length ? <ul>{detail.senses.map(s=><li key={s.id}><b>{s.lemma}</b> · {s.meaning}</li>)}</ul>
+              : <p className="muted">还没有收录义项。</p>}
+          </section>}
           <section>
             <h2>原文出现记录 <small>{detail.marks.length}</small></h2>
             <label>筛选义项<select value={markSense} onChange={e=>{
@@ -1069,7 +1240,7 @@ function App() {
 
       {mode==='settings' && <main className="page manage">
         <p className="eyebrow">PREFERENCES</p><h1>设置</h1>
-        <section><h2>AI 分类接口</h2><p>请求 AI 建议或补充学习提示时，会发送选中文字、附近语境和最多五个候选组。开启自动查原形后，词典缺少读音时也会发送选区和附近语境。补充提示也会发送已保存的义项。</p>
+        <section><h2>AI 分类接口</h2><p>请求 AI 建议或补充学习提示时，会发送选中文字、附近语境和最多五个候选组。查词时也可能发送同词的已有义项，用来判断是否复用。建议新建组且本地补查找到其他候选时，会再请求一次归组判断。开启自动查原形后，词典缺少读音时也会发送选区和附近语境。补充提示也会发送已保存的义项。</p>
           <label className="check"><input type="checkbox" checked={autoSuggest} onChange={e=>{
             setAutoSuggest(e.target.checked);
             localStorage.setItem('autoSuggestOnDoubleClick', e.target.checked ? 'on' : 'off');
@@ -1148,16 +1319,16 @@ function HelpPage() {
       <h2>2. 查词和收录</h2>
       <ol>
         <li>双击新词。配置 AI 后，右栏会自动请求语境释义、学习笔记和语义组建议。拖选短语后，可以点「请求 AI 建议」。</li>
-        <li>核对或修改原形、释义和语义组。已有合适义项时，可直接复用。</li>
+        <li>核对原形、释义和归组。同一意思可复用已有义项，只新增原文标注。不同意思可选「填写新义项」。</li>
         <li>点「确认收录」。以后点击原文里的标注，就能打开已保存的笔记。</li>
       </ol>
-      <p>「词源与速记」是 AI 生成的学习提示，旧笔记可点「补充学习笔记」。匹配到已有语义组时，右栏会从本地词库列出同组已收录词项。</p>
+      <p>「词源与速记」是 AI 生成的学习提示，旧笔记可点「补充学习笔记」。匹配到已有组时，右栏会列出同组已收录词项。点「比较用法」，可用 AI 比较最多 12 个词项的侧重点、语气和搭配。</p>
     </section>
 
     <section>
       <h2>3. 配置 AI</h2>
       <p>在「设置」填写服务商提供的完整 <code>/chat/completions</code> 地址、模型名和 API Key，再点「保存密钥」。密钥会保存在当前用户的应用数据中，未加密。</p>
-      <p>AI 请求会发送所选文字、附近语境和少量候选语义组。可在设置里关闭双击自动请求，也可单独关闭词典缺少读音时的 AI 原形查询。手动填写和收录无需配置 AI。</p>
+      <p>AI 请求会发送所选文字、附近语境和少量候选语义组。建议新建组时，应用会先用 AI 给出的检索词补查本地词库。有新候选才追加一次归组请求。可在设置里关闭双击自动请求，也可单独关闭词典缺少读音时的 AI 原形查询。手动填写和收录无需配置 AI。</p>
     </section>
 
     <section>
@@ -1168,7 +1339,7 @@ function HelpPage() {
 
     <section>
       <h2>5. 管理语义组</h2>
-      <p>在「语义库」搜索组名、词语或义项，也可以用标签筛选。打开组后可编辑说明、核心词和标签，并在关系调整里移动义项、拆组或合并组。点原文出现记录可跳回文章中的标注。</p>
+      <p>在「语义库」搜索组名、词语或义项，也可以用标签筛选。打开组后可编辑说明、核心词和标签，也可以点「整理语义组」移动义项、拆组或合并组。「AI 扫描」可以检查当前组，左栏「AI 整理全库」则逐组扫描并集中列出建议。点建议可预填表单，确认后才会修改词库。拆分时可点「填入所选核心词」再编辑，留空则按拆出的义项生成核心词。点原文出现记录可跳回文章中的标注。</p>
     </section>
 
     <section>
