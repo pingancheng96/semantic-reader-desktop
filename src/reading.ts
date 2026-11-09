@@ -76,3 +76,48 @@ export function articleMatches(blocks: Piece[][], query: string) {
     }));
   });
 }
+
+export function editRange(before: string, after: string, cursor: number) {
+  let oldEnd = before.length - (after.length - cursor);
+  let newEnd = cursor;
+  if (oldEnd < 0 || before.slice(oldEnd) !== after.slice(newEnd)) {
+    oldEnd = before.length;
+    newEnd = after.length;
+    while (oldEnd > 0 && newEnd > 0 && before[oldEnd - 1] === after[newEnd - 1]) {
+      oldEnd--;
+      newEnd--;
+    }
+  }
+  let start = 0;
+  while (start < oldEnd && start < newEnd && before[start] === after[start]) start++;
+  return {start, oldEnd, delta: newEnd - oldEnd};
+}
+
+type UnchangedText = {start:number; end:number; offset:number};
+
+export function keepUnchanged(spans: UnchangedText[], before: string, after: string, cursor: number) {
+  const {start, oldEnd, delta} = editRange(before,after,cursor);
+  return spans.flatMap(span=>{
+    const left = Math.min(span.end,start-span.offset);
+    const right = Math.max(span.start,oldEnd-span.offset);
+    const kept: UnchangedText[] = [];
+    if (span.start < left) kept.push({...span,end:left});
+    if (right < span.end) kept.push({...span,start:right,offset:span.offset+delta});
+    return kept;
+  });
+}
+
+export function changedRanges(spans: UnchangedText[], beforeLength: number, afterLength: number) {
+  const changes: {start:number;end:number;delta:number}[] = [];
+  let original = 0;
+  let current = 0;
+  for (const span of [...spans,{start:beforeLength,end:beforeLength,offset:afterLength-beforeLength}]) {
+    const next = span.start + span.offset;
+    if (span.start !== original || next !== current) {
+      changes.push({start:original,end:span.start,delta:(next-current)-(span.start-original)});
+    }
+    original = span.end;
+    current = span.end + span.offset;
+  }
+  return changes;
+}

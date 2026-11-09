@@ -1,7 +1,7 @@
 import {waitForVoice} from './speech-voices.js';
-import type {FormEvent, ReactNode} from 'react';
+import type {ClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode} from 'react';
 import {React, ReactDOM, call, exportFile, installDictionary, type DictionaryStatus, type DictionaryProgress} from './runtime.js';
-import {articleMatches, readingLines, selectedOffsets, type Piece} from './reading.js';
+import {articleMatches, changedRanges, keepUnchanged, readingLines, selectedOffsets, type Piece} from './reading.js';
 import {captionNodes, type WebNode} from './web-captions.js';
 import {facets, type Tag, type TagLink} from './tag-filters.js';
 import {dictionaryLookupWord} from './dictionary-word.js';
@@ -280,12 +280,105 @@ const webTags = new Set(['div','section','article','header','p','h1','h2','h3','
   'ul','ol','li','blockquote','figure','figcaption','table','thead','tbody','tfoot','tr','th','td',
   'pre','dl','dt','dd','strong','b','em','i','code','s','sub','sup','mark','br','hr']);
 
-function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible: boolean; focused: string; onMark: (m: Mark) => void; onSelect: (s: Selection, doubleClick: boolean) => void}) {
+type InlineEdit = {start:number; end:number; text:string; unchanged:ReturnType<typeof keepUnchanged>};
+type EditedDocument = {content:string; positions:{id:string; start:number|null}[]; webNodes?:WebNode[]};
+
+function DeleteSense({sense, busy, remove}: {
+  sense: Pick<Sense,'lemma'|'meaning'>; busy: boolean; remove: () => void;
+}) {
+  const [confirm,setConfirm] = useState(false);
+  return confirm ? <div className="delete-confirm">
+    <p>删除「{sense.lemma} · {sense.meaning}」及它在所有文章中的标注和原文链接？此操作无法撤销，并会清除语义组关系调整的撤销记录。</p>
+    <div className="row">
+      <button type="button" disabled={busy} onClick={()=>setConfirm(false)}>取消</button>
+      <button type="button" className="delete-document" disabled={busy} onClick={remove}>确认删除义项</button>
+    </div>
+  </div> : <button type="button" className="quiet delete-document" disabled={busy}
+    onClick={()=>setConfirm(true)}>删除义项</button>;
+}
+
+function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginEdit, cancel, save}: {
+  data: Read; visible: boolean; focused: string; onMark: (m: Mark) => void;
+  onSelect: (s: Selection, doubleClick: boolean) => void;
+  editing:boolean; busy:boolean; beginEdit:()=>void; cancel:()=>void; save:(edit:EditedDocument)=>void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const {content, format, id, web_layout} = data.document;
   const web = useMemo(() => web_layout ? JSON.parse(web_layout) as WebLayout : null,[web_layout]);
   const captions = useMemo(() => captionNodes(web?.nodes ?? [],content), [web,content]);
   const lines = useMemo(() => web ? [] : readingLines(content, format === 'md'), [content,format,web]);
+  const edits = useRef(new Map<number,InlineEdit>());
+  const [pendingEdit,setPendingEdit] = useState<{edit:EditedDocument;removed:number}|null>(null);
+  function finishEdit() {
+    const changes = [...edits.current.values()].sort((a,b)=>a.start-b.start);
+    const parts: string[] = [];
+    let end = 0;
+    const ranges = new Map<number,{start:number;end:number}>();
+    let delta = 0;
+    for (const edit of changes) {
+      parts.push(content.slice(end,edit.start),edit.text);
+      end = edit.end;
+      const start = edit.start + delta;
+      ranges.set(edit.start,{start,end:start + edit.text.length});
+      delta += edit.text.length - (edit.end - edit.start);
+    }
+    const changed = changes.flatMap(edit=>
+      changedRanges(edit.unchanged,edit.end-edit.start,edit.text.length).map(range=>
+        ({...range,start:range.start+edit.start,end:range.end+edit.start})));
+    let changeIndex = 0;
+    let shift = 0;
+    const positions = data.marks.map(mark=>{
+      while (changed[changeIndex]?.end <= mark.start) shift += changed[changeIndex++].delta;
+      return {id:mark.id,start:changed[changeIndex]?.start < mark.end ? null : mark.start + shift};
+    });
+    let nodeShift = 0;
+    function rebase(nodes:WebNode[]):WebNode[] {
+      return nodes.map(node=>{
+        if (node.type==='element') return {...node,children:rebase(node.children)};
+        if (node.type==='image') return node;
+        const moved = ranges.get(node.start);
+        if (!moved) return {...node,start:node.start+nodeShift,end:node.end+nodeShift};
+        nodeShift = moved.end - node.end;
+        return {...node,...moved};
+      }).filter(node=>node.type!=='text' || node.start!==node.end);
+    }
+    const removed = positions.filter(position=>position.start===null).length;
+    parts.push(content.slice(end));
+    const edit = {content:parts.join(''),positions,webNodes:web && changes.length ? rebase(web.nodes) : undefined};
+    if (removed) setPendingEdit({edit,removed});
+    else save(edit);
+  }
+  function editable(start:number, text:string) {
+    if (!editing) return {};
+    return {
+      contentEditable:'plaintext-only' as const, suppressContentEditableWarning:true,
+      onKeyDown:(event:ReactKeyboardEvent<HTMLElement>)=>{
+        if (event.key==='Enter' && !event.nativeEvent.isComposing) event.preventDefault();
+      },
+      onPaste:(event:ClipboardEvent<HTMLElement>)=>{
+        const pasted = event.clipboardData.getData('text/plain');
+        if (/[\r\n]/.test(pasted)) {
+          event.preventDefault();
+          document.execCommand('insertText',false,pasted.replace(/\r\n?|\n/g,' '));
+        }
+      },
+      onInput:(event:FormEvent<HTMLElement>)=>{
+        if (pendingEdit) setPendingEdit(null);
+        const element = event.currentTarget;
+        const value = element.textContent ?? '';
+        if (value===text) {edits.current.delete(start);return;}
+        const selection = window.getSelection();
+        const cursor = selection?.anchorNode && element.contains(selection.anchorNode)
+          ? (()=>{const range=document.createRange();range.selectNodeContents(element);
+              range.setEnd(selection.anchorNode,selection.anchorOffset);return range.toString().length;})()
+          : value.length;
+        const previous = edits.current.get(start);
+        const unchanged = keepUnchanged(previous?.unchanged ?? [{start:0,end:text.length,offset:0}],
+          previous?.text ?? text,value,cursor);
+        edits.current.set(start,{start,end:start+text.length,text:value,unchanged});
+      }
+    };
+  }
   const input = useRef<HTMLInputElement>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -319,8 +412,12 @@ function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible
   useEffect(() => {
     if (matches.length) ref.current?.querySelector('.article-hit.active')?.scrollIntoView({block:'center'});
   }, [matches,active]);
-  useEffect(() => {
-    if (searchOpen) input.current?.focus();
+  function focusSearch() {
+    input.current?.focus({preventScroll:true});
+    input.current?.select();
+  }
+  useLayoutEffect(() => {
+    if (searchOpen) focusSearch();
   }, [searchOpen]);
   function closeSearch() {
     setSearchOpen(false);
@@ -328,19 +425,26 @@ function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible
     setCurrent(0);
     ref.current?.focus({preventScroll:true});
   }
+  function openSearch() {
+    setSearchOpen(true);
+    focusSearch();
+  }
   useEffect(() => {
-    if (!visible) return;
+    if (!visible || editing) return;
     function find(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey &&
+          (event.code === 'KeyF' || event.key.toLowerCase() === 'f')) {
         event.preventDefault();
-        setSearchOpen(true);
-        input.current?.focus();
-        input.current?.select();
+        openSearch();
       }
     }
-    window.addEventListener('keydown',find);
-    return () => window.removeEventListener('keydown',find);
-  }, [visible]);
+    window.addEventListener('keydown',find,true);
+    window.addEventListener('semantic-reader-find',openSearch);
+    return () => {
+      window.removeEventListener('keydown',find,true);
+      window.removeEventListener('semantic-reader-find',openSearch);
+    };
+  }, [visible,editing]);
   function move(step: number) {
     if (matches.length) setCurrent((active + step + matches.length) % matches.length);
   }
@@ -348,7 +452,7 @@ function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible
     if (focused) document.getElementById('mark-' + focused)?.scrollIntoView({block:'center'});
   }, [focused,data]);
   function capture(doubleClick = false) {
-    if (!ref.current) return;
+    if (editing || !ref.current) return;
     const s = selectedOffsets(ref.current,content,window.getSelection());
     if (!s) return;
     const existing = doubleClick && data.marks.find(mark => mark.start <= s.start && mark.end >= s.end);
@@ -397,8 +501,9 @@ function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible
   function renderWeb(node: WebNode, index: number): ReactNode {
     const className = captions.has(node) ? 'web-caption' : undefined;
     if (node.type === 'text') {
-      return <span key={index} className={className} data-offset={node.start}>
-        {decorate(node.start,content.slice(node.start,node.end))}
+      const text = content.slice(node.start,node.end);
+      return <span key={index} className={className} data-offset={node.start} {...editable(node.start,text)}>
+        {editing ? text : decorate(node.start,text)}
       </span>;
     }
     if (node.type === 'image') {
@@ -412,7 +517,25 @@ function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible
     return React.createElement(node.tag,{key:index,className},node.children.map(renderWeb));
   }
   return <>
-    {searchOpen && <div className="article-search" role="search" aria-label="文章内搜索"
+    <div className="reader-tools">
+      {editing ? <>
+        {pendingEdit && <p role="status">保存后会移除被改动的 {pendingEdit.removed} 条原文标注，对应的词库义项会保留。</p>}
+        <div className="row">
+          <button className="primary" disabled={busy} onClick={()=>pendingEdit ? save(pendingEdit.edit) : finishEdit()}>
+            {pendingEdit ? '确认保存' : '保存'}
+          </button>
+          <button disabled={busy} onClick={cancel}>取消</button>
+        </div>
+      </> : <div className="row">
+        <button className="reader-icon" type="button" onClick={openSearch} aria-label="文章内搜索" title="文章内搜索 · ⌘F / Ctrl+F">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 5 5"/></svg>
+        </button>
+        <button className="primary reader-icon" type="button" disabled={busy} onClick={beginEdit} aria-label="编辑正文" title="编辑正文">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m4 20 1-5L16 4a2.1 2.1 0 0 1 3 3L8 19l-4 1ZM14 6l4 4"/></svg>
+        </button>
+      </div>}
+    </div>
+    {!editing && searchOpen && <div className="article-search" role="search" aria-label="文章内搜索"
       onKeyDown={e=>{
         if (e.key === 'Escape' && !e.nativeEvent.isComposing) {e.preventDefault();closeSearch();}
       }}>
@@ -431,9 +554,11 @@ function Reader({data, visible, focused, onMark, onSelect}: {data: Read; visible
     onMouseUp={e => {if(e.detail < 2) capture();}} onDoubleClick={() => capture(true)}
     onKeyUp={e => {if (e.shiftKey) capture();}}>
     {web ? web.nodes.map(renderWeb) : lines.map(line => <div key={line.start} className={'line ' + line.kind}>
-      {line.pieces.map(piece => {
+      {(editing && !line.pieces.length && line.kind==='text' ? [{start:line.start,text:''} as Piece] : line.pieces).map(piece => {
         const Tag = piece.kind ?? 'span';
-        return <Tag key={piece.start} data-offset={piece.start}>{decorate(piece.start,piece.text)}</Tag>;
+        return <Tag key={piece.start} data-offset={piece.start} {...editable(piece.start,piece.text)}>
+          {editing ? piece.text : decorate(piece.start,piece.text)}
+        </Tag>;
       })}
     </div>)}
   </div></>;
@@ -460,11 +585,12 @@ function App() {
   const [confirmTagMerge,setConfirmTagMerge] = useState(false);
   const [search,setSearch] = useState<Library | null>(null);
   const [read,setRead] = useState<Read | null>(null);
+  const [editing,setEditing] = useState(false);
   const readerPage = useRef<HTMLElement>(null);
   const readerScroll = useRef(0);
   useLayoutEffect(() => {
     if (mode === 'reader' && readerPage.current) readerPage.current.scrollTop = readerScroll.current;
-  }, [mode, read?.document.id]);
+  }, [mode, read?.document.id, editing]);
   const [detail,setDetail] = useState<Detail | null>(null);
   const [bulkMode,setBulkMode] = useState(false);
   const [bulkGroups,setBulkGroups] = useState<string[]>([]);
@@ -632,7 +758,7 @@ function App() {
   async function openDoc(id: string, markId = '') {
     const data = await call<Read>('document',{id});
     if (read?.document.id !== id) readerScroll.current = 0;
-    setDeleteDocId(''); setRead(data); setFocus(markId); setMode('reader'); resetSelection();
+    setEditing(false); setDeleteDocId(''); setRead(data); setFocus(markId); setMode('reader'); resetSelection();
   }
   function clearGroup() {
     setDeleteGroupId('');
@@ -686,6 +812,17 @@ function App() {
     const content = new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(await input.arrayBuffer());
     const id = await call<string>('import',{title:input.name,format,content});
     await refresh(); await openDoc(id); setNotice('已导入 ' + input.name);
+  }
+  async function deleteSense(id: string, groupId: string) {
+    await call('sense_delete',{id});
+    setRead(previous=>previous && {...previous,marks:previous.marks.filter(mark=>mark.sense_id!==id)});
+    resetSelection();
+    if (detail?.group.id === groupId) {
+      if (mode==='library') await openGroup(groupId);
+      else clearGroup();
+    }
+    await refresh();
+    setNotice('已删除义项及其原文链接');
   }
   async function deleteDocument(id: string) {
     await call('document_delete',{id});
@@ -789,7 +926,7 @@ function App() {
   return <div className="app">
     <header className="top"><div className="brand"><img src="./icon.png" alt=""/> Semantic Reader</div>
       <nav aria-label="工作区">
-        <button aria-current={mode==='reader' ? 'page' : undefined} className={mode==='reader'?'current':''} onClick={() => void task(async () => { if (read) await openDoc(read.document.id); else setMode('reader'); })}>阅读器</button>
+        <button aria-current={mode==='reader' ? 'page' : undefined} className={mode==='reader'?'current':''} onClick={() => void task(async () => { if (read && !editing) await openDoc(read.document.id); else setMode('reader'); })}>阅读器</button>
         <button aria-current={mode==='library' ? 'page' : undefined} className={mode==='library'?'current':''} onClick={() => setMode('library')}>语义库</button>
         <button aria-current={mode==='settings' ? 'page' : undefined} className={mode==='settings'?'current':''} onClick={() => setMode('settings')}>设置</button>
         <button aria-current={mode==='help' ? 'page' : undefined} className={mode==='help'?'current':''}
@@ -903,15 +1040,16 @@ function App() {
         </div>
       </aside>
 
-        <main className="page" hidden={mode!=='reader'} ref={readerPage}
+        <div className="reader-frame" hidden={mode!=='reader'}>
+        <main className="page" ref={readerPage}
           onScroll={e=>{if (mode==='reader') readerScroll.current = e.currentTarget.scrollTop;}}>
           {read ? <>
             <p className="eyebrow">READING ROOM · {read.document.source_url ? 'WEB' : read.document.format.toUpperCase()}</p>
             <h1>{read.document.title.replace(/\.(md|markdown|txt)$/i,'')}</h1>
             {read.document.source_url && <p className="muted web-source">来源 · {read.document.source_url}</p>}
-            <div className="document-actions">
+            <div className="document-actions" style={{visibility:editing ? 'hidden' : undefined}}>
               <p className="muted">{read.marks.length} 条标注 · 选中一个词或短语开始收录</p>
-              {read.document.source_url && <button disabled={busy} onClick={()=>void task(async()=>{
+              {read.document.web_layout && <button disabled={busy} onClick={()=>void task(async()=>{
                 const id = read.document.id;
                 const result = await call<{saved:number; missing:number}>('repair_images',{id});
                 await openDoc(id);
@@ -926,11 +1064,22 @@ function App() {
                 <button className="delete-document" disabled={busy} onClick={()=>void task(()=>deleteDocument(read.document.id))}>确认删除文章</button>
               </div>
             </section>}
-            <Reader key={read.document.id} data={read} visible={mode==='reader'} focused={focus} onSelect={capture} onMark={mark=>{resetSelection();setActiveMark(mark);}}/>
+            <Reader key={read.document.id + (editing ? ':edit' : '')} data={read} visible={mode==='reader'}
+              focused={focus} editing={editing} busy={busy} cancel={()=>setEditing(false)}
+              beginEdit={()=>{resetSelection();setFocus('');setDeleteDocId('');setEditing(true);}}
+              save={({content,positions,webNodes})=>void task(async()=>{
+                const {id,content:original} = read.document;
+                const removed = await call<number>('document_edit',{id,original,content,positions,web_nodes:webNodes});
+                await openDoc(id);
+                if (detail) clearGroup();
+                setNotice(removed ? `正文已保存，移除了 ${removed} 条原文标注` : '正文已保存');
+              })}
+              onSelect={capture} onMark={mark=>{resetSelection();setActiveMark(mark);}}/>
           </> : <div className="welcome"><p className="eyebrow">YOUR READING ROOM</p><h1>从一篇文章开始</h1>
             <p>在原文中选中词或短语，保存它在这个语境中的含义。以后点击标注即可回到语义组。</p>
             <button className="primary" onClick={()=>file.current?.click()}>导入第一篇文章</button></div>}
         </main>
+        </div>
         {mode==='reader' && <aside className="inspector">
           <p className="eyebrow">CONTEXT PANEL</p>
           {activeMark ? <>
@@ -938,6 +1087,8 @@ function App() {
             <h2>{activeMark.surface}</h2>
             <p className="muted">{activeMark.lemma}</p><p>{activeMark.meaning}</p>
             <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
+            <DeleteSense key={activeMark.sense_id} sense={activeMark} busy={busy}
+              remove={()=>void task(()=>deleteSense(activeMark.sense_id,activeMark.group_id))}/>
             <DictionaryPanel word={activeMark.lemma || activeMark.surface} revision={dictionaryRevision} fallback={activeLearning}/>
             <GroupSenses key={activeMark.group_id} groupId={activeMark.group_id} exclude={activeMark.sense_id} lemma={activeMark.lemma} meaning={activeMark.meaning} ai={aiConfigured ? savedAi : undefined}/>
             {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
@@ -1211,7 +1362,9 @@ function App() {
         {detail && <>
           {!organizing && <section>
             <h2>已收录义项</h2>
-            {detail.senses.length ? <ul>{detail.senses.map(s=><li key={s.id}><b>{s.lemma}</b> · {s.meaning}</li>)}</ul>
+            {detail.senses.length ? <ul>{detail.senses.map(s=><li key={s.id}><b>{s.lemma}</b> · {s.meaning}
+              <DeleteSense sense={s} busy={busy} remove={()=>void task(()=>deleteSense(s.id,s.group_id))}/>
+            </li>)}</ul>
               : <p className="muted">还没有收录义项。</p>}
           </section>}
           <section>
@@ -1312,7 +1465,8 @@ function HelpPage() {
     <section>
       <h2>1. 导入和阅读</h2>
       <p>在「阅读器」左栏导入 Markdown 或 TXT 文件，也可以粘贴网页地址后导入。左栏搜索按标题或网址查找文章。</p>
-      <p>按 <kbd>⌘F</kbd>（Mac）或 <kbd>Ctrl+F</kbd>（Windows）搜索当前文章。<kbd>Enter</kbd> 跳到下一处，<kbd>Shift+Enter</kbd> 跳到上一处，按 <kbd>Esc</kbd> 或点「关闭」收起搜索。</p>
+      <p>点击阅读区右下角的铅笔可以修改正文。未改动的标注会随文字移动，改到标注时会在保存前提示。编辑时沿用阅读版式，网页图片和来源链接会保留。</p>
+      <p>按 <kbd>⌘F</kbd>（Mac）或 <kbd>Ctrl+F</kbd>（Windows）搜索当前文章，也可以点击右下角的放大镜。<kbd>Enter</kbd> 跳到下一处，<kbd>Shift+Enter</kbd> 跳到上一处，按 <kbd>Esc</kbd> 或点「关闭」收起搜索。</p>
     </section>
 
     <section>
@@ -1339,6 +1493,7 @@ function HelpPage() {
 
     <section>
       <h2>5. 管理语义组</h2>
+      <p>点击已收录的原文标注，或在组详情的「已收录义项」中选择「删除义项」。确认后，该义项和它在所有文章中的原文链接会一起删除。</p>
       <p>在「语义库」搜索组名、词语或义项，也可以用标签筛选。打开组后可编辑说明、核心词和标签，也可以点「整理语义组」移动义项、拆组或合并组。「AI 扫描」可以检查当前组，左栏「AI 整理全库」则逐组扫描并集中列出建议。点建议可预填表单，确认后才会修改词库。拆分时可点「填入所选核心词」再编辑，留空则按拆出的义项生成核心词。点原文出现记录可跳回文章中的标注。</p>
     </section>
 

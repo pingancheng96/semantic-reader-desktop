@@ -325,12 +325,15 @@ pub fn selection(db: &Db, p: &V) -> Result<(V, V, V, String, String)> {
     if surface.trim() != surface || surface.is_empty() || surface.contains(['\n', '\r']) {
         return Err("请选择同一行中的词或短语".into());
     }
+    Ok((doc, json!(start), json!(end), surface.into(), passage_context(content, a, b)))
+}
+
+fn passage_context(content: &str, a: usize, b: usize) -> String {
+    let surface = &content[a..b];
     let prefix: String = content[..a]
-        .rsplit(['\r', '\n'])
-        .next()
-        .unwrap_or("")
         .chars()
         .rev()
+        .take_while(|c| !matches!(c, '\r' | '\n'))
         .take(240)
         .collect::<Vec<_>>()
         .into_iter()
@@ -341,13 +344,73 @@ pub fn selection(db: &Db, p: &V) -> Result<(V, V, V, String, String)> {
         .take_while(|c| !matches!(c, '\r' | '\n'))
         .take(240)
         .collect();
-    Ok((
-        doc,
-        json!(start),
-        json!(end),
-        surface.into(),
-        format!("{prefix}⟦{surface}⟧{suffix}"),
-    ))
+    format!("{prefix}⟦{surface}⟧{suffix}")
+}
+
+fn edit_document(db: &Db, p: &V) -> Result<V> {
+    let key = id(p, "id")?;
+    let args = std::slice::from_ref(&key);
+    let old = db.one("SELECT content,web_layout FROM documents WHERE id=?1", args)?;
+    if old["content"] != p["original"] {
+        return Err("文章已更新，请重新打开后编辑".into());
+    }
+    let content = p["content"].as_str()
+        .filter(|s| !s.trim().is_empty() && s.len() <= 2_000_000 && !s.contains('\0'))
+        .ok_or("正文不能为空，且最大为 2 MB")?;
+    if old["content"] == content {
+        return Ok(json!(0));
+    }
+    let layout = if let Some(raw) = old["web_layout"].as_str() {
+        let mut layout: crate::web_layout::Layout =
+            serde_json::from_str(raw).map_err(|_| "网页版式数据无效")?;
+        layout.nodes = serde_json::from_value(p["web_nodes"].clone())
+            .map_err(|_| "编辑后的网页版式无效")?;
+        let serialized = serde_json::to_string(&layout).map_err(|_| "无法保存网页版式")?;
+        if serialized.len() > crate::web_layout::MAX_LAYOUT_BYTES {
+            return Err("网页版式数据过大".into());
+        }
+        json!(serialized)
+    } else {
+        V::Null
+    };
+    let marks = db.query("SELECT id,surface FROM occurrences WHERE document_id=?1 ORDER BY start,end", args)?;
+    let positions = p["positions"].as_array().ok_or("标注位置无效")?;
+    if positions.len() != marks.len() {
+        return Err("文章标注已更新，请重新打开后编辑".into());
+    }
+
+    // Vacate the old ranges before moving marks to avoid collisions with their unique index.
+    db.query("UPDATE occurrences SET start=start+2000001,end=end+2000001 WHERE document_id=?1", args)?;
+    let mut previous_end = 0;
+    let mut previous_byte = 0;
+    let mut removed = 0;
+    for (mark, position) in marks.iter().zip(positions) {
+        if mark["id"] != position["id"] {
+            return Err("文章标注已更新，请重新打开后编辑".into());
+        }
+        let mark_id = &mark["id"];
+        if position["start"].is_null() {
+            db.write("DELETE FROM occurrences WHERE id=?1", std::slice::from_ref(mark_id))?;
+            removed += 1;
+            continue;
+        }
+        let surface = mark["surface"].as_str().unwrap();
+        let start = position["start"].as_u64().filter(|n| *n <= 2_000_000)
+            .ok_or("标注位置无效")? as usize;
+        let end = start + surface.encode_utf16().count();
+        let gap = start.checked_sub(previous_end).ok_or("标注顺序无效")?;
+        let a = previous_byte + byte_offset(&content[previous_byte..], gap).ok_or("标注起点无效")?;
+        if !content[a..].starts_with(surface) {
+            return Err("标注与编辑后的正文不一致".into());
+        }
+        let b = a + surface.len();
+        previous_end = end;
+        previous_byte = b;
+        db.write("UPDATE occurrences SET start=?1,end=?2,context=?3 WHERE id=?4",
+            &[json!(start), json!(end), json!(passage_context(content, a, b)), mark_id.clone()])?;
+    }
+    db.write("UPDATE documents SET content=?1,web_layout=?2 WHERE id=?3", &[json!(content), layout, key])?;
+    Ok(json!(removed))
 }
 
 fn normalize(text: &str) -> String {
@@ -1009,6 +1072,23 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             db.batch("DELETE FROM operation_history")?;
             Ok(V::Null)
         }),
+        "document_edit" => db.transaction(|| edit_document(db, p)),
+        "sense_delete" => db.transaction(|| {
+            let key = id(p, "id")?;
+            let args = std::slice::from_ref(&key);
+            let sense = db.one(&format!("{SENSES} WHERE s.id=?1"), args)?;
+            let group = &sense["group_id"];
+            db.query("DELETE FROM occurrences WHERE sense_id=?1", args)?;
+            db.write("DELETE FROM senses WHERE id=?1", args)?;
+            // The vocabulary list is separate. Remove this lemma only when the group
+            // no longer has a sense that uses it.
+            db.query("DELETE FROM group_vocabulary WHERE group_id=?1 AND expression=?2 COLLATE NOCASE
+                AND NOT EXISTS(SELECT 1 FROM senses WHERE group_id=?1 AND expression_id=?3)",
+                &[group.clone(), sense["lemma"].clone(), sense["expression_id"].clone()])?;
+            reindex(db, group)?;
+            db.batch("DELETE FROM operation_history")?;
+            Ok(V::Null)
+        }),
         "document_delete" => db.transaction(|| {
             let key = id(p, "id")?;
             db.query(
@@ -1504,6 +1584,35 @@ mod tests {
     }
 
     #[test]
+    fn editing_web_body_keeps_images_and_source() {
+        use crate::web_layout::{Layout, Node};
+        let db = memory();
+        let png = crate::web_layout::image_uri(b"\x89PNG\r\n\x1a\n").unwrap();
+        let url = "https://example.org/news";
+        let doc = import_web(&db, crate::web_import::Page {
+            url: url.into(),
+            title: "News".into(),
+            content: "Headline".into(),
+            images: Vec::new(),
+            layout: Some(Layout {
+                nodes: vec![Node::Text { start: 0, end: 8 }, Node::Image { index: 0, alt: "Photo".into() }],
+                images: vec![Some(png.clone())],
+                image_errors: Vec::new(),
+            }),
+        }).unwrap();
+        run(&db, "document_edit", &json!({
+            "id":doc, "original":"Headline", "content":"New headline", "positions":[],
+            "web_nodes":[{"type":"text","start":0,"end":12},{"type":"image","index":0,"alt":"Photo"}]
+        })).unwrap();
+        let result = run(&db, "document", &json!({"id":doc})).unwrap();
+        let layout: V = serde_json::from_str(result["document"]["web_layout"].as_str().unwrap()).unwrap();
+        assert_eq!(result["document"]["content"], "New headline");
+        assert_eq!(result["document"]["source_url"], url);
+        assert_eq!(layout["nodes"][0]["end"], 12);
+        assert_eq!(layout["images"][0], png);
+    }
+
+    #[test]
     fn bulk_group_delete_is_atomic_and_deduplicates_ids() {
         let db = memory();
         let a = create(&db, "A");
@@ -1544,6 +1653,60 @@ mod tests {
             .query("PRAGMA foreign_key_check", &[])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn editing_body_moves_unchanged_marks_and_keeps_removed_marks_senses() {
+        let db = memory();
+        let original = "Prices plunged. They plunged.";
+        let doc = import(&db, "Article.txt", "txt", original).unwrap();
+        let group = create(&db, "Decline");
+        let first = annotate_at(&db, anchor(original, &doc, 7), &group, "下降");
+        let second = annotate_at(&db, anchor(original, &doc, 21), &group, "下落");
+        let content = "🙂 Prices plunged. They rose.";
+        let mut edit = json!({"id":doc,"original":original,"content":content,
+            "positions":[{"id":first,"start":8},{"id":second,"start":null}]});
+        assert!(run(&db, "document_edit", &edit).is_err());
+        let before = run(&db, "document", &json!({"id":doc})).unwrap();
+        assert_eq!(before["document"]["content"], original);
+        assert_eq!(before["marks"].as_array().unwrap().len(), 2);
+        edit["positions"][0]["start"] = json!(10);
+        assert_eq!(run(&db, "document_edit", &edit).unwrap(), 1);
+        assert!(run(&db, "document_edit", &edit).is_err());
+        let after = run(&db, "document", &json!({"id":doc})).unwrap();
+        assert_eq!(after["document"]["content"], content);
+        assert_eq!(after["marks"].as_array().unwrap().len(), 1);
+        assert_eq!(after["marks"][0]["id"], first);
+        assert_eq!(after["marks"][0]["context"], "🙂 Prices ⟦plunged⟧. They rose.");
+        assert_eq!(group_senses(&db, &group).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_one_sense_removes_its_links_across_articles_and_preserves_other_senses() {
+        let db = memory();
+        let text = "Prices plunged. They plunged.";
+        let first = import(&db, "First.txt", "txt", text).unwrap();
+        let second = import(&db, "Second.txt", "txt", text).unwrap();
+        let group = create(&db, "Decline");
+        db.write("INSERT INTO group_vocabulary VALUES(?1,'plunge','')", &[group.clone()]).unwrap();
+        annotate_at(&db, anchor(text, &first, 7), &group, "Financial loss");
+        annotate_at(&db, anchor(text, &second, 7), &group, "Financial loss");
+        let other = annotate_at(&db, anchor(text, &first, 21), &group, "Jumped");
+        let sense = run(&db, "document", &json!({"id":second})).unwrap()["marks"][0]["sense_id"].clone();
+        run(&db, "sense_delete", &json!({"id":sense})).unwrap();
+        let remaining = run(&db, "group", &json!({"id":group})).unwrap();
+        assert_eq!(remaining["senses"].as_array().unwrap().len(), 1);
+        assert_eq!(remaining["marks"].as_array().unwrap().len(), 1);
+        assert_eq!(remaining["marks"][0]["id"], other);
+        assert!(groups(&db, "Financial", None).unwrap().is_empty());
+        let after = run(&db, "document", &json!({"id":second})).unwrap();
+        assert_eq!(after["document"]["content"], text);
+        assert_eq!(after["marks"], json!([]));
+        assert!(remaining["vocabulary"].as_array().unwrap().iter().any(|row| row["expression"] == "plunge"));
+        run(&db, "sense_delete", &json!({"id":remaining["senses"][0]["id"]})).unwrap();
+        let empty = run(&db, "group", &json!({"id":group})).unwrap();
+        assert!(empty["vocabulary"].as_array().unwrap().iter().all(|row| row["expression"] != "plunge"));
+        assert_eq!(empty["senses"], json!([]));
     }
 
     #[test]

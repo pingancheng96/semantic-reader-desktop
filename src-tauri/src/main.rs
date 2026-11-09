@@ -327,8 +327,34 @@ async fn export_file(
     .map_err(|_| "导出失败")?
 }
 
+#[cfg(target_os = "macos")]
+fn reader_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItemKind, MenuItem};
+    let menu = Menu::default(app)?;
+    for item in menu.items()? {
+        if let MenuItemKind::Submenu(submenu) = item {
+            if submenu.text()? == "Edit" {
+                submenu.append(&MenuItem::with_id(
+                    app, "find-in-article", "Find in Article", true, Some("CommandOrControl+F"),
+                )?)?;
+                break;
+            }
+        }
+    }
+    Ok(menu)
+}
+
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(reader_menu).on_menu_event(|app, event| {
+        if event.id() == "find-in-article" {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.eval("window.dispatchEvent(new Event('semantic-reader-find'))");
+            }
+        }
+    });
+    builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let directory = match std::env::var_os("SEMANTIC_READER_DATA_DIR") {

@@ -34,6 +34,8 @@ section > label { margin: .8rem 0; }
 .shelf, .inspector { background: #eeefe8; }
 .shelf { border-right: 1px solid #dce0d7; }
 .inspector { border-left: 1px solid #dce0d7; }
+.reader-frame { position: relative; min-width: 0; min-height: 0; }
+.reader-frame > .page { height: 100%; }
 .page { padding: clamp(1.5rem,4vw,4rem); }
 .manage { padding-right: max(3rem, calc(100% - 52rem)); }
 .eyebrow { font-size: .72rem; font-weight: 700; letter-spacing: .13em; color: #537065; margin: 0 0 .7rem; }
@@ -144,7 +146,7 @@ button.delete-document { color: #a22f29; }
 
 
 
-.article-search { display: flex; gap: .45rem; align-items: center; flex-wrap: wrap; margin: .75rem 0; position: sticky; top: 0; z-index: 1; padding: .4rem; background: #f8f8f1; border-radius: .45rem; }
+.article-search { display: flex; gap: .45rem; align-items: center; flex-wrap: wrap; margin: 0; position: absolute; inset: .75rem .75rem auto; z-index: 3; padding: .4rem; background: #f8f8f1; border-radius: .45rem; }
 .article-search input { width: auto; flex: 1 1 10rem; min-width: 0; }
 .article-search [role="status"] { font-variant-numeric: tabular-nums; }
 .article-hit { background: #fceaa4; color: #262319; }
@@ -158,3 +160,13 @@ button.delete-document { color: #a22f29; }
 .help-page section { margin-top: 1.8rem; }
 .help-page li + li { margin-top: .35rem; }
 .help-page kbd { background: #e9eee5; border-radius: .25rem; padding: .08rem .28rem; }
+
+.reader-tools { position: absolute; right: .85rem; bottom: .85rem; z-index: 2; max-width: calc(100% - 1.7rem); }
+.reader-tools .row { justify-content: flex-end; margin: 0; }
+.reader-tools button { box-shadow: 0 2px 8px #20303226; }
+.reader-tools p { background: #fffefa; border: 1px solid #ccd2c9; padding: .6rem; border-radius: .45rem; }
+.reader-icon { display: grid; place-items: center; width: 2.4rem; height: 2.4rem; padding: 0; border-radius: 50%; }
+.reader-icon svg { width: 1.15rem; height: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.reading [contenteditable] { cursor: text; }
+.reading [contenteditable]:empty { display: inline-block; min-width: 1em; min-height: 1em; }
+.reading [contenteditable]:focus { outline: 2px solid #aac7af; border-radius: .15rem; }
