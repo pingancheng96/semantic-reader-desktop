@@ -12,7 +12,10 @@ type Group = {id: string; name: string; description: string};
 type Vocabulary = {expression: string; nuance: string};
 type Sense = {id: string; lemma: string; meaning: string; group_id: string};
 type Mark = {id: string; document_id: string; title: string; sense_id: string; start: number; end: number;
-  surface: string; context: string; lemma: string; meaning: string; group_id: string; group_name: string; learning?: string | null};
+  surface: string; context: string; context_meaning?:string|null; lemma: string; meaning: string; group_id: string; group_name: string; learning?: string | null};
+type Snapshot = {id:string; timestamp:number; safety:boolean};
+const snapshotLabel = (snapshot:Snapshot) =>
+  new Date(snapshot.timestamp).toLocaleString() + (snapshot.safety ? ' · 恢复前自动备份' : '');
 type Library = {documents: Item[]; groups: Group[]; undo: number; tags:Tag[]; tag_links:TagLink[]};
 type WebLayout = {nodes:WebNode[]; images:(string|null)[]; image_errors?:(string|null)[]};
 type Read = {document: Item & {content: string; web_layout?: string | null}; marks: Mark[]};
@@ -32,7 +35,7 @@ type Learning = {usage_note: string; example: string; etymology?:string|null; mn
 type LexicalFallback = Pick<Learning,'ipa_uk'|'ipa_us'|'part_of_speech'> & {word?:string};
 type LemmaResult = {lemma:string|null; dictionary?:DictionaryResult|null; fallback?:LexicalFallback|null};
 type VerifiedDictionary = {word:string; data:DictionaryResult; revision:number};
-type Suggestion = {suggestion: {lemma: string; meaning: string; group_id: string | null; sense_id?: string | null; group_reason?: string | null;
+type Suggestion = {suggestion: {lemma: string; meaning: string; context_meaning:string; group_id: string | null; sense_id?: string | null; group_reason?: string | null;
   group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean};
 const blank = (): GroupFields => ({name: '', description: '', vocabulary: '', tags:[]});
 const empty: Library = {documents: [], groups: [], undo: 0, tags:[], tag_links:[]};
@@ -295,6 +298,116 @@ function DeleteSense({sense, busy, remove}: {
     </div>
   </div> : <button type="button" className="quiet delete-document" disabled={busy}
     onClick={()=>setConfirm(true)}>删除义项</button>;
+}
+
+type MergeTarget = {id:string;meaning:string;group_name:string;links:number};
+function MergeSense({sense,links,busy,load,merge}: {
+  sense:Sense;links:number;busy:boolean;
+  load:(receive:(options:MergeTarget[])=>void)=>void;
+  merge:(target:string,meaning:string)=>void;
+}) {
+  const [options,setOptions] = useState<MergeTarget[]|null>(null);
+  const [target,setTarget] = useState('');
+  const [meaning,setMeaning] = useState('');
+  const chosen = options?.find(item=>item.id===target);
+  if (!options) return <button type="button" className="quiet" disabled={busy}
+    onClick={()=>load(setOptions)}>合并义项…</button>;
+  return <form className="action" onSubmit={event=>{
+    event.preventDefault();
+    if (chosen && meaning.trim()) merge(chosen.id,meaning);
+  }}>
+    {options.length ? <>
+      <label>保留哪个义项<select value={target} disabled={busy} onChange={event=>{
+        const id=event.target.value;
+        setTarget(id);setMeaning(options.find(item=>item.id===id)?.meaning ?? '');
+      }}>
+        <option value="">选择同词义项</option>
+        {options.map(item=><option key={item.id} value={item.id}>{item.group_name} · {item.meaning}</option>)}
+      </select></label>
+      {chosen && <>
+        <label>合并后的通用义项<textarea required maxLength={1200} disabled={busy}
+          value={meaning} onChange={event=>setMeaning(event.target.value)}/></label>
+        <p>将「{sense.meaning}」并入「{chosen.group_name}」中的所选义项。合并后保留两条义项的 {links+chosen.links} 处原文链接和学习笔记。已有本句释义会保留，缺少本句释义的链接会沿用原义项释义。</p>
+        <p className="muted">确认后会清除语义组关系调整的撤销记录。</p>
+      </>}
+    </> : <p>没有找到同一词形的其他义项。</p>}
+    <div className="row">
+      <button type="button" disabled={busy} onClick={()=>{setOptions(null);setTarget('');}}>取消</button>
+      {chosen && <button type="submit" disabled={busy || !meaning.trim()}>确认合并义项</button>}
+    </div>
+  </form>;
+}
+
+type GlossChange = {
+  key:string;id:string;kind:'sense'|'mark';lemma:string;previous:string|null;
+  general:string;sense_id:string;context:string|null;meaning:string;
+};
+
+function toggle(list: string[], id: string) {
+  return list.includes(id) ? list.filter(x => x !== id) : [...list,id];
+}
+
+function LibraryGlossOrganizer({busy,configured,scan,apply}: {
+  busy:boolean;configured:boolean;
+  scan:(cursor:string|null,receive:(changes:GlossChange[],next:string|null)=>void,stopped:()=>boolean)=>void;
+  apply:(changes:GlossChange[],done:()=>void)=>void;
+}) {
+  const [changes,setChanges] = useState<GlossChange[]>([]);
+  const [excluded,setExcluded] = useState<string[]>([]);
+  const [cursor,setCursor] = useState<string|null>(null);
+  const [batches,setBatches] = useState(0);
+  const [complete,setComplete] = useState(false);
+  const [query,setQuery] = useState('');
+  const [page,setPage] = useState(0);
+  const running = useRef(false);
+  const stop = useRef(false);
+  useEffect(()=>()=>{stop.current=true;},[]);
+  const selected = changes.filter(item=>!excluded.includes(item.key));
+  const matches = changes.filter(item=>item.lemma.toLowerCase().includes(query.trim().toLowerCase()));
+  const pageCount = Math.ceil(matches.length/30);
+  return <section aria-label="一次性整理全库释义">
+    <h2>一次性整理全库释义</h2>
+    <p>扫描全库义项和未单独填写本句释义的原文链接。早期版本从义项复制到标注的释义也会纳入。</p>
+    <p>开始后会先自动备份，再分批把词形、已有释义和相关原文片段发送到你配置的 AI 服务。词库只在确认后更新。</p>
+    <div className="row">
+      <button type="button" disabled={busy || !configured} onClick={()=>{
+        if (!cursor) {
+          setChanges([]);setExcluded([]);setBatches(0);setComplete(false);setPage(0);
+        }
+        stop.current=false;running.current=true;
+        scan(cursor,(items,next)=>{
+          setChanges(previous=>[...previous,...items]);setCursor(next);
+          setBatches(count=>count+1);setComplete(next===null);
+          if (next===null) running.current=false;
+        },()=>stop.current);
+      }}>{cursor ? '继续生成预览' : '开始备份并生成预览'}</button>
+      {busy && running.current && <button type="button" onClick={()=>{stop.current=true;}}>本批完成后停止</button>}
+    </div>
+    {!configured && <p className="muted">请先在设置中配置 AI。</p>}
+    {batches>0 && <p role="status">已检查 {batches} 批 · {changes.length} 条建议
+      {complete ? ' · 扫描完成' : ' · 可继续扫描'}</p>}
+    {changes.length>0 && <>
+      <label>按词形筛选预览<input value={query} onChange={event=>{setQuery(event.target.value);setPage(0);}}/></label>
+      {matches.slice(page*30,page*30+30).map(item=><section className="action" key={item.key}>
+        <label className="check"><input type="checkbox" checked={!excluded.includes(item.key)}
+          disabled={busy} onChange={()=>setExcluded(items=>toggle(items,item.key))}/>
+          <b>{item.lemma}</b> · {item.kind==='sense' ? '通用义项' : '本句释义'}</label>
+        {item.kind==='mark' && item.context && <blockquote>{item.context}</blockquote>}
+        <p>原释义 · {item.previous ?? item.general}</p>
+        <p>建议 · {item.meaning}</p>
+      </section>)}
+      {pageCount>1 && <div className="row">
+        <button type="button" disabled={page===0} onClick={()=>setPage(page-1)}>上一页</button>
+        <span>{page+1} / {pageCount}</span>
+        <button type="button" disabled={page+1>=pageCount} onClick={()=>setPage(page+1)}>下一页</button>
+      </div>}
+      <p className="muted">写入会保留原文链接和学习笔记，并清除语义组关系调整的撤销记录。与其他义项释义冲突的项目会跳过。</p>
+      <button className="primary" type="button" disabled={busy || !complete || !selected.length}
+        onClick={()=>apply(selected,()=>{
+          setChanges([]);setExcluded([]);setBatches(0);setComplete(false);setPage(0);
+        })}>确认写入所选（{selected.length}）</button>
+    </>}
+  </section>;
 }
 
 function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginEdit, cancel, save}: {
@@ -611,6 +724,7 @@ function App() {
   const [autoLemma,setAutoLemma] = useState(()=>localStorage.getItem('autoDictionaryLemma')!=='off');
   const [lemma,setLemma] = useState('');
   const [meaning,setMeaning] = useState('');
+  const [contextMeaning,setContextMeaning] = useState('');
   const [attachGroup,setAttachGroup] = useState('');
   const [attachSense,setAttachSense] = useState('');
   const [newFields,setNewFields] = useState(blank);
@@ -650,6 +764,21 @@ function App() {
   const lock = useRef(false);
   const lemmaRequests = useRef(new Map<string,Promise<LemmaResult>>());
   const file = useRef<HTMLInputElement>(null);
+  const [snapshots,setSnapshots] = useState<Snapshot[]>([]);
+  const [snapshotId,setSnapshotId] = useState('');
+  const [confirmSnapshot,setConfirmSnapshot] = useState(false);
+  useEffect(() => {
+    if (mode!=='settings') return;
+    let active = true;
+    void call<Snapshot[]>('snapshot_list').then(
+      items=>{if (active) setSnapshots(items);},
+      error=>{if (active) setError(String(error));}
+    );
+    return ()=>{active=false;};
+  },[mode]);
+  const selectedSnapshot = snapshots.find(snapshot=>snapshot.id===snapshotId);
+  const previewFile = useRef<HTMLInputElement>(null);
+  const [backupPreview,setBackupPreview] = useState<{name:string;data:BackupPreviewData}|null>(null);
   const backupFile = useRef<HTMLInputElement>(null);
 
   async function task(action: () => Promise<void>) {
@@ -765,11 +894,17 @@ function App() {
     setDetail(null); setGroupFields(blank()); setSelectedSenses([]); setSelectedMarks([]);
     setOrganizing(false); setOrganizationPlan(null); setTarget(''); setOperation('move'); setSplitFields(blank()); setMarkSense(''); setMarkFilter(''); setReclassMeaning('');
   }
+  function ignoreLibrarySuggestion(plan: OrganizationPlan, kind: 'merge'|'split') {
+    const remaining = {...plan,[kind]:null};
+    const hasSuggestions = Boolean(remaining.merge || remaining.split);
+    setLibraryPlans(current=>current.flatMap(entry=>entry.plan!==plan
+      ? [entry] : hasSuggestions ? [{...entry,plan:remaining}] : []));
+    setOrganizationPlan(current=>current===plan ? hasSuggestions ? remaining : null : current);
+  }
   function scanLibrary() {
     void task(async()=>{
       const groups = [...lib.groups];
       const pairs = new Set<string>();
-      const plans: typeof libraryPlans = [];
       let done = 0, failed = 0, consecutiveFailures = 0;
       stopLibraryScan.current = false;
       setLibraryPlans([]);
@@ -785,8 +920,7 @@ function App() {
             else pairs.add(pair);
           }
           if (plan.merge || plan.split) {
-            plans.push({group,plan});
-            setLibraryPlans([...plans]);
+            setLibraryPlans(current=>[...current,{group,plan}]);
           }
         } catch {
           failed++;
@@ -838,7 +972,7 @@ function App() {
       if (selectionRequest.current !== request) return;
       const s = response.suggestion;
       setLearning(s.learning);
-      setLemma(s.lemma);setMeaning(s.meaning);setAttachSense(s.sense_id ?? '');setAttachGroup(s.group_id ?? '');
+      setLemma(s.lemma);setMeaning(s.meaning);setContextMeaning(s.context_meaning);setAttachSense(s.sense_id ?? '');setAttachGroup(s.group_id ?? '');
       if (!s.group_id) {
         const terms = s.group_vocabulary?.length ? s.group_vocabulary : [
           {expression:s.lemma,note:s.meaning}, ...s.learning.related
@@ -869,7 +1003,7 @@ function App() {
     autoAnalysis.current = automatic;
     setSuggesting(automatic);
     setSelection(s); setActiveMark(null); setCandidate(null); setAiNote(''); setLearning(null);
-    setVerifiedDictionary(null);setLexicalFallback(null);setLemmaNotice('');setLemma(s.surface); setMeaning(''); setAttachGroup(''); setAttachSense(''); setNewFields(blank());
+    setVerifiedDictionary(null);setLexicalFallback(null);setLemmaNotice('');setLemma(s.surface); setMeaning(''); setContextMeaning(''); setAttachGroup(''); setAttachSense(''); setNewFields(blank());
     void call<Candidates>('candidates',s).then(options=>{
       if (selectionRequest.current !== request) return;
       setCandidate(options);
@@ -889,9 +1023,6 @@ function App() {
   function submit(e: FormEvent, action: () => Promise<void>) {
     e.preventDefault();
     void task(action);
-  }
-  function toggle(list: string[], id: string) {
-    return list.includes(id) ? list.filter(x => x !== id) : [...list,id];
   }
   const listed = search ?? lib;
   const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()];
@@ -986,13 +1117,20 @@ function App() {
             <p className="muted">逐组扫描当前词库。每组最多一次 AI 请求，结果由你逐条确认。</p>
             <button type="button" disabled={busy || !aiConfigured || !lib.groups.length} onClick={scanLibrary}>开始扫描</button>
             {scanProgress?.running && <button type="button" onClick={()=>{stopLibraryScan.current=true;}}>本组完成后停止</button>}
-            {scanProgress && <p role="status">已扫描 {scanProgress.done}/{scanProgress.total} 组，{libraryPlans.length} 组有建议
+            {scanProgress && <p role="status">已扫描 {scanProgress.done}/{scanProgress.total} 组，{libraryPlans.length} 组待查看
               {scanProgress.failed ? '，失败 '+scanProgress.failed+' 组' : ''}
               {!scanProgress.running && scanProgress.done < scanProgress.total ? ' · 已停止' : ''}</p>}
             {libraryPlans.filter(({group})=>lib.groups.some(item=>item.id===group.id)).map(({group,plan})=>
-              <button className="quiet full" type="button" key={group.id} disabled={busy} onClick={()=>void task(async()=>{
-                await openGroup(group.id);setOrganizationPlan(plan);setOrganizing(true);
-              })}>{group.name} · {plan.merge && plan.split ? '合并、拆分' : plan.merge ? '合并' : '拆分'}</button>)}
+              (['merge','split'] as const).filter(kind=>plan[kind]).map(kind=>{
+                const label = kind==='merge' ? '合并' : '拆分';
+                return <div className="row" key={group.id + kind}>
+                  <button className="quiet" type="button" disabled={busy} onClick={()=>void task(async()=>{
+                    await openGroup(group.id);setOrganizationPlan(plan);setOrganizing(true);
+                  })}>{group.name} · {label}</button>
+                  <button className="quiet" type="button" aria-label={`忽略「${group.name}」的${label}建议`}
+                    disabled={busy && !scanProgress?.running} onClick={()=>ignoreLibrarySuggestion(plan,kind)}>忽略</button>
+                </div>;
+              }))}
           </>}
         </section>}
         {mode==='library' && <div className="bulk-controls">
@@ -1085,7 +1223,9 @@ function App() {
           {activeMark ? <>
 
             <h2>{activeMark.surface}</h2>
-            <p className="muted">{activeMark.lemma}</p><p>{activeMark.meaning}</p>
+            <p className="muted">{activeMark.lemma}</p>
+            <p><b>本句释义</b> · {activeMark.context_meaning || activeMark.meaning}</p>
+            <p><b>通用义项</b> · {activeMark.meaning}</p>
             <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
             <DeleteSense key={activeMark.sense_id} sense={activeMark} busy={busy}
               remove={()=>void task(()=>deleteSense(activeMark.sense_id,activeMark.group_id))}/>
@@ -1159,7 +1299,7 @@ function App() {
                   part_of_speech:savedLearning?.part_of_speech || lexicalFallback.part_of_speech
                 };
               }
-              await call('annotate',{...selection,lemma,meaning,learning:savedLearning,
+              await call('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
                 sense_id:attachSense || null,group_id:attachGroup || null,
                 new_group:newFields});
               window.getSelection()?.removeAllRanges();
@@ -1170,9 +1310,11 @@ function App() {
                 <option value="">填写新义项</option>
                 {candidateSenses.map(s=><option key={s.id} value={s.id}>{s.lemma} · {s.meaning}</option>)}
               </select></label>}
+              <label>本句释义<textarea value={contextMeaning} maxLength={1200}
+                placeholder="可留空，沿用通用义项" onChange={e=>setContextMeaning(e.target.value)}/></label>
               {!attachSense && <>
                 <label>原形或表达<input value={lemma} required maxLength={240} onChange={e=>setLemma(e.target.value)}/></label>
-                <label>语境义项<textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
+                <label>通用义项<textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
                 <GroupPicker groups={lib.groups} value={attachGroup} change={setAttachGroup} placeholder="新建语义组"/>
                   {!attachGroup && <GroupEditor value={newFields} change={setNewFields} tags={lib.tags}/>}
               </>}
@@ -1363,6 +1505,14 @@ function App() {
           {!organizing && <section>
             <h2>已收录义项</h2>
             {detail.senses.length ? <ul>{detail.senses.map(s=><li key={s.id}><b>{s.lemma}</b> · {s.meaning}
+              <MergeSense sense={s} busy={busy} links={detail.marks.filter(mark=>mark.sense_id===s.id).length}
+                load={receive=>void task(async()=>receive(await call<MergeTarget[]>('sense_merge_options',{id:s.id})))}
+                merge={(target,meaning)=>void task(async()=>{
+                  const groupId=await call<string>('sense_merge',{source:s.id,target,meaning});
+                  if (read) setRead(await call<Read>('document',{id:read.document.id}));
+                  resetSelection();setLibraryPlans([]);await refresh();await openGroup(groupId);
+                  setNotice('义项已合并，原文链接和学习笔记已保留');
+                })}/>
               <DeleteSense sense={s} busy={busy} remove={()=>void task(()=>deleteSense(s.id,s.group_id))}/>
             </li>)}</ul>
               : <p className="muted">还没有收录义项。</p>}
@@ -1378,7 +1528,8 @@ function App() {
               <div className="backlink" key={m.id}>
                 {markSense && <input type="checkbox" aria-label={'选择 ' + m.surface} checked={selectedMarks.includes(m.id)} onChange={()=>setSelectedMarks(toggle(selectedMarks,m.id))}/>}
                 <div><button className="quiet" disabled={busy} onClick={()=>void task(()=>openDoc(m.document_id,m.id))}>{m.title} ↗</button>
-                  <p><b>{m.surface}</b> · {m.context}</p></div>
+                  <p><b>{m.surface}</b> · {m.context}</p>
+                  <p>本句释义 · {m.context_meaning || m.meaning}</p></div>
               </div>)}
             {markSense && <Reclassify key={markSense} {...{groups:lib.groups,selectedMarks,reclassMeaning,setReclassMeaning,busy}}
               apply={groupId=>void task(async()=>{
@@ -1436,10 +1587,75 @@ function App() {
               value={dictionaryProgress.total ? dictionaryProgress.bytes : undefined}/>
           </div>}
         </section>
-        <section><h2>数据导出</h2>
+        <LibraryGlossOrganizer busy={busy} configured={aiConfigured}
+          scan={(resume,receive,stopped)=>void task(async()=>{
+            if (!resume) setSnapshots(await call<Snapshot[]>('snapshot_create'));
+            let cursor = resume ?? '';
+            do {
+              const batch = await call<{changes:GlossChange[];next:string|null}>('organize_glosses',{...savedAi,cursor});
+              if (batch.next && batch.next<=cursor) throw Error('扫描进度无效，请重新开始');
+              receive(batch.changes,batch.next);
+              cursor = batch.next ?? '';
+            } while (cursor && !stopped());
+          })}
+          apply={(changes,done)=>void task(async()=>{
+            const result=await call<{applied:number;conflicts:number}>('gloss_apply',{changes});
+            done();
+            if (read) setRead(await call<Read>('document',{id:read.document.id}));
+            resetSelection();clearGroup();setLibraryPlans([]);await refresh();
+            setNotice(`已写入 ${result.applied} 条释义${result.conflicts ? `，跳过 ${result.conflicts} 条重复释义` : ''}`);
+          })}/>
+        <section><h2>备份与恢复</h2>
+          <p>快照保存在这台设备，包含文章、网页图片、语义库、标签、原文标注和学习笔记。</p>
           <button disabled={busy} onClick={()=>void task(async()=>{
-            if (await exportFile()) setNotice('已导出 JSON 词汇库');
-          })}>导出完整词汇库 JSON</button>
+            const items = await call<Snapshot[]>('snapshot_create');
+            setSnapshots(items);
+            setSnapshotId(items[0]?.id ?? '');
+            setConfirmSnapshot(false);setBackupPreview(null);
+            setNotice('备份已自动保存');
+          })}>导出备份</button>
+          {snapshots.length>0 ? <>
+            <label>本地备份（{snapshots.length} 份）<select size={Math.max(2,Math.min(6,snapshots.length))}
+              value={snapshotId} disabled={busy} onChange={e=>{
+                setSnapshotId(e.target.value);setConfirmSnapshot(false);setBackupPreview(null);
+              }}>
+              {snapshots.map(snapshot=><option key={snapshot.id} value={snapshot.id}>{snapshotLabel(snapshot)}</option>)}
+            </select></label>
+            <div className="row">
+              <button disabled={busy || !selectedSnapshot} onClick={()=>void task(async()=>{
+                if (!selectedSnapshot) return;
+                const data = await call<unknown>('snapshot_preview',{id:selectedSnapshot.id});
+                setBackupPreview({name:snapshotLabel(selectedSnapshot),data:parseBackupPreview(data)});
+              })}>查看所选备份</button>
+              <button disabled={busy || !selectedSnapshot} onClick={()=>setConfirmSnapshot(true)}>恢复所选备份</button>
+            </div>
+          </> : <p className="muted">暂无本地快照。</p>}
+          {confirmSnapshot && selectedSnapshot && <section className="delete-confirm" aria-label="确认恢复快照">
+            <p>恢复到 {snapshotLabel(selectedSnapshot)}？当前文章和词库会被替换。应用会先自动备份当前数据。</p>
+            <div className="row">
+              <button disabled={busy} onClick={()=>setConfirmSnapshot(false)}>取消</button>
+              <button className="delete-document" disabled={busy} onClick={()=>void task(async()=>{
+                await call('snapshot_restore',{id:selectedSnapshot.id});
+                setConfirmSnapshot(false);setSnapshotId('');setBackupPreview(null);
+                setRead(null);setFocus('');setEditing(false);readerScroll.current=0;resetSelection();clearGroup();
+                setSelectedTags([]);setBulkGroups([]);setLibraryPlans([]);setScanProgress(null);
+                await refresh();
+                setSnapshots(await call<Snapshot[]>('snapshot_list'));
+                setNotice('已恢复快照，恢复前的数据已自动备份');
+              })}>确认恢复</button>
+            </div>
+          </section>}
+          {backupPreview && <BackupPreview key={backupPreview.name} {...backupPreview} close={()=>setBackupPreview(null)}/>}
+        </section>
+        <section><h2>外部文件</h2>
+          <button disabled={busy} onClick={()=>previewFile.current?.click()}>查看导出的 JSON</button>
+          <input hidden ref={previewFile} type="file" accept=".json,application/json" onChange={e=>{
+            const input=e.currentTarget.files?.[0];e.currentTarget.value='';
+            if (input) void task(async()=>{
+              const data = parseBackupPreview(JSON.parse(await input.text()));
+              setBackupPreview({name:input.name,data});
+            });
+          }}/>
           <button disabled={busy} onClick={()=>backupFile.current?.click()}>从 JSON 恢复到空词汇库</button>
           <input hidden ref={backupFile} type="file" accept=".json,application/json" onChange={e=>{
             const input=e.currentTarget.files?.[0];e.currentTarget.value='';
@@ -1450,10 +1666,77 @@ function App() {
             });
           }}/>
           {read && <button disabled={busy} onClick={()=>void task(async()=>{if(await exportFile(read.document.id)) setNotice('已导出原文');})}>导出当前原文</button>}
+          {backupPreview && <BackupPreview key={backupPreview.name} {...backupPreview} close={()=>setBackupPreview(null)}/>}
         </section>
       </main>}
     </div>
   </div>;
+}
+
+type BackupPreviewData = {
+  documents:{id:string;title:string;content:string;source_url?:string|null}[];
+  semantic_groups:Group[];
+  expressions:{id:string;lemma:string}[];
+  senses:(Omit<Sense,'lemma'> & {expression_id:string})[];
+  occurrences:Pick<Mark,'id'|'document_id'|'sense_id'|'surface'|'context'|'context_meaning'>[];
+};
+
+function parseBackupPreview(value:unknown):BackupPreviewData {
+  const data = value as Record<string,unknown> | null;
+  const tables = {
+    documents:['id','title','content'],semantic_groups:['id','name','description'],
+    expressions:['id','lemma'],senses:['id','group_id','expression_id','meaning'],
+    occurrences:['id','document_id','sense_id','surface','context']
+  };
+  if (!data || typeof data.version!=='number' || ![1,2,3,4,5,6,7,8].includes(data.version) ||
+      !Object.entries(tables).every(([table,columns])=>{
+        const rows = data[table];
+        return Array.isArray(rows) && rows.every(row=>row && columns.every(key=>typeof row[key]==='string'));
+      })) throw Error('请选择 Semantic Reader 导出的完整词汇库 JSON');
+  return value as BackupPreviewData;
+}
+
+function BackupPreview({name,data,close}: {name:string;data:BackupPreviewData;close:()=>void}) {
+  const panel = useRef<HTMLElement>(null);
+  useEffect(()=>{panel.current?.scrollIntoView({block:'nearest'});},[data]);
+  const [view,setView] = useState<'articles'|'groups'>('articles');
+  const [query,setQuery] = useState('');
+  const [selected,setSelected] = useState('');
+  const documents = useMemo(()=>new Map(data.documents.map(doc=>[doc.id,doc])),[data]);
+  const expressions = useMemo(()=>new Map(data.expressions.map(item=>[item.id,item.lemma])),[data]);
+  const doc = view==='articles' ? documents.get(selected) : undefined;
+  const group = view==='groups' ? data.semantic_groups.find(item=>item.id===selected) : undefined;
+  const senses = group ? data.senses.filter(sense=>sense.group_id===group.id) : [];
+  const senseIds = new Set(senses.map(sense=>sense.id));
+  const marks = (doc || group) ? data.occurrences.filter(mark=>doc ? mark.document_id===doc.id : senseIds.has(mark.sense_id)) : [];
+  const items = (view==='articles' ? data.documents.map(item=>({id:item.id,name:item.title}))
+    : data.semantic_groups).filter(item=>item.name.toLowerCase().includes(query.trim().toLowerCase()));
+  return <section ref={panel} className="action" aria-label="备份预览">
+    <div className="row"><b>{name}</b><button type="button" onClick={close}>关闭预览</button></div>
+    <p>{data.documents.length} 篇文章 · {data.semantic_groups.length} 个语义组 · {data.senses.length} 个义项 · {data.occurrences.length} 条原文链接</p>
+    <div className="row">
+      <button type="button" aria-pressed={view==='articles'} onClick={()=>{setView('articles');setSelected('');setQuery('');}}>文章</button>
+      <button type="button" aria-pressed={view==='groups'} onClick={()=>{setView('groups');setSelected('');setQuery('');}}>语义组</button>
+    </div>
+    <label>{view==='articles' ? '搜索文章标题' : '搜索语义组名称'}<input value={query} onChange={e=>setQuery(e.target.value)}/></label>
+    <label>{view==='articles' ? '选择文章' : '选择语义组'}<select value={items.some(item=>item.id===selected) ? selected : ''}
+      onChange={e=>setSelected(e.target.value)}>
+      <option value="">{items.length ? '请选择' : '没有匹配结果'}</option>
+      {items.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}
+    </select></label>
+    {doc && <><h3>{doc.title}</h3>{typeof doc.source_url==='string' && <p className="muted">{doc.source_url}</p>}
+      <pre className="backup-text">{doc.content}</pre></>}
+    {group && <><h3>{group.name}</h3><p>{group.description}</p>
+      <ul>{senses.map(sense=><li key={sense.id}>{expressions.get(sense.expression_id)} · {sense.meaning}</li>)}</ul></>}
+    {(doc || group) && <details><summary>原文链接（{marks.length}）</summary>
+      <ul>{marks.map(mark=><li key={mark.id}><b>{mark.surface}</b> · {mark.context}
+        {typeof mark.context_meaning==='string' && <p>本句释义 · {mark.context_meaning}</p>}
+        {group && <> · <button className="quiet" type="button" onClick={()=>{
+          setView('articles');setQuery('');setSelected(mark.document_id);
+        }}>{documents.get(mark.document_id)?.title ?? '查看文章'}</button></>}
+      </li>)}</ul>
+    </details>}
+  </section>;
 }
 
 function HelpPage() {
@@ -1499,7 +1782,7 @@ function HelpPage() {
 
     <section>
       <h2>6. 备份和恢复</h2>
-      <p>在「设置 → 数据导出」保存完整词汇库 JSON。换设备后，可以在空词汇库中恢复该文件。API Key 和离线词典需要在新设备上单独配置。</p>
+      <p>在「设置 → 备份与恢复」点「导出备份」，应用会自动保存带时间戳的 JSON。可以在列表中按时间查看和恢复备份，恢复前会自动备份当前数据。「外部文件」可以查看以前导出的 JSON，或将其恢复到空词汇库。API Key 和离线词典需要在新设备上单独配置。</p>
     </section>
   </main>;
 }

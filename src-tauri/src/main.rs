@@ -2,6 +2,7 @@
 
 mod ai;
 mod dictionary;
+mod snapshots;
 mod sqlite;
 mod store;
 mod tags;
@@ -112,6 +113,17 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             .map_err(|_| "读取同组词项失败")??;
             ai::compare_group_senses(&payload, key, input).await
         }
+        "organize_glosses" => {
+            let params = payload.clone();
+            let (input, key) = tauri::async_runtime::spawn_blocking(move || {
+                let db = Db::open(&path)?;
+                let input = db.snapshot(|| store::gloss_batch(&db, &params))?;
+                Ok::<_, String>((input, ai::request_key(&path, &params)?))
+            })
+            .await
+            .map_err(|_| "读取释义候选失败")??;
+            ai::organize_glosses(&payload, key, input).await
+        }
         "organize_group" => {
             let params = payload.clone();
             let (input, key) = tauri::async_runtime::spawn_blocking(move || {
@@ -202,6 +214,12 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
         .map_err(|_| "密钥操作失败")?,
         _ => tauri::async_runtime::spawn_blocking(move || {
             let db = Db::open(&path)?;
+            if matches!(
+                op.as_str(),
+                "snapshot_list" | "snapshot_create" | "snapshot_preview" | "snapshot_restore"
+            ) {
+                return snapshots::run(&db, &path, &op, &payload);
+            }
             if op == "import" {
                 let title = store::field(&payload, "title", 255, true)?;
                 let format = store::field(&payload, "format", 3, true)?;
@@ -297,7 +315,16 @@ async fn export_file(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("semantic-reader-export");
-        let Some(destination) = app.dialog().file().set_file_name(name).blocking_save_file() else {
+        let timestamp = db.one(
+            "SELECT strftime('%Y-%m-%d_%H-%M-%S', 'now', 'localtime') AS timestamp",
+            &[],
+        )?;
+        let timestamp = timestamp["timestamp"].as_str().ok_or("无法读取导出时间")?;
+        let name = match name.rsplit_once('.') {
+            Some((stem, extension)) if !stem.is_empty() => format!("{stem}_{timestamp}.{extension}"),
+            _ => format!("{name}_{timestamp}"),
+        };
+        let Some(destination) = app.dialog().file().set_file_name(&name).blocking_save_file() else {
             return Ok(false);
         };
         let destination = destination.into_path().map_err(|_| "请选择本地文件位置")?;

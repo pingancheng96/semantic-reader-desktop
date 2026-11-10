@@ -20,7 +20,8 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
             Some(4) => (),
             Some(5) => (),
             Some(6) => (),
-            Some(7) => return Ok(()),
+            Some(7) => return migrate_context_meaning(db),
+            Some(8) => return Ok(()),
             _ => return Err("数据库版本不兼容".into()),
         }
         if matches!(version, Some(1..=3)) {
@@ -34,8 +35,14 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
             tags::install_unesco(db)?;
             db.write("INSERT INTO tag_defaults VALUES(1,?1)",&[empty])?;
         }
-        Ok(())
+        migrate_context_meaning(db)
     })
+}
+
+fn migrate_context_meaning(db: &Db) -> Result<()> {
+    db.batch("ALTER TABLE occurrences ADD COLUMN context_meaning TEXT;
+        UPDATE occurrences SET context_meaning=(SELECT meaning FROM senses WHERE senses.id=occurrences.sense_id);
+        PRAGMA user_version=8;")
 }
 
 fn uuid() -> V {
@@ -613,8 +620,9 @@ fn annotate(db: &Db, p: &V) -> Result<V> {
     };
     let key = uuid();
     let learning = learning_value(&p["learning"])?;
+    let context_meaning = field(p, "context_meaning", 1200, false)?;
     db.write(
-        "INSERT INTO occurrences(id,document_id,sense_id,start,end,surface,context,learning) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        "INSERT INTO occurrences(id,document_id,sense_id,start,end,surface,context,learning,context_meaning) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         &[
             key.clone(),
             doc,
@@ -624,9 +632,113 @@ fn annotate(db: &Db, p: &V) -> Result<V> {
             json!(surface),
             json!(context),
             learning,
+            json!((!context_meaning.is_empty()).then_some(context_meaning)),
         ],
     )?;
     Ok(key)
+}
+
+pub fn gloss_batch(db: &Db, p: &V) -> Result<V> {
+    let cursor = field(p, "cursor", 40, false)?;
+    let mut rows = db.query(
+        "WITH work AS (
+            SELECT 'a:'||s.id AS key,'sense' AS kind,s.id,e.lemma,s.meaning AS previous,
+                s.meaning AS general,s.id AS sense_id,
+                (SELECT context FROM occurrences WHERE sense_id=s.id ORDER BY id LIMIT 1) AS context
+            FROM senses s JOIN expressions e ON e.id=s.expression_id
+            UNION ALL
+            SELECT 'b:'||o.id,'mark',o.id,e.lemma,o.context_meaning,s.meaning,s.id,o.context
+            FROM occurrences o JOIN senses s ON s.id=o.sense_id JOIN expressions e ON e.id=s.expression_id
+            WHERE o.context_meaning IS NULL OR o.context_meaning=s.meaning
+         ) SELECT * FROM work WHERE key>?1 ORDER BY key LIMIT 13",
+        &[json!(cursor)],
+    )?;
+    let next = if rows.len() > 12 {
+        rows.pop();
+        rows[11]["key"].clone()
+    } else {
+        V::Null
+    };
+    Ok(json!({"rows":rows,"next":next}))
+}
+
+fn apply_glosses(db: &Db, p: &V) -> Result<V> {
+    let changes = p["changes"].as_array().filter(|rows| !rows.is_empty()).ok_or("请选择要写入的释义")?;
+    let mut seen = std::collections::HashSet::new();
+    let mut applied = 0;
+    let mut conflicts = 0;
+    let mut groups = std::collections::HashSet::new();
+    // Write contextual glosses first so their original general sense can still be checked.
+    for kind in ["mark", "sense"] {
+        for row in changes.iter().filter(|row| row["kind"] == kind) {
+            let key = id(row, "id")?;
+            if !seen.insert((kind, key.clone())) {
+                return Err("释义列表包含重复项目".into());
+            }
+            let meaning = json!(field(row, "meaning", 1200, true)?);
+            let args = std::slice::from_ref(&key);
+            if kind == "mark" {
+                let old = db.one("SELECT o.context_meaning,o.sense_id,o.context,s.meaning FROM occurrences o
+                    JOIN senses s ON s.id=o.sense_id WHERE o.id=?1", args)?;
+                if old["context_meaning"] != row["previous"] || old["sense_id"] != row["sense_id"]
+                    || old["meaning"] != row["general"] || old["context"] != row["context"] {
+                    return Err("原文标注已变更，请重新生成预览".into());
+                }
+                db.write("UPDATE occurrences SET context_meaning=?1 WHERE id=?2", &[meaning,key])?;
+            } else {
+                let old = db.one("SELECT meaning,group_id,expression_id FROM senses WHERE id=?1", args)?;
+                if old["meaning"] != row["previous"] {
+                    return Err("通用义项已变更，请重新生成预览".into());
+                }
+                if !db.query("SELECT id FROM senses WHERE group_id=?1 AND expression_id=?2 AND meaning=?3 AND id<>?4",
+                    &[old["group_id"].clone(),old["expression_id"].clone(),meaning.clone(),key.clone()])?.is_empty() {
+                    conflicts += 1;
+                    continue;
+                }
+                db.query("UPDATE occurrences SET context_meaning=?1 WHERE sense_id=?2 AND context_meaning IS NULL",
+                    &[old["meaning"].clone(),key.clone()])?;
+                db.write("UPDATE senses SET meaning=?1 WHERE id=?2", &[meaning,key])?;
+                groups.insert(old["group_id"].clone());
+            }
+            applied += 1;
+        }
+    }
+    if applied + conflicts != changes.len() {
+        return Err("释义类型无效".into());
+    }
+    for group in groups {
+        reindex(db, &group)?;
+    }
+    if applied > 0 {
+        db.batch("DELETE FROM operation_history")?;
+    }
+    Ok(json!({"applied":applied,"conflicts":conflicts}))
+}
+
+fn merge_senses(db: &Db, p: &V) -> Result<V> {
+    let source = id(p, "source")?;
+    let target = id(p, "target")?;
+    let meaning = field(p, "meaning", 1200, true)?;
+    if source == target {
+        return Err("请选择两个不同的义项".into());
+    }
+    let sql = "SELECT * FROM senses WHERE id=?1";
+    let from = db.one(sql, std::slice::from_ref(&source))?;
+    let to = db.one(sql, std::slice::from_ref(&target))?;
+    if from["expression_id"] != to["expression_id"] {
+        return Err("只能合并同一词形的义项".into());
+    }
+    for sense in [&from, &to] {
+        db.query("UPDATE occurrences SET context_meaning=coalesce(context_meaning,?1) WHERE sense_id=?2",
+            &[sense["meaning"].clone(),sense["id"].clone()])?;
+    }
+    db.query("UPDATE occurrences SET sense_id=?1 WHERE sense_id=?2", &[target.clone(), source.clone()])?;
+    db.write("DELETE FROM senses WHERE id=?1", &[source])?;
+    db.write("UPDATE senses SET meaning=?1 WHERE id=?2", &[json!(meaning),target])?;
+    reindex(db, &from["group_id"])?;
+    reindex(db, &to["group_id"])?;
+    db.batch("DELETE FROM operation_history")?;
+    Ok(to["group_id"].clone())
 }
 
 fn regroup(db: &Db, op: &str, p: &V) -> Result<V> {
@@ -873,12 +985,30 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
             "surface",
             "context",
             "learning",
+            "context_meaning",
         ],
     ),
 ];
 
+pub fn backup_data(db: &Db) -> Result<V> {
+    let mut data = json!({"version":8});
+    for &(table, _) in BACKUP_TABLES {
+        data[table] = json!(db.query(&format!("SELECT * FROM {table}"), &[])?);
+    }
+    Ok(data)
+}
+
+// The caller holds a write transaction so a validation or disk error rolls back the replacement.
+pub fn replace_backup(db: &Db, data: &V) -> Result<V> {
+    for &(table, _) in BACKUP_TABLES.iter().rev() {
+        db.batch(&format!("DELETE FROM {table}"))?;
+    }
+    db.batch("DELETE FROM group_search; DELETE FROM operation_history;")?;
+    restore(db, data)
+}
+
 fn restore(db: &Db, p: &V) -> Result<V> {
-    if !matches!(p["version"].as_u64(), Some(1 | 2 | 3 | 4 | 5 | 6 | 7)) {
+    if !matches!(p["version"].as_u64(), Some(1 | 2 | 3 | 4 | 5 | 6 | 7 | 8)) {
         return Err("JSON 导出版本不兼容".into());
     }
     let defaults = db.query("SELECT pristine FROM tag_defaults WHERE id=1", &[])?;
@@ -919,6 +1049,17 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                     }
                     if col == "id" || col.ends_with("_id") {
                         return id(row, col);
+                    }
+                    if col == "context_meaning" {
+                        if p["version"].as_u64().unwrap_or(0) < 8 && row[col].is_null() {
+                            let sense = db.one("SELECT meaning FROM senses WHERE id=?1", &[id(row,"sense_id")?])?;
+                            return Ok(sense["meaning"].clone());
+                        }
+                        return match &row[col] {
+                            V::Null => Ok(V::Null),
+                            V::String(_) => Ok(json!(field(row,col,1200,true)?)),
+                            _ => Err("本句释义格式无效".into()),
+                        };
                     }
                     if col == "learning" {
                         return match &row[col] {
@@ -992,7 +1133,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
     for row in db.query("SELECT id FROM semantic_groups", &[])? {
         reindex(db, &row["id"])?;
     }
-    if !defaults.is_empty() && p["version"] != 7 {
+    if !defaults.is_empty() && p["version"].as_u64().unwrap_or(0) < 7 {
         tags::install_unesco(db)?;
     }
     tags::mark_defaults_modified(db)?;
@@ -1073,6 +1214,16 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             Ok(V::Null)
         }),
         "document_edit" => db.transaction(|| edit_document(db, p)),
+        "sense_merge_options" => Ok(json!(db.query(
+            "SELECT s.id,s.meaning,g.name AS group_name,
+                (SELECT count(*) FROM occurrences WHERE sense_id=s.id) AS links
+             FROM senses s JOIN semantic_groups g ON g.id=s.group_id
+             WHERE s.expression_id=(SELECT expression_id FROM senses WHERE id=?1) AND s.id<>?1
+             ORDER BY g.name,s.meaning,s.id",
+            &[id(p,"id")?],
+        )?)),
+        "gloss_apply" => db.transaction(|| apply_glosses(db, p)),
+        "sense_merge" => db.transaction(|| merge_senses(db, p)),
         "sense_delete" => db.transaction(|| {
             let key = id(p, "id")?;
             let args = std::slice::from_ref(&key);
@@ -1098,13 +1249,7 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             db.write("DELETE FROM documents WHERE id=?1", &[key])?;
             Ok(V::Null)
         }),
-        "backup" => db.transaction(|| {
-            let mut data = json!({"version":7});
-            for &(table, _) in BACKUP_TABLES {
-                data[table] = json!(db.query(&format!("SELECT * FROM {table}"), &[])?);
-            }
-            Ok(data)
-        }),
+        "backup" => db.snapshot(|| backup_data(db)),
         "learning_save" => {
             let mark = id(p, "id")?;
             let learning = learning_value(&p["learning"])?;
@@ -1161,6 +1306,113 @@ mod tests {
         data["lemma"] = json!("plunge");
         data["meaning"] = json!(meaning);
         run(db, "annotate", &data).unwrap()
+    }
+
+    #[test]
+    fn global_gloss_cleanup_updates_single_senses_and_keeps_explicit_glosses() {
+        let db = memory();
+        let text = "Prices plunged. They plunged.";
+        let doc = import(&db, "Article.txt", "txt", text).unwrap();
+        let group = create(&db, "Decline");
+        let first = annotate_at(&db, anchor(text, &doc, 7), &group, "价格暴跌");
+        let mut second_anchor = anchor(text, &doc, 21);
+        second_anchor["context_meaning"] = json!("他们急速下落");
+        let second = annotate_at(&db, second_anchor, &group, "价格暴跌");
+        let batch = gloss_batch(&db, &V::Null).unwrap();
+        let rows = batch["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let mut sense = rows[0].clone();
+        let mut mark = rows[1].clone();
+        assert_eq!(sense["kind"], "sense");
+        assert_eq!(mark["id"], first);
+        sense["meaning"] = json!("突然急剧下降");
+        mark["meaning"] = json!("价格大幅下跌");
+        let mut stale = sense.clone();
+        stale["previous"] = json!("失效");
+        assert!(run(&db, "gloss_apply", &json!({"changes":[mark,stale]})).is_err());
+        let before = run(&db, "document", &json!({"id":doc})).unwrap();
+        assert!(before["marks"][0]["context_meaning"].is_null());
+        assert_eq!(run(&db, "gloss_apply", &json!({"changes":[sense,mark]})).unwrap()["applied"], 2);
+        let after = run(&db, "document", &json!({"id":doc})).unwrap();
+        assert_eq!(after["marks"][0]["context_meaning"], "价格大幅下跌");
+        assert_eq!(after["marks"][1]["context_meaning"], "他们急速下落");
+        assert_eq!(after["marks"][1]["id"], second);
+        assert_eq!(after["marks"][0]["meaning"], "突然急剧下降");
+        assert_eq!(after["marks"][0]["sense_id"], after["marks"][1]["sense_id"]);
+    }
+
+    #[test]
+    fn merging_same_word_senses_keeps_occurrence_glosses_and_notes() {
+        let db = memory();
+        let text = "Prices plunged. They plunged.";
+        let doc = import(&db, "Article.txt", "txt", text).unwrap();
+        let first_group = create(&db, "Financial change");
+        let second_group = create(&db, "Rapid movement");
+        let first = annotate_at(&db, anchor(text, &doc, 7), &first_group, "价格暴跌");
+        let mut second_anchor = anchor(text, &doc, 21);
+        second_anchor["context_meaning"] = json!("他们猛地向下跳");
+        second_anchor["learning"] = json!({"usage_note":"旧笔记","example":"They plunged.","related":[]});
+        let second = annotate_at(&db, second_anchor, &second_group, "突然下降");
+        let source = group_senses(&db, &first_group).unwrap()[0]["id"].clone();
+        let target = group_senses(&db, &second_group).unwrap()[0]["id"].clone();
+        let options = run(&db, "sense_merge_options", &json!({"id":source})).unwrap();
+        assert_eq!(options[0]["id"], target);
+        assert_eq!(options[0]["links"], 1);
+        assert_eq!(run(&db, "sense_merge", &json!({
+            "source":source,"target":target,"meaning":"迅速向下移动"
+        })).unwrap(), second_group);
+        let result = run(&db, "document", &json!({"id":doc})).unwrap();
+        let marks = result["marks"].as_array().unwrap();
+        assert_eq!(marks[0]["id"], first);
+        assert_eq!(marks[1]["id"], second);
+        assert_eq!(marks[0]["context_meaning"], "价格暴跌");
+        assert_eq!(marks[1]["context_meaning"], "他们猛地向下跳");
+        assert!(marks[1]["learning"].as_str().unwrap().contains("旧笔记"));
+        assert!(marks.iter().all(|mark| mark["meaning"] == "迅速向下移动" && mark["sense_id"] == target));
+        assert!(group_senses(&db, &first_group).unwrap().is_empty());
+        let data = run(&db, "backup", &V::Null).unwrap();
+        let restored = memory();
+        run(&restored, "restore", &data).unwrap();
+        assert_eq!(run(&restored, "document", &json!({"id":doc})).unwrap(), result);
+    }
+
+    #[test]
+    fn local_snapshots_replace_library_with_links_and_keep_a_recovery_point() {
+        use crate::snapshots;
+        let db = memory();
+        let directory = std::env::temp_dir().join(format!("semantic-reader-snapshots-{}", Uuid::new_v4()));
+        let path = directory.join("library.sqlite3");
+        let text = "They plunged.";
+        let doc = import(&db, "First.txt", "txt", text).unwrap();
+        let group = create(&db, "Movement");
+        let mark = annotate_at(&db, anchor(text, &doc, 5), &group, "跳入");
+        let saved = snapshots::run(&db, &path, "snapshot_create", &V::Null).unwrap();
+        let id = &saved[0]["id"];
+        let preview = snapshots::run(&db, &path, "snapshot_preview", &json!({"id":id})).unwrap();
+        assert_eq!(preview["documents"][0]["content"], text);
+        assert_eq!(preview["occurrences"][0]["id"], mark);
+        assert!(preview["documents"][0].get("web_layout").is_none());
+        run(&db, "document_delete", &json!({"id":doc})).unwrap();
+        let replacement = import(&db, "Second.txt", "txt", "Later document").unwrap();
+
+        snapshots::run(&db, &path, "snapshot_restore", &json!({"id":id})).unwrap();
+        let restored = run(&db, "document", &json!({"id":doc})).unwrap();
+        assert_eq!(restored["document"]["content"], text);
+        assert_eq!(restored["marks"][0]["id"], mark);
+        assert_eq!(run(&db, "group", &json!({"id":group})).unwrap()["marks"][0]["document_id"], doc);
+        assert!(run(&db, "document", &json!({"id":replacement})).is_err());
+
+        let entries = snapshots::run(&db, &path, "snapshot_list", &V::Null).unwrap();
+        let safety = entries.as_array().unwrap().iter().find(|item| item["safety"] == true).unwrap();
+        let invalid = "1-manual-00000000-0000-0000-0000-000000000000";
+        std::fs::write(directory.join("snapshots").join(format!("{invalid}.json")), r#"{"version":7}"#).unwrap();
+        assert!(snapshots::run(&db, &path, "snapshot_restore", &json!({"id":invalid})).is_err());
+        assert_eq!(run(&db, "document", &json!({"id":doc})).unwrap(), restored);
+
+        snapshots::run(&db, &path, "snapshot_restore", &json!({"id":safety["id"]})).unwrap();
+        assert!(run(&db, "document", &json!({"id":replacement})).is_ok());
+        assert!(run(&db, "document", &json!({"id":doc})).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

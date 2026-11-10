@@ -170,3 +170,5 @@ button.delete-document { color: #a22f29; }
 .reading [contenteditable] { cursor: text; }
 .reading [contenteditable]:empty { display: inline-block; min-width: 1em; min-height: 1em; }
 .reading [contenteditable]:focus { outline: 2px solid #aac7af; border-radius: .15rem; }
+
+.backup-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22rem; overflow: auto; }
