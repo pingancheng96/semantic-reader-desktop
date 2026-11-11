@@ -20,8 +20,10 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
             Some(4) => (),
             Some(5) => (),
             Some(6) => (),
-            Some(7) => return migrate_context_meaning(db),
-            Some(8) => return Ok(()),
+            Some(7) => { migrate_context_meaning(db)?; return migrate_pdf(db); },
+            Some(8) => return migrate_pdf(db),
+            Some(9) => return migrate_pdf_storage(db),
+            Some(10) => return Ok(()),
             _ => return Err("数据库版本不兼容".into()),
         }
         if matches!(version, Some(1..=3)) {
@@ -35,7 +37,8 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
             tags::install_unesco(db)?;
             db.write("INSERT INTO tag_defaults VALUES(1,?1)",&[empty])?;
         }
-        migrate_context_meaning(db)
+        migrate_context_meaning(db)?;
+        migrate_pdf(db)
     })
 }
 
@@ -43,6 +46,175 @@ fn migrate_context_meaning(db: &Db) -> Result<()> {
     db.batch("ALTER TABLE occurrences ADD COLUMN context_meaning TEXT;
         UPDATE occurrences SET context_meaning=(SELECT meaning FROM senses WHERE senses.id=occurrences.sense_id);
         PRAGMA user_version=8;")
+}
+
+fn migrate_pdf(db: &Db) -> Result<()> {
+    db.batch("CREATE TABLE pdf_files (
+        document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE, data TEXT NOT NULL
+    );
+    CREATE TABLE pdf_pages (
+        document_id TEXT NOT NULL REFERENCES pdf_files(document_id) ON DELETE CASCADE,
+        page INTEGER NOT NULL CHECK(page>0), offset INTEGER NOT NULL CHECK(offset>=0),
+        text TEXT NOT NULL, layer TEXT NOT NULL, PRIMARY KEY(document_id,page)
+    );
+    PRAGMA user_version=9;")?;
+    migrate_pdf_storage(db)
+}
+
+fn migrate_pdf_storage(db: &Db) -> Result<()> {
+    db.batch("ALTER TABLE pdf_files ADD COLUMN storage TEXT;
+        CREATE INDEX pdf_pages_offset ON pdf_pages(document_id,offset);
+        PRAGMA user_version=10;")
+}
+
+pub const PDF_MAX_BYTES: u64 = 100_000_000;
+
+fn pdf_directory(db: &Db) -> std::path::PathBuf {
+    db.path().with_file_name("pdf-originals")
+}
+
+fn pdf_path(db: &Db, storage: &str) -> Result<std::path::PathBuf> {
+    Uuid::parse_str(storage).map_err(|_| "PDF 文件编号无效")?;
+    Ok(pdf_directory(db).join(format!("{storage}.pdf")))
+}
+
+fn write_pdf(db: &Db, mut source: impl std::io::Read) -> Result<(String, std::path::PathBuf)> {
+    use std::io::{Read, Write};
+    let mut prefix = Vec::new();
+    source.by_ref().take(1024).read_to_end(&mut prefix).map_err(|e| e.to_string())?;
+    if !prefix.windows(5).any(|part| part == b"%PDF-") {
+        return Err("PDF 文件格式无效".into());
+    }
+    std::fs::create_dir_all(pdf_directory(db)).map_err(|e| e.to_string())?;
+    let storage = Uuid::new_v4().to_string();
+    let path = pdf_path(db, &storage)?;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(&path).map_err(|e| e.to_string())?;
+        file.write_all(&prefix).map_err(|e| e.to_string())?;
+        let remainder = std::io::copy(&mut source.take(PDF_MAX_BYTES + 1 - prefix.len() as u64), &mut file)
+            .map_err(|e| e.to_string())?;
+        if remainder + prefix.len() as u64 > PDF_MAX_BYTES {
+            return Err("PDF 文件最大 100 MB".into());
+        }
+        file.sync_all().map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok((storage,path))
+}
+
+pub fn import_pdf(db: &Db, title: &str, source: impl std::io::Read) -> Result<V> {
+    let mut created = None;
+    let result = db.transaction(|| {
+        let (storage,path) = write_pdf(db,source)?;
+        created = Some(path);
+        let key = uuid();
+        db.write("INSERT INTO documents(id,title,format,content) VALUES(?1,?2,'txt','')",
+            &[key.clone(),json!(title)])?;
+        db.write("INSERT INTO pdf_files(document_id,data,storage) VALUES(?1,'',?2)",
+            &[key.clone(),json!(storage)])?;
+        Ok(key)
+    });
+    if result.is_err() {
+        if let Some(path) = created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+pub fn pdf_prepare(db: &Db, p: &V) -> Result<V> {
+    use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
+    let key = id(p, "id")?;
+    let mut created = None;
+    let result = db.transaction(|| {
+        let args = std::slice::from_ref(&key);
+        let file = db.one("SELECT storage FROM pdf_files WHERE document_id=?1", args)?;
+        if file["storage"].is_null() {
+            let legacy = db.one("SELECT data FROM pdf_files WHERE document_id=?1", args)?;
+            let source = legacy["data"].as_str().ok_or("PDF 文件数据无效")?;
+            let (storage,path) = write_pdf(db,DecoderReader::new(source.as_bytes(), &STANDARD))?;
+            created = Some(path);
+            db.write("UPDATE pdf_files SET data='',storage=?1 WHERE document_id=?2",
+                &[json!(storage),key.clone()])?;
+        }
+        run(db,"pdf_load",p)
+    });
+    if result.is_err() {
+        if let Some(path) = created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+pub fn pdf_range(db: &Db, p: &V, begin: u64, end: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let key = id(p, "id")?;
+    let file = db.one("SELECT storage FROM pdf_files WHERE document_id=?1", &[key])?;
+    let path = pdf_path(db,file["storage"].as_str().ok_or("PDF 尚未准备就绪")?)?;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    if end <= begin || end - begin > PDF_MAX_BYTES || end > file.metadata().map_err(|e| e.to_string())?.len() {
+        return Err("PDF 读取范围无效".into());
+    }
+    let mut bytes = vec![0; (end-begin) as usize];
+    file.seek(SeekFrom::Start(begin)).and_then(|_| file.read_exact(&mut bytes)).map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+pub fn prune_pdf_files(db: &Db) -> Result<()> {
+    db.transaction(|| {
+        let directory = pdf_directory(db);
+        if !directory.is_dir() {
+            return Ok(());
+        }
+        let files = db.query("SELECT storage FROM pdf_files WHERE storage IS NOT NULL", &[])?;
+        let referenced: std::collections::HashSet<_> = files.iter().filter_map(|file| file["storage"].as_str()).collect();
+        for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("pdf") {
+                continue;
+            }
+            if let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) {
+                if Uuid::parse_str(key).is_ok() && !referenced.contains(key) {
+                    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn save_pdf_page(db: &Db, p: &V) -> Result<V> {
+    let key = id(p, "id")?;
+    let page = p["page"].as_u64().filter(|n| (1..=100_000).contains(n)).ok_or("PDF 页码无效")?;
+    let args = &[key.clone(),json!(page)];
+    if let Some(row) = db.query("SELECT page,offset,text,layer FROM pdf_pages WHERE document_id=?1 AND page=?2", args)?.pop() {
+        return Ok(row);
+    }
+    let text = p["text"].as_str().filter(|text| text.len() <= 2_000_000 && !text.contains(['\0','\r','\n']))
+        .ok_or("PDF 页面文字无效或过长")?;
+    let layer = p["layer"].as_object().ok_or("PDF 文字层无效")?;
+    let layer = json!(layer).to_string();
+    if layer.len() > 12_000_000 {
+        return Err("PDF 页面文字层过大".into());
+    }
+    db.one("SELECT 1 AS present FROM pdf_files WHERE document_id=?1", &[key.clone()])?;
+    let previous = db.query("SELECT page,offset,text FROM pdf_pages WHERE document_id=?1 ORDER BY page DESC LIMIT 1",
+        &[key.clone()])?.pop();
+    let last = previous.as_ref().and_then(|row| row["page"].as_u64()).unwrap_or(0);
+    if last != page - 1 {
+        return Err("PDF 页面索引顺序无效".into());
+    }
+    let offset = previous.map_or(0, |row| row["offset"].as_u64().unwrap()
+        + row["text"].as_str().unwrap().encode_utf16().count() as u64 + 2);
+    db.write("INSERT INTO pdf_pages VALUES(?1,?2,?3,?4,?5)",
+        &[key,json!(page),json!(offset),json!(text),json!(layer)])?;
+    Ok(json!({"page":page,"offset":offset,"text":text,"layer":layer}))
 }
 
 fn uuid() -> V {
@@ -318,16 +490,22 @@ pub fn selection(db: &Db, p: &V) -> Result<(V, V, V, String, String)> {
     let doc = id(p, "document_id")?;
     let start = p["start"]
         .as_u64()
-        .filter(|n| *n <= 2_000_000)
+        .filter(|n| *n <= 100_000_000_000)
         .ok_or("起始位置无效")?;
     let end = p["end"]
         .as_u64()
         .filter(|n| *n > start && *n - start <= 240)
         .ok_or("请选择 1–240 个字符")? as usize;
-    let row = db.one("SELECT content FROM documents WHERE id=?1", &[doc.clone()])?;
+    let indexed = db.query("SELECT text AS content,offset FROM pdf_pages WHERE document_id=?1 AND offset<=?2
+        ORDER BY offset DESC LIMIT 1", &[doc.clone(),json!(start)])?.pop();
+    let row = match indexed {
+        Some(row) => row,
+        None => db.one("SELECT content,0 AS offset FROM documents WHERE id=?1", &[doc.clone()])?,
+    };
+    let offset = row["offset"].as_u64().unwrap_or(0) as usize;
     let content = row["content"].as_str().unwrap();
-    let a = byte_offset(content, start as usize).ok_or("起始位置无效")?;
-    let b = byte_offset(content, end).ok_or("结束位置无效")?;
+    let a = byte_offset(content, start as usize - offset).ok_or("起始位置无效")?;
+    let b = byte_offset(content, end - offset).ok_or("结束位置无效")?;
     let surface = &content[a..b];
     if surface.trim() != surface || surface.is_empty() || surface.contains(['\n', '\r']) {
         return Err("请选择同一行中的词或短语".into());
@@ -357,6 +535,9 @@ fn passage_context(content: &str, a: usize, b: usize) -> String {
 fn edit_document(db: &Db, p: &V) -> Result<V> {
     let key = id(p, "id")?;
     let args = std::slice::from_ref(&key);
+    if !db.query("SELECT 1 FROM pdf_files WHERE document_id=?1", args)?.is_empty() {
+        return Err("原版式 PDF 不支持编辑正文".into());
+    }
     let old = db.one("SELECT content,web_layout FROM documents WHERE id=?1", args)?;
     if old["content"] != p["original"] {
         return Err("文章已更新，请重新打开后编辑".into());
@@ -963,6 +1144,8 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
             "web_layout",
         ],
     ),
+    ("pdf_files", &["document_id", "data"]),
+    ("pdf_pages", &["document_id", "page", "offset", "text", "layer"]),
     ("semantic_groups", &["id", "name", "description"]),
     ("tags", &["id", "name"]),
     ("tag_names", &["normalized", "name", "tag_id"]),
@@ -991,9 +1174,17 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
 ];
 
 pub fn backup_data(db: &Db) -> Result<V> {
-    let mut data = json!({"version":8});
+    let mut data = json!({"version":9});
     for &(table, _) in BACKUP_TABLES {
         data[table] = json!(db.query(&format!("SELECT * FROM {table}"), &[])?);
+    }
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    for file in data["pdf_files"].as_array_mut().unwrap() {
+        if let Some(key) = file["storage"].as_str() {
+            let original = std::fs::read(pdf_path(db,key)?).map_err(|e| e.to_string())?;
+            file["data"] = json!(STANDARD.encode(original));
+        }
+        file.as_object_mut().unwrap().remove("storage");
     }
     Ok(data)
 }
@@ -1008,7 +1199,7 @@ pub fn replace_backup(db: &Db, data: &V) -> Result<V> {
 }
 
 fn restore(db: &Db, p: &V) -> Result<V> {
-    if !matches!(p["version"].as_u64(), Some(1 | 2 | 3 | 4 | 5 | 6 | 7 | 8)) {
+    if !matches!(p["version"].as_u64(), Some(1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9)) {
         return Err("JSON 导出版本不兼容".into());
     }
     let defaults = db.query("SELECT pristine FROM tag_defaults WHERE id=1", &[])?;
@@ -1026,6 +1217,9 @@ fn restore(db: &Db, p: &V) -> Result<V> {
         {
             continue;
         }
+        if matches!(table, "pdf_files" | "pdf_pages") && p["version"].as_u64().unwrap_or(0) < 9 {
+            continue;
+        }
         if table == "tag_scopes" && p["version"].as_u64().unwrap_or(0) < 6 {
             continue;
         }
@@ -1041,7 +1235,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
             let values = columns
                 .iter()
                 .map(|&col| {
-                    if col == "start" || col == "end" {
+                    if matches!(col, "start" | "end" | "page" | "offset") {
                         return row[col]
                             .as_i64()
                             .map(|n| json!(n))
@@ -1089,11 +1283,18 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                             _ => Err("导出中的网页地址无效".into()),
                         };
                     }
+                    if matches!(table, "pdf_files" | "pdf_pages") {
+                        let limit = match col { "data" => 133_333_336, "layer" => 12_000_000, _ => 2_000_000 };
+                        return row[col].as_str().filter(|value| value.len() <= limit && !value.contains('\0'))
+                            .map(|value| json!(value)).ok_or_else(|| format!("PDF 备份字段 {col} 无效"));
+                    }
                     if col == "content" {
                         let text = row[col]
                             .as_str()
                             .filter(|s| {
-                                s.len() <= 2_000_000 && !s.trim().is_empty() && !s.contains('\0')
+                                s.len() <= 2_000_000 && !s.contains('\0') && (!s.trim().is_empty()
+                                    || p["pdf_files"].as_array().is_some_and(|rows|
+                                        rows.iter().any(|pdf| pdf["document_id"] == row["id"])))
                             })
                             .ok_or("导出中的文档内容无效")?;
                         return Ok(json!(text));
@@ -1153,13 +1354,36 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
         }
         "document" => {
             let key = id(p, "id")?;
-            let doc = db.one("SELECT * FROM documents WHERE id=?1", &[key.clone()])?;
+            let doc = db.one("SELECT documents.*,EXISTS(SELECT 1 FROM pdf_files WHERE document_id=id) AS pdf FROM documents WHERE id=?1", &[key.clone()])?;
             let marks = db.query(
                 &format!("{MARKS} WHERE o.document_id=?1 ORDER BY o.start"),
                 &[key],
             )?;
             Ok(json!({"document":doc,"marks":marks}))
         }
+        "pdf_load" => {
+            let key = id(p, "id")?;
+            let args = std::slice::from_ref(&key);
+            let file = db.one("SELECT storage FROM pdf_files WHERE document_id=?1", args)?;
+            let storage = file["storage"].as_str().ok_or("PDF 尚未准备就绪")?;
+            let length = std::fs::metadata(pdf_path(db,storage)?).map_err(|e| e.to_string())?.len();
+            let pages = db.query("SELECT page,offset,text FROM pdf_pages WHERE document_id=?1 ORDER BY page", args)?;
+            Ok(json!({"length":length,"pages":pages}))
+        }
+        "pdf_native_boxes" => {
+            let key = id(p, "id")?;
+            let page = p["page"].as_u64().filter(|n| (1..=100_000).contains(n)).ok_or("PDF 页码无效")?;
+            let file = db.one("SELECT storage FROM pdf_files WHERE document_id=?1", &[key])?;
+            let path = pdf_path(db,file["storage"].as_str().ok_or("PDF 尚未准备就绪")?)?;
+            crate::pdf_geometry::word_boxes(&path,page as usize)
+        }
+        "pdf_page_layer" => {
+            let key = id(p, "id")?;
+            let page = p["page"].as_u64().filter(|n| (1..=100_000).contains(n)).ok_or("PDF 页码无效")?;
+            Ok(db.one("SELECT layer FROM pdf_pages WHERE document_id=?1 AND page=?2",
+                &[key,json!(page)])?["layer"].clone())
+        }
+        "pdf_index_page" => db.transaction(|| save_pdf_page(db, p)),
         "group_senses" => {
             let key = id(p, "id")?;
             Ok(json!(group_senses(db, &key)?))
@@ -1249,7 +1473,7 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             db.write("DELETE FROM documents WHERE id=?1", &[key])?;
             Ok(V::Null)
         }),
-        "backup" => db.snapshot(|| backup_data(db)),
+        "backup" => db.transaction(|| backup_data(db)),
         "learning_save" => {
             let mark = id(p, "id")?;
             let learning = learning_value(&p["learning"])?;
@@ -1377,6 +1601,56 @@ mod tests {
     }
 
     #[test]
+    fn pdf_backup_keeps_source_page_offsets_and_annotations() {
+        let directory = std::env::temp_dir().join(format!("semantic-pdf-{}",Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Db::open(&directory.join("library.sqlite3")).unwrap();
+        init_schema(&db,false).unwrap();
+        let bytes = b"%PDF-1.7";
+        let doc = import_pdf(&db, "Source.pdf", &bytes[..]).unwrap();
+        let group = create(&db, "Movement");
+        let index = |page, text| run(&db, "pdf_index_page",
+            &json!({"id":doc,"page":page,"text":text,"layer":{"words":[],"offsets":[]}}));
+        assert!(index(2, "They plunged.").is_err());
+        index(1, "📚 A heading.").unwrap();
+        let page = index(2, "They plunged.").unwrap();
+        assert_eq!(page["offset"], 15);
+        assert_eq!(index(2, "They plunged.").unwrap(), page);
+        let content = "📚 A heading.\n\nThey plunged.\n\n";
+        let mark = annotate_at(&db, anchor(content, &doc, content.find("plunged").unwrap()), &group, "下坠");
+        let saved = run(&db, "pdf_load", &json!({"id":doc})).unwrap();
+        let backup = run(&db, "backup", &V::Null).unwrap();
+        let restored_dir = directory.join("restored");
+        std::fs::create_dir_all(&restored_dir).unwrap();
+        let restored = Db::open(&restored_dir.join("library.sqlite3")).unwrap();
+        init_schema(&restored,false).unwrap();
+        run(&restored, "restore", &backup).unwrap();
+        assert_eq!(pdf_prepare(&restored, &json!({"id":doc})).unwrap(), saved);
+        assert_eq!(pdf_range(&restored,&json!({"id":doc}),0,bytes.len() as u64).unwrap(), bytes);
+        let restored_doc = run(&restored, "document", &json!({"id":doc})).unwrap();
+        assert_eq!(restored_doc["document"]["pdf"], 1);
+        assert_eq!(restored_doc["marks"][0]["id"], mark);
+        run(&restored, "document_delete", &json!({"id":doc})).unwrap();
+        assert!(run(&restored, "pdf_load", &json!({"id":doc})).is_err());
+        use std::io::Read;
+        let large_pdf = (&bytes[..]).chain(std::io::repeat(0).take(26_000_000));
+        let large = import_pdf(&db,"Large.pdf",large_pdf).unwrap();
+        assert_eq!(pdf_range(&db,&json!({"id":large}),26_000_000,26_000_004).unwrap(), vec![0;4]);
+        for page in 1..=2 {
+            run(&db,"pdf_index_page",&json!({"id":large,"page":page,"text":"x".repeat(1_100_000),
+                "layer":{"words":[],"offsets":[]}})).unwrap();
+        }
+        let last = run(&db,"pdf_index_page",&json!({"id":large,"page":3,"text":"plunged",
+            "layer":{"words":[],"offsets":[]}})).unwrap();
+        let start = last["offset"].as_u64().unwrap();
+        assert!(start > 2_000_000);
+        assert_eq!(selection(&db,&json!({"document_id":large,"start":start,"end":start+7})).unwrap().3,"plunged");
+        drop(restored);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn local_snapshots_replace_library_with_links_and_keep_a_recovery_point() {
         use crate::snapshots;
         let db = memory();
@@ -1412,6 +1686,10 @@ mod tests {
         snapshots::run(&db, &path, "snapshot_restore", &json!({"id":safety["id"]})).unwrap();
         assert!(run(&db, "document", &json!({"id":replacement})).is_ok());
         assert!(run(&db, "document", &json!({"id":doc})).is_err());
+        let remaining = snapshots::run(&db, &path, "snapshot_delete", &json!({"id":id})).unwrap();
+        assert!(remaining.as_array().unwrap().iter().all(|item| item["id"] != *id));
+        assert!(snapshots::run(&db, &path, "snapshot_preview", &json!({"id":id})).is_err());
+        assert!(run(&db, "document", &json!({"id":replacement})).is_ok());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

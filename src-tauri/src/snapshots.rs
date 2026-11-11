@@ -69,24 +69,44 @@ pub fn run(db: &Db, database: &Path, op: &str, payload: &Value) -> Result<Value>
     match op {
         "snapshot_list" => list(&directory),
         "snapshot_create" => {
-            let data = db.snapshot(|| store::backup_data(db))?;
+            let data = db.transaction(|| store::backup_data(db))?;
             save(&directory, "manual", &data)?;
             list(&directory)
         }
-        "snapshot_preview" | "snapshot_restore" => {
+        "snapshot_preview" | "snapshot_restore" | "snapshot_delete" => {
             let id = payload["id"]
                 .as_str()
                 .filter(|id| snapshot_metadata(id).is_some())
                 .ok_or("快照编号无效")?;
-            let file =
-                File::open(directory.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
+            let path = directory.join(format!("{id}.json"));
+            if !fs::symlink_metadata(&path)
+                .map_err(|e| e.to_string())?
+                .is_file()
+            {
+                return Err("找不到本地备份文件".into());
+            }
+            if op == "snapshot_delete" {
+                fs::remove_file(&path).map_err(|e| format!("无法删除备份：{e}"))?;
+                return list(&directory);
+            }
+            let file = File::open(path).map_err(|e| e.to_string())?;
             let mut data: Value =
                 serde_json::from_reader(BufReader::new(file)).map_err(|e| e.to_string())?;
             if op == "snapshot_preview" {
+                if let Some(fields) = data.as_object_mut() {
+                    fields.remove("pdf_files");
+                }
                 if let Some(documents) = data["documents"].as_array_mut() {
                     for document in documents {
                         if let Some(fields) = document.as_object_mut() {
                             fields.remove("web_layout");
+                        }
+                    }
+                }
+                if let Some(pages) = data["pdf_pages"].as_array_mut() {
+                    for page in pages {
+                        if let Some(fields) = page.as_object_mut() {
+                            fields.remove("layer");
                         }
                     }
                 }
@@ -97,6 +117,7 @@ pub fn run(db: &Db, database: &Path, op: &str, payload: &Value) -> Result<Value>
                 store::replace_backup(db, &data)?;
                 save(&directory, "safety", &previous)
             })?;
+            let _ = store::prune_pdf_files(db);
             Ok(Value::Null)
         }
         _ => Err("未知快照操作".into()),

@@ -1,6 +1,6 @@
 [package]
 name = "semantic-reader"
-version = "0.20.19"
+version = "0.20.20"
 edition = "2021"
 
 [build-dependencies]
@@ -28,3 +28,8 @@ strip = "symbols"
 
 [dev-dependencies]
 tauri = { version = "2.11.3", features = ["test"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+unicode-segmentation = "1.13.3"

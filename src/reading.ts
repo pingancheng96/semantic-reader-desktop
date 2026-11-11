@@ -34,7 +34,7 @@ export function readingLines(content: string, markdown: boolean): Line[] {
   });
 }
 
-export function selectedOffsets(root: HTMLElement, content: string, selection: Selection | null) {
+export function selectedOffsets(root: HTMLElement, content: string, selection: Selection | null, indexed = false) {
   if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
   const range = selection.getRangeAt(0);
   const position = (node: Node, index: number) => {
@@ -49,7 +49,7 @@ export function selectedOffsets(root: HTMLElement, content: string, selection: S
   const b = position(range.endContainer, range.endOffset);
   if (a === null || b === null) return null;
   const raw = content.slice(a, b);
-  if (raw !== range.toString()) return null;
+  if (!indexed && raw !== range.toString()) return null;
   const surface = raw.trim();
   const start = a + raw.length - raw.trimStart().length;
   if (!surface || surface.length > 240 || /[\r\n]/.test(surface)) return null;

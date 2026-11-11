@@ -1,6 +1,8 @@
+import {useArticleSearchShortcut} from './article-search.js';
+import {PdfReader} from './pdf-reader.js';
 import {waitForVoice} from './speech-voices.js';
 import type {ClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode} from 'react';
-import {React, ReactDOM, call, exportFile, installDictionary, type DictionaryStatus, type DictionaryProgress} from './runtime.js';
+import {React, ReactDOM, call, exportFile, importLocalFile, restoreBackupFile, installDictionary, type DictionaryStatus, type DictionaryProgress} from './runtime.js';
 import {articleMatches, changedRanges, keepUnchanged, readingLines, selectedOffsets, type Piece} from './reading.js';
 import {captionNodes, type WebNode} from './web-captions.js';
 import {facets, type Tag, type TagLink} from './tag-filters.js';
@@ -18,7 +20,7 @@ const snapshotLabel = (snapshot:Snapshot) =>
   new Date(snapshot.timestamp).toLocaleString() + (snapshot.safety ? ' · 恢复前自动备份' : '');
 type Library = {documents: Item[]; groups: Group[]; undo: number; tags:Tag[]; tag_links:TagLink[]};
 type WebLayout = {nodes:WebNode[]; images:(string|null)[]; image_errors?:(string|null)[]};
-type Read = {document: Item & {content: string; web_layout?: string | null}; marks: Mark[]};
+type Read = {document: Item & {content: string; web_layout?: string | null; pdf?:number}; marks: Mark[]};
 type Detail = {group: Group; senses: Sense[]; marks: Mark[]; vocabulary: Vocabulary[]; tags:{id:string; name:string}[]};
 type Selection = {document_id: string; start: number; end: number; surface: string};
 type SavedNote = Sense & {group_name:string; learning?:string|null};
@@ -542,22 +544,7 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
     setSearchOpen(true);
     focusSearch();
   }
-  useEffect(() => {
-    if (!visible || editing) return;
-    function find(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey &&
-          (event.code === 'KeyF' || event.key.toLowerCase() === 'f')) {
-        event.preventDefault();
-        openSearch();
-      }
-    }
-    window.addEventListener('keydown',find,true);
-    window.addEventListener('semantic-reader-find',openSearch);
-    return () => {
-      window.removeEventListener('keydown',find,true);
-      window.removeEventListener('semantic-reader-find',openSearch);
-    };
-  }, [visible,editing]);
+  useArticleSearchShortcut(visible && !editing,openSearch);
   function move(step: number) {
     if (matches.length) setCurrent((active + step + matches.length) % matches.length);
   }
@@ -699,6 +686,10 @@ function App() {
   const [search,setSearch] = useState<Library | null>(null);
   const [read,setRead] = useState<Read | null>(null);
   const [editing,setEditing] = useState(false);
+  const [readingShelfCollapsed,setReadingShelfCollapsed] = useState(()=>localStorage.getItem('readingShelfCollapsed')==='yes');
+  const shelfCollapsed = mode==='reader' && readingShelfCollapsed;
+  const [notesCollapsed,setNotesCollapsed] = useState(false);
+  const [pdfFooter,setPdfFooter] = useState<HTMLDivElement|null>(null);
   const readerPage = useRef<HTMLElement>(null);
   const readerScroll = useRef(0);
   useLayoutEffect(() => {
@@ -763,10 +754,9 @@ function App() {
   const [busy,setBusy] = useState(false);
   const lock = useRef(false);
   const lemmaRequests = useRef(new Map<string,Promise<LemmaResult>>());
-  const file = useRef<HTMLInputElement>(null);
   const [snapshots,setSnapshots] = useState<Snapshot[]>([]);
   const [snapshotId,setSnapshotId] = useState('');
-  const [confirmSnapshot,setConfirmSnapshot] = useState(false);
+  const [confirmSnapshot,setConfirmSnapshot] = useState<'restore'|'delete'|null>(null);
   useEffect(() => {
     if (mode!=='settings') return;
     let active = true;
@@ -779,7 +769,6 @@ function App() {
   const selectedSnapshot = snapshots.find(snapshot=>snapshot.id===snapshotId);
   const previewFile = useRef<HTMLInputElement>(null);
   const [backupPreview,setBackupPreview] = useState<{name:string;data:BackupPreviewData}|null>(null);
-  const backupFile = useRef<HTMLInputElement>(null);
 
   async function task(action: () => Promise<void>) {
     if (lock.current) return;
@@ -938,14 +927,10 @@ function App() {
     clearGroup(); setManageTags(false); setDetail(data); setMode('library');
     setGroupFields({...data.group,tags:data.tags.map(tag=>tag.name),vocabulary:data.vocabulary.map(v => v.expression + (v.nuance ? ' | '+v.nuance : '')).join('\n')});
   }
-  async function importFile(input: File) {
-    const extension = input.name.split('.').pop()?.toLowerCase();
-    const format = extension === 'markdown' ? 'md' : extension;
-    if (format !== 'md' && format !== 'txt') throw Error('请选择 .md、.markdown 或 .txt 文件');
-    if (input.size > 2_000_000) throw Error('文件最大 2 MB');
-    const content = new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(await input.arrayBuffer());
-    const id = await call<string>('import',{title:input.name,format,content});
-    await refresh(); await openDoc(id); setNotice('已导入 ' + input.name);
+  async function importFile() {
+    const imported = await importLocalFile();
+    if (!imported) return;
+    await refresh(); await openDoc(imported.id); setNotice('已导入 ' + imported.title);
   }
   async function deleteSense(id: string, groupId: string) {
     await call('sense_delete',{id});
@@ -996,8 +981,15 @@ function App() {
     }
   }
 
+  function openMarkNote(mark: Mark) {
+    resetSelection();
+    setActiveMark(mark);
+    setNotesCollapsed(false);
+  }
+
   function capture(s: Selection, doubleClick: boolean) {
     if (lock.current) return;
+    setNotesCollapsed(false);
     const request = ++selectionRequest.current;
     const automatic = doubleClick && autoSuggest && aiConfigured;
     autoAnalysis.current = automatic;
@@ -1054,7 +1046,7 @@ function App() {
     name.toLowerCase().includes(tagQuery.trim().toLowerCase())));
 
 
-  return <div className="app">
+  return <div className={mode==='reader' && read?.document.pdf ? 'app pdf-app' : 'app'}>
     <header className="top"><div className="brand"><img src="./icon.png" alt=""/> Semantic Reader</div>
       <nav aria-label="工作区">
         <button aria-current={mode==='reader' ? 'page' : undefined} className={mode==='reader'?'current':''} onClick={() => void task(async () => { if (read && !editing) await openDoc(read.document.id); else setMode('reader'); })}>阅读器</button>
@@ -1066,15 +1058,21 @@ function App() {
       <span className="local">● 本地词汇库</span>
     </header>
     <div className="status" aria-live="polite">{error ? <span className="error" role="alert">{error}</span> : busy ? '处理中…' : notice}</div>
-    <div className={'workspace ' + (mode === 'reader' ? 'three' : 'two')}>
+    <div className={mode==='reader'
+      ? 'workspace three' + (shelfCollapsed ? ' shelf-collapsed' : '') + (notesCollapsed ? ' notes-collapsed' : '')
+      : 'workspace two'}>
       <aside className="shelf" hidden={mode==='help'}>
+        {mode==='reader' && <button className="shelf-toggle" type="button" aria-expanded={!shelfCollapsed}
+          aria-controls="reader-shelf-content" aria-label={shelfCollapsed ? '展开文章列表' : '收起文章列表'}
+          title={shelfCollapsed ? '展开文章列表' : '收起文章列表'} onClick={()=>{
+            setReadingShelfCollapsed(!shelfCollapsed);
+            localStorage.setItem('readingShelfCollapsed',shelfCollapsed ? 'no' : 'yes');
+          }}>{shelfCollapsed ? '›' : '‹'}</button>}
+        <div id="reader-shelf-content" hidden={shelfCollapsed}>
         <div className="eyebrow">{mode==='library' ? 'SEMANTIC LIBRARY' : 'READING LIBRARY'}</div>
         <button className="primary full" disabled={busy} onClick={() => {
-          if(mode==='library'){clearGroup();setManageTags(false);setMode('library');} else file.current?.click();
-        }}>{mode==='library' ? '＋ 新建语义组' : '＋ 导入 Markdown / TXT'}</button>
-        <input hidden ref={file} type="file" accept=".md,.markdown,.txt" onChange={e => {
-          const item=e.currentTarget.files?.[0]; e.currentTarget.value=''; if(item) void task(() => importFile(item));
-        }}/>
+          if(mode==='library'){clearGroup();setManageTags(false);setMode('library');} else void task(importFile);
+        }}>{mode==='library' ? '＋ 新建语义组' : '＋ 导入 Markdown / TXT / PDF'}</button>
         {mode === 'reader' && <form className="web-import" onSubmit={e=>submit(e,async()=>{
           const id = await call<string>('import_web',{url:webUrl.trim()});
           setWebUrl(''); await refresh(); await openDoc(id); setNotice('网页已导入');
@@ -1176,24 +1174,43 @@ function App() {
           })}
           {!sidebar.length && <p className="muted">{filter || (mode==='library' && (selectedTags.length || untagged)) ? '没有匹配结果' : '列表为空'}</p>}
         </div>
+        </div>
       </aside>
 
-        <div className="reader-frame" hidden={mode!=='reader'}>
+        <div className={read?.document.pdf ? 'reader-frame pdf-frame' : 'reader-frame'} hidden={mode!=='reader'}>
         <main className="page" ref={readerPage}
           onScroll={e=>{if (mode==='reader') readerScroll.current = e.currentTarget.scrollTop;}}>
           {read ? <>
-            <p className="eyebrow">READING ROOM · {read.document.source_url ? 'WEB' : read.document.format.toUpperCase()}</p>
-            <h1>{read.document.title.replace(/\.(md|markdown|txt)$/i,'')}</h1>
-            {read.document.source_url && <p className="muted web-source">来源 · {read.document.source_url}</p>}
-            <div className="document-actions" style={{visibility:editing ? 'hidden' : undefined}}>
-              <p className="muted">{read.marks.length} 条标注 · 选中一个词或短语开始收录</p>
-              {read.document.web_layout && <button disabled={busy} onClick={()=>void task(async()=>{
-                const id = read.document.id;
-                const result = await call<{saved:number; missing:number}>('repair_images',{id});
-                await openDoc(id);
-                setNotice(`已保存 ${result.saved} 张图片${result.missing ? `，仍有 ${result.missing} 张未能导入` : ''}`);
-              })}>重新下载图片</button>}
-              <button className="quiet delete-document" disabled={busy} onClick={()=>setDeleteDocId(read.document.id)}>删除文章</button>
+            <div className="reader-heading">
+            <div className="reader-title-bar">
+              <h1 title={read.document.title}>{read.document.title.replace(/\.(md|markdown|txt|pdf)$/i,'')}</h1>
+              <details className="reader-document-menu" key={read.document.id} onBlur={event=>{
+                if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open=false;
+              }} onKeyDown={event=>{
+                if (event.key==='Escape' && event.currentTarget.open) {
+                  event.stopPropagation();event.currentTarget.open=false;
+                  event.currentTarget.querySelector('summary')?.focus();
+                }
+              }}>
+                <summary aria-label="文档选项" title="文档选项">⋯</summary>
+                <div className="reader-document-menu-panel">
+                  <p className="muted">文档信息 · {read.marks.length} 条标注</p>
+                  {read.document.source_url && <p className="muted">来源 · {read.document.source_url}</p>}
+                  {read.document.web_layout && <button type="button" disabled={busy || editing} onClick={event=>{
+                    event.currentTarget.closest('details')?.removeAttribute('open');
+                    void task(async()=>{
+                      const id = read.document.id;
+                      const result = await call<{saved:number; missing:number}>('repair_images',{id});
+                      await openDoc(id);
+                      setNotice(`已保存 ${result.saved} 张图片${result.missing ? `，仍有 ${result.missing} 张未能导入` : ''}`);
+                    });
+                  }}>重新下载图片</button>}
+                  <button type="button" className="quiet delete-document" disabled={busy || editing} onClick={event=>{
+                    event.currentTarget.closest('details')?.removeAttribute('open');
+                    setDeleteDocId(read.document.id);
+                  }}>删除文章</button>
+                </div>
+              </details>
             </div>
             {deleteDocId === read.document.id && <section className="delete-confirm" aria-label="确认删除文章">
               <p>删除《{read.document.title}》及其 {read.marks.length} 条原文标注和随标注保存的学习提示？词库义项、语义组和其他文章会保留。删除后无法在应用内撤销。</p>
@@ -1202,6 +1219,10 @@ function App() {
                 <button className="delete-document" disabled={busy} onClick={()=>void task(()=>deleteDocument(read.document.id))}>确认删除文章</button>
               </div>
             </section>}
+            </div>
+            {read.document.pdf ? <PdfReader key={read.document.id} id={read.document.id} marks={read.marks}
+              focused={focus} selection={selection} visible={mode==='reader'} footer={pdfFooter} onSelect={capture} onClearSelection={resetSelection}
+              onMark={openMarkNote}/> :
             <Reader key={read.document.id + (editing ? ':edit' : '')} data={read} visible={mode==='reader'}
               focused={focus} editing={editing} busy={busy} cancel={()=>setEditing(false)}
               beginEdit={()=>{resetSelection();setFocus('');setDeleteDocId('');setEditing(true);}}
@@ -1212,13 +1233,18 @@ function App() {
                 if (detail) clearGroup();
                 setNotice(removed ? `正文已保存，移除了 ${removed} 条原文标注` : '正文已保存');
               })}
-              onSelect={capture} onMark={mark=>{resetSelection();setActiveMark(mark);}}/>
+              onSelect={capture} onMark={openMarkNote}/>}
           </> : <div className="welcome"><p className="eyebrow">YOUR READING ROOM</p><h1>从一篇文章开始</h1>
             <p>在原文中选中词或短语，保存它在这个语境中的含义。以后点击标注即可回到语义组。</p>
-            <button className="primary" onClick={()=>file.current?.click()}>导入第一篇文章</button></div>}
+            <button className="primary" onClick={()=>void task(importFile)}>导入第一篇文章</button></div>}
         </main>
+        {read?.document.pdf ? <div className="pdf-footer" ref={setPdfFooter}/> : null}
         </div>
-        {mode==='reader' && <aside className="inspector">
+        {mode==='reader' && <aside className="inspector" aria-label="笔记">
+          <button type="button" className="notes-toggle" aria-expanded={!notesCollapsed} aria-controls="reader-notes"
+            aria-label={notesCollapsed ? '展开笔记栏' : '收起笔记栏'} title={notesCollapsed ? '展开笔记栏' : '收起笔记栏'}
+            onClick={()=>setNotesCollapsed(!notesCollapsed)}>{notesCollapsed ? '‹' : '›'}</button>
+          <div id="reader-notes" hidden={notesCollapsed}>
           <p className="eyebrow">CONTEXT PANEL</p>
           {activeMark ? <>
 
@@ -1322,6 +1348,7 @@ function App() {
               </fieldset>
             </form>
           </> : <p className="muted">双击词语查看词库笔记，或选中短语开始收录。</p>}
+          </div>
         </aside>}
 
       {mode==='library' && manageTags && <main className="page manage">
@@ -1611,13 +1638,13 @@ function App() {
             const items = await call<Snapshot[]>('snapshot_create');
             setSnapshots(items);
             setSnapshotId(items[0]?.id ?? '');
-            setConfirmSnapshot(false);setBackupPreview(null);
+            setConfirmSnapshot(null);setBackupPreview(null);
             setNotice('备份已自动保存');
           })}>导出备份</button>
           {snapshots.length>0 ? <>
             <label>本地备份（{snapshots.length} 份）<select size={Math.max(2,Math.min(6,snapshots.length))}
               value={snapshotId} disabled={busy} onChange={e=>{
-                setSnapshotId(e.target.value);setConfirmSnapshot(false);setBackupPreview(null);
+                setSnapshotId(e.target.value);setConfirmSnapshot(null);setBackupPreview(null);
               }}>
               {snapshots.map(snapshot=><option key={snapshot.id} value={snapshot.id}>{snapshotLabel(snapshot)}</option>)}
             </select></label>
@@ -1627,22 +1654,34 @@ function App() {
                 const data = await call<unknown>('snapshot_preview',{id:selectedSnapshot.id});
                 setBackupPreview({name:snapshotLabel(selectedSnapshot),data:parseBackupPreview(data)});
               })}>查看所选备份</button>
-              <button disabled={busy || !selectedSnapshot} onClick={()=>setConfirmSnapshot(true)}>恢复所选备份</button>
+              <button disabled={busy || !selectedSnapshot} onClick={()=>setConfirmSnapshot('restore')}>恢复所选备份</button>
+              <button className="delete-document" disabled={busy || !selectedSnapshot} onClick={()=>setConfirmSnapshot('delete')}>删除所选备份</button>
             </div>
           </> : <p className="muted">暂无本地快照。</p>}
-          {confirmSnapshot && selectedSnapshot && <section className="delete-confirm" aria-label="确认恢复快照">
+          {confirmSnapshot==='restore' && selectedSnapshot && <section className="delete-confirm" aria-label="确认恢复快照">
             <p>恢复到 {snapshotLabel(selectedSnapshot)}？当前文章和词库会被替换。应用会先自动备份当前数据。</p>
             <div className="row">
-              <button disabled={busy} onClick={()=>setConfirmSnapshot(false)}>取消</button>
+              <button disabled={busy} onClick={()=>setConfirmSnapshot(null)}>取消</button>
               <button className="delete-document" disabled={busy} onClick={()=>void task(async()=>{
                 await call('snapshot_restore',{id:selectedSnapshot.id});
-                setConfirmSnapshot(false);setSnapshotId('');setBackupPreview(null);
+                setConfirmSnapshot(null);setSnapshotId('');setBackupPreview(null);
                 setRead(null);setFocus('');setEditing(false);readerScroll.current=0;resetSelection();clearGroup();
                 setSelectedTags([]);setBulkGroups([]);setLibraryPlans([]);setScanProgress(null);
                 await refresh();
                 setSnapshots(await call<Snapshot[]>('snapshot_list'));
                 setNotice('已恢复快照，恢复前的数据已自动备份');
               })}>确认恢复</button>
+            </div>
+          </section>}
+          {confirmSnapshot==='delete' && selectedSnapshot && <section className="delete-confirm" aria-label="确认删除备份">
+            <p>永久删除 {snapshotLabel(selectedSnapshot)} 的备份？</p>
+            <div className="row">
+              <button disabled={busy} onClick={()=>setConfirmSnapshot(null)}>取消</button>
+              <button className="delete-document" disabled={busy} onClick={()=>void task(async()=>{
+                setSnapshots(await call<Snapshot[]>('snapshot_delete',{id:selectedSnapshot.id}));
+                setConfirmSnapshot(null);setSnapshotId('');setBackupPreview(null);
+                setNotice('已删除所选备份');
+              })}>确认删除备份</button>
             </div>
           </section>}
           {backupPreview && <BackupPreview key={backupPreview.name} {...backupPreview} close={()=>setBackupPreview(null)}/>}
@@ -1656,15 +1695,9 @@ function App() {
               setBackupPreview({name:input.name,data});
             });
           }}/>
-          <button disabled={busy} onClick={()=>backupFile.current?.click()}>从 JSON 恢复到空词汇库</button>
-          <input hidden ref={backupFile} type="file" accept=".json,application/json" onChange={e=>{
-            const input=e.currentTarget.files?.[0];e.currentTarget.value='';
-            if (input) void task(async()=>{
-              if (input.size > 64_000_000) throw Error('恢复文件最大 64 MB');
-              const data = JSON.parse(await input.text());
-              await call('restore',data);await refresh();setNotice('词汇库已恢复');
-            });
-          }}/>
+          <button disabled={busy} onClick={()=>void task(async()=>{
+            if (await restoreBackupFile()) {await refresh();setNotice('词汇库已恢复');}
+          })}>从 JSON 恢复到空词汇库</button>
           {read && <button disabled={busy} onClick={()=>void task(async()=>{if(await exportFile(read.document.id)) setNotice('已导出原文');})}>导出当前原文</button>}
           {backupPreview && <BackupPreview key={backupPreview.name} {...backupPreview} close={()=>setBackupPreview(null)}/>}
         </section>
@@ -1688,12 +1721,25 @@ function parseBackupPreview(value:unknown):BackupPreviewData {
     expressions:['id','lemma'],senses:['id','group_id','expression_id','meaning'],
     occurrences:['id','document_id','sense_id','surface','context']
   };
-  if (!data || typeof data.version!=='number' || ![1,2,3,4,5,6,7,8].includes(data.version) ||
+  if (!data || typeof data.version!=='number' || ![1,2,3,4,5,6,7,8,9].includes(data.version) ||
       !Object.entries(tables).every(([table,columns])=>{
         const rows = data[table];
         return Array.isArray(rows) && rows.every(row=>row && columns.every(key=>typeof row[key]==='string'));
       })) throw Error('请选择 Semantic Reader 导出的完整词汇库 JSON');
-  return value as BackupPreviewData;
+  const preview = value as BackupPreviewData;
+  if (!Array.isArray(data.pdf_pages)) return preview;
+  const pages = new Map<string,{page:number;text:string}[]>();
+  for (const row of data.pdf_pages) {
+    if (row && typeof row.document_id==='string' && typeof row.page==='number' && typeof row.text==='string') {
+      const items = pages.get(row.document_id) ?? [];
+      items.push({page:row.page,text:row.text});
+      pages.set(row.document_id,items);
+    }
+  }
+  return {...preview,documents:preview.documents.map(doc=>{
+    const indexed = pages.get(doc.id);
+    return indexed ? {...doc,content:indexed.sort((a,b)=>a.page-b.page).map(page=>page.text).join('\n\n')} : doc;
+  })};
 }
 
 function BackupPreview({name,data,close}: {name:string;data:BackupPreviewData;close:()=>void}) {
@@ -1747,7 +1793,7 @@ function HelpPage() {
 
     <section>
       <h2>1. 导入和阅读</h2>
-      <p>在「阅读器」左栏导入 Markdown 或 TXT 文件，也可以粘贴网页地址后导入。左栏搜索按标题或网址查找文章。</p>
+      <p>在「阅读器」左栏导入 Markdown、TXT 或 PDF 文件。PDF 最大 100 MB，保留原版式并逐页建立文字索引。没有文字层的页面会在本地做英文 OCR。也可以粘贴网页地址后导入。左栏搜索按标题或网址查找文章。</p>
       <p>点击阅读区右下角的铅笔可以修改正文。未改动的标注会随文字移动，改到标注时会在保存前提示。编辑时沿用阅读版式，网页图片和来源链接会保留。</p>
       <p>按 <kbd>⌘F</kbd>（Mac）或 <kbd>Ctrl+F</kbd>（Windows）搜索当前文章，也可以点击右下角的放大镜。<kbd>Enter</kbd> 跳到下一处，<kbd>Shift+Enter</kbd> 跳到上一处，按 <kbd>Esc</kbd> 或点「关闭」收起搜索。</p>
     </section>

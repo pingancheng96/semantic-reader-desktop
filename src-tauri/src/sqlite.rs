@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
-    path::Path,
+    path::{Path, PathBuf},
     ptr,
 };
 
@@ -49,7 +49,7 @@ extern "C" {
     fn sqlite3_changes(db: Handle) -> c_int;
 }
 
-pub struct Db(Handle);
+pub struct Db(Handle, PathBuf);
 struct Statement(Handle);
 impl Drop for Db {
     fn drop(&mut self) {
@@ -68,16 +68,20 @@ impl Drop for Statement {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        let filename = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
         let mut handle = ptr::null_mut();
-        let code = unsafe { sqlite3_open(path.as_ptr(), &mut handle) };
+        let code = unsafe { sqlite3_open(filename.as_ptr(), &mut handle) };
         if handle.is_null() {
             return Err("无法打开 SQLite".into());
         }
-        let db = Self(handle);
+        let db = Self(handle, path.to_owned());
         db.check(code)?;
         db.batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
         Ok(db)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.1
     }
 
     fn check(&self, code: c_int) -> Result<()> {

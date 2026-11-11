@@ -28,14 +28,18 @@ section > label { margin: .8rem 0; }
 .status { min-height: 2.3rem; display: flex; align-items: center; padding: .3rem 1.4rem; background: #e9eee5; color: #315447; font-size: .88rem; }
 .error { color: #982f26; }
 .workspace { display: grid; height: calc(100dvh - 6.15rem); }
-.three { grid-template-columns: minmax(175px, 19%) minmax(0, 1fr) minmax(240px, 25%); }
+.three {
+  --shelf-width: minmax(175px, 19%);
+  --notes-width: minmax(240px, 25%);
+  grid-template-columns: var(--shelf-width) minmax(0, 1fr) var(--notes-width);
+}
 .two { grid-template-columns: minmax(175px, 19%) minmax(0, 1fr); }
 .shelf, .page, .inspector { min-width: 0; overflow: auto; padding: 1.45rem; }
 .shelf, .inspector { background: #eeefe8; }
 .shelf { border-right: 1px solid #dce0d7; }
 .inspector { border-left: 1px solid #dce0d7; }
 .reader-frame { position: relative; min-width: 0; min-height: 0; }
-.reader-frame > .page { height: 100%; }
+.reader-frame > .page { height: 100%; padding-top: .6rem; }
 .page { padding: clamp(1.5rem,4vw,4rem); }
 .manage { padding-right: max(3rem, calc(100% - 52rem)); }
 .eyebrow { font-size: .72rem; font-weight: 700; letter-spacing: .13em; color: #537065; margin: 0 0 .7rem; }
@@ -49,7 +53,7 @@ button.primary:hover:not(:disabled) { background: #174c3c; }
 .shelf-list button { text-align: left; background: transparent; border-color: transparent; overflow-wrap: anywhere; }
 .shelf-list .selected { background: #dae8d8; border-color: #c8d9c7; }
 .welcome { margin-top: 7vh; max-width: 33rem; }
-.reading { margin: 2rem auto; font: 1.16rem/1.75 Georgia, "Times New Roman", serif; }
+.reading { margin: .85rem auto 2rem; font: 1.16rem/1.75 Georgia, "Times New Roman", serif; }
 .line { white-space: pre-wrap; overflow-wrap: anywhere; min-height: .95em; }
 .line.h1, .line.h2, .line.h3, .line.h4, .line.h5, .line.h6 { font-weight: bold; margin: .65em 0 .25em; line-height: 1.3; }
 .line.h1 { font-size: 1.7em; }
@@ -109,8 +113,6 @@ button.quiet { padding: .2rem; border-color: transparent; background: transparen
 .saved-note > p { margin: .4rem 0; }
 .saved-note .learning { margin-top: .5rem; }
 
-.document-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; }
-.document-actions p { margin: .25rem 0; }
 button.delete-document { color: #a22f29; }
 .delete-confirm { background: #fff2ee; border: 1px solid #ecc8bf; border-radius: .6rem; padding: .8rem; margin: .75rem 0; }
 .delete-confirm p { margin: 0 0 .5rem; }
@@ -172,3 +174,79 @@ button.delete-document { color: #a22f29; }
 .reading [contenteditable]:focus { outline: 2px solid #aac7af; border-radius: .15rem; }
 
 .backup-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22rem; overflow: auto; }
+
+.pdf-app { display: grid; grid-template-rows: auto auto minmax(0,1fr); height: 100dvh; overflow: hidden; }
+.pdf-app > .workspace { height: auto; min-height: 0; }
+.pdf-frame:not([hidden]) { display: grid; grid-template-rows: minmax(0,1fr) auto; }
+.pdf-frame > .page { display: grid; grid-template-rows: auto minmax(0,1fr); min-height: 0; overflow: hidden; padding-top: .6rem; padding-bottom: 0; }
+.reader-title-bar { display: flex; align-items: center; justify-content: space-between; gap: .65rem; min-width: 0; }
+.reader-title-bar h1 { margin: 0; font-size: 1.05rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-document-menu { position: relative; flex: none; }
+.reader-document-menu summary { list-style: none; padding: .1rem .55rem; border: 1px solid #cbd2c9; border-radius: 6px; background: #fffefa; cursor: pointer; }
+.reader-document-menu summary::-webkit-details-marker { display: none; }
+.reader-document-menu-panel { position: absolute; z-index: 4; top: calc(100% + .25rem); right: 0; width: max-content; min-width: 10rem; max-width: min(24rem, 45vw); padding: .55rem; background: #fffefa; border: 1px solid #dce0d7; border-radius: .45rem; box-shadow: 0 3px 12px #24393122; }
+.reader-document-menu-panel p { margin: 0 0 .3rem; overflow-wrap: anywhere; }
+.reader-document-menu-panel button { display: block; }
+.reader-document-menu-panel button + button { margin-top: .3rem; }
+.reader-heading > .delete-confirm { margin-top: .5rem; padding-top: .4rem; }
+.pdf-reader { display: grid; grid-template: minmax(0,1fr) / minmax(0,1fr); min-width: 0; min-height: 0; margin-top: .5rem; }
+
+.pdf-footer { border-top: 1px solid #dce0d7; background: #f6f5ef; }
+.pdf-pagination, .pdf-pagination form { display: flex; align-items: center; justify-content: center; gap: .5rem; }
+.pdf-pagination { padding: .25rem .5rem; }
+.pdf-pagination button { font-size: 1.25rem; line-height: 1; padding: .25rem .65rem; }
+.pdf-pagination input { width: 3.25rem; padding: .15rem .25rem; text-align: center; }
+.pdf-pagination span { color: #586762; white-space: nowrap; }
+.pdf-status:empty { display: none; }
+.pdf-sheet { width: 0; height: 0; margin: .75rem auto; overflow: hidden; overflow: clip; }
+.pdf-paper { --scale-round-x: 1px; --scale-round-y: 1px; position: relative; transform-origin: 0 0; background: white; overflow: hidden; }
+.pdf-canvas, .pdf-highlights { position: absolute; inset: 0; pointer-events: none; }
+.pdf-canvas canvas { display: block; width: 100%; height: 100%; }
+.pdf-highlights span { position: absolute; background: #75ac6270; border-radius: 2px; }
+.pdf-highlights span.saved-word { border-bottom: 2px solid #398054; }
+.pdf-highlights span.current { background: #ffd04d99; }
+.pdf-highlights span.selected-word { background: #4888d977; }
+.pdf-paper:active .selected-word { visibility: hidden; }
+.pdf-paper .textLayer {
+  position: absolute; inset: 0; overflow: clip; line-height: 1; text-align: initial;
+  text-size-adjust: none; -webkit-text-size-adjust: none;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+.pdf-paper .textLayer :is(span, br) {
+  color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0 0;
+}
+.pdf-paper .textLayer > :not(.markedContent), .pdf-paper .textLayer .markedContent span:not(.markedContent) {
+  --font-height: 0; --scale-x: 1; --rotate: 0deg;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.pdf-paper .textLayer .markedContent { display: contents; }
+.pdf-paper .textLayer.over-pdf-mark, .pdf-paper .textLayer.over-pdf-mark span { cursor: pointer; }
+.pdf-paper .textLayer ::selection { color: transparent; background: #4888d977; }
+
+.pdf-paper .textLayer { transform-origin: 0 0; }
+.pdf-paper .textLayer[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
+.pdf-paper .textLayer[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
+.pdf-paper .textLayer[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
+
+.three.shelf-collapsed { --shelf-width: 2.65rem; }
+.three.notes-collapsed { --notes-width: 2.65rem; }
+.shelf-toggle, .notes-toggle { float: right; font-size: 1.2rem; line-height: 1; padding: .1rem .45rem; margin: -.3rem -.3rem .3rem .4rem; }
+.shelf-collapsed > .shelf, .notes-collapsed > .inspector { padding: .7rem .35rem; }
+.shelf-collapsed .shelf-toggle, .notes-collapsed .notes-toggle { float: none; display: block; margin: 0 auto; }
+.pdf-reader.has-outline { grid-template-columns: minmax(7rem, 25%) minmax(0, 1fr); gap: .75rem; }
+.pdf-page-area { min-width: 0; min-height: 0; overflow: auto; overflow-anchor: none; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.pdf-outline { min-height: 0; overflow: auto; padding: .4rem; background: #eeefe8; border-radius: .45rem; }
+.pdf-outline ul { list-style: none; margin: 0; padding: 0; }
+.pdf-outline ul ul { padding-left: .7rem; border-left: 1px solid #dce0d7; }
+.pdf-outline button, .pdf-outline li > span { display: block; width: 100%; padding: .25rem .35rem; overflow-wrap: anywhere; text-align: left; font-size: .85rem; }
+.pdf-outline button { border-color: transparent; background: transparent; }
+.pdf-pagination .pdf-outline-toggle { font-size: .85rem; line-height: 1.2; }
+.pdf-paper { touch-action: pan-y; overscroll-behavior-x: contain; }
+
+.pdf-pagination { flex-wrap: wrap; }
+.pdf-zoom { display: flex; align-items: center; gap: .3rem; padding-left: .45rem; border-left: 1px solid #dce0d7; }
+.pdf-pagination .pdf-zoom-fit { font-size: .85rem; min-width: 3.45rem; line-height: 1.2; }
+.pdf-paper.zoomed { touch-action: pan-x pan-y; }

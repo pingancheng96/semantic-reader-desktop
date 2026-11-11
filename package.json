@@ -1,6 +1,6 @@
 {
   "name": "semantic-reader",
-  "version": "0.20.19",
+  "version": "0.20.20",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,16 @@
     "start": "npm run build && cargo run --locked --manifest-path src-tauri/Cargo.toml",
     "test": "npm run build && cargo test --locked --manifest-path src-tauri/Cargo.toml && node --test scripts/*.test.mjs"
   },
-  "dependencies": {"react":"18.3.1","react-dom":"18.3.1"},
-  "devDependencies": {"typescript":"5.9.3","@types/react":"19.2.17","@types/react-dom":"19.2.3"}
+  "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "pdfjs-dist": "^5.7.284",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "tesseract.js": "^6.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3"
+  }
 }

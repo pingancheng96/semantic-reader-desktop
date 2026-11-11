@@ -3,6 +3,7 @@
 mod ai;
 mod dictionary;
 mod snapshots;
+mod pdf_geometry;
 mod sqlite;
 mod store;
 mod tags;
@@ -216,7 +217,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             let db = Db::open(&path)?;
             if matches!(
                 op.as_str(),
-                "snapshot_list" | "snapshot_create" | "snapshot_preview" | "snapshot_restore"
+                "snapshot_list" | "snapshot_create" | "snapshot_preview" | "snapshot_restore" | "snapshot_delete"
             ) {
                 return snapshots::run(&db, &path, &op, &payload);
             }
@@ -229,6 +230,14 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
                     format,
                     payload["content"].as_str().ok_or("文件内容无效")?,
                 );
+            }
+            if op == "pdf_load" {
+                return store::pdf_prepare(&db, &payload);
+            }
+            if op == "document_delete" {
+                let result = store::run(&db, &op, &payload)?;
+                let _ = store::prune_pdf_files(&db);
+                return Ok(result);
             }
             if matches!(op.as_str(), "list" | "document" | "group" | "candidates") {
                 db.snapshot(|| store::run(&db, &op, &payload))
@@ -279,6 +288,71 @@ async fn dictionary_install(
 }
 
 #[tauri::command]
+async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Result<Value> {
+    use std::io::Read;
+    use tauri_plugin_dialog::DialogExt;
+    let database = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(file) = app.dialog().file()
+            .add_filter("Markdown, TXT, PDF", &["md", "markdown", "txt", "pdf"])
+            .blocking_pick_file() else { return Ok(Value::Null); };
+        let path = file.into_path().map_err(|_| "请选择本地文件")?;
+        let title = path.file_name().and_then(|name| name.to_str()).ok_or("文件名无效")?;
+        if title.chars().count() > 255 {
+            return Err("文件名太长".into());
+        }
+        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let db = Db::open(&database)?;
+        let id = match extension.as_str() {
+            "pdf" => {
+                if file.metadata().map_err(|e| e.to_string())?.len() > store::PDF_MAX_BYTES {
+                    return Err("PDF 文件最大 100 MB".into());
+                }
+                store::import_pdf(&db, title, file)?
+            }
+            "md" | "markdown" | "txt" => {
+                let mut bytes = Vec::new();
+                file.take(2_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                if bytes.len() > 2_000_000 {
+                    return Err("文件最大 2 MB".into());
+                }
+                let content = std::str::from_utf8(&bytes).map_err(|_| "请选择 UTF-8 文本文件")?;
+                store::import(&db, title, if extension == "txt" { "txt" } else { "md" }, content)?
+            }
+            _ => return Err("请选择 Markdown、TXT 或 PDF 文件".into()),
+        };
+        Ok(serde_json::json!({"id":id,"title":title}))
+    }).await.map_err(|_| "导入文件失败")?
+}
+
+#[tauri::command]
+async fn restore_backup_file(app: tauri::AppHandle, state: State<'_, Database>) -> Result<bool> {
+    use tauri_plugin_dialog::DialogExt;
+    let database = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(file) = app.dialog().file().add_filter("JSON", &["json"]).blocking_pick_file() else {
+            return Ok(false);
+        };
+        let path = file.into_path().map_err(|_| "请选择本地备份文件")?;
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let backup = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|e| format!("无法读取 JSON 备份：{e}"))?;
+        store::run(&Db::open(&database)?, "restore", &backup)?;
+        Ok(true)
+    }).await.map_err(|_| "恢复备份文件失败")?
+}
+
+#[tauri::command]
+async fn pdf_range(state: State<'_, Database>, id: String, begin: u64, end: u64) -> Result<tauri::ipc::Response> {
+    let path = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store::pdf_range(&Db::open(&path)?, &serde_json::json!({"id":id}), begin, end)
+            .map(tauri::ipc::Response::new)
+    }).await.map_err(|_| "读取 PDF 失败")?
+}
+
+#[tauri::command]
 async fn export_file(
     app: tauri::AppHandle,
     state: State<'_, Database>,
@@ -291,8 +365,12 @@ async fn export_file(
         let (name, text) = if let Some(id) = document_id {
             let doc = db.one(
                 "SELECT title,content,source_url FROM documents WHERE id=?1",
-                &[Value::from(id)],
+                &[Value::from(id.clone())],
             )?;
+            let pages = db.query("SELECT text FROM pdf_pages WHERE document_id=?1 ORDER BY page", &[Value::from(id)])?;
+            let text = if pages.is_empty() { doc["content"].as_str().unwrap().to_owned() } else {
+                pages.iter().filter_map(|page| page["text"].as_str()).collect::<Vec<_>>().join("\n\n")
+            };
             (
                 if doc["source_url"].is_string() {
                     format!(
@@ -300,9 +378,13 @@ async fn export_file(
                         doc["title"].as_str().unwrap().replace(['/', '\\'], "_")
                     )
                 } else {
-                    doc["title"].as_str().unwrap().to_owned()
+                    let title = doc["title"].as_str().unwrap();
+                    match title.rsplit_once('.') {
+                        Some((stem, extension)) if extension.eq_ignore_ascii_case("pdf") => format!("{stem}.txt"),
+                        _ => title.to_owned(),
+                    }
                 },
-                doc["content"].as_str().unwrap().to_owned(),
+                text,
             )
         } else {
             let backup = store::run(&db, "backup", &Value::Null)?;
@@ -400,6 +482,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             request,
             export_file,
+            import_file,
+            restore_backup_file,
+            pdf_range,
             dictionary_install
         ])
         .run(tauri::generate_context!())
