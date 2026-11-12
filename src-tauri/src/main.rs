@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
-mod dictionary;
+mod kokoro;
+mod mdict;
+mod pronunciation;
 mod snapshots;
 mod pdf_geometry;
 mod sqlite;
@@ -21,54 +23,31 @@ struct Database(PathBuf);
 async fn request(state: State<'_, Database>, op: String, payload: Value) -> Result<Value> {
     let path = state.0.clone();
     match op.as_str() {
-        "dictionary_lookup" | "dictionary_status" => {
-            tauri::async_runtime::spawn_blocking(move || {
-                let dictionary = path.with_file_name("wiktionary.sqlite3");
-                if op == "dictionary_status" {
-                    return dictionary::status(&dictionary);
-                }
-                dictionary::lookup(&dictionary, store::field(&payload, "word", 240, true)?)
-            })
-            .await
-            .map_err(|_| "无法读取本地词典")?
+        "kokoro_status" => {
+            let installed = |variant: kokoro::Variant| {
+                kokoro::installed(&path.with_file_name(variant.directory()), variant)
+            };
+            Ok(serde_json::json!({"fp32":installed(kokoro::Variant::Fp32),"int8":installed(kokoro::Variant::Int8)}))
         }
-        "dictionary_resolve" => {
-            let params = payload.clone();
-            let source_path = path.clone();
-            let (surface, context, local, key) = tauri::async_runtime::spawn_blocking(move || {
-                let db = Db::open(&source_path)?;
-                let (_, _, _, surface, context) = store::selection(&db, &params)?;
-                let local = dictionary::lookup(
-                    &source_path.with_file_name("wiktionary.sqlite3"),
-                    &surface,
-                )?;
-                let needs_ai = !dictionary::has_pronunciation(&local);
-                let key = if needs_ai {
-                    ai::request_key(&source_path, &params)?
-                } else {
-                    None
-                };
-                Ok::<_, String>((surface, context, local, key))
-            })
-            .await
-            .map_err(|_| "无法查找词典原形")??;
-            if dictionary::has_pronunciation(&local) {
-                return Ok(serde_json::json!({"lemma":null}));
-            }
-            let proposed = ai::find_lemma(&payload, key, &surface, &context).await?;
-            let lemma = proposed["lemma"].as_str().unwrap().trim().to_owned();
+        "pronunciation_list" | "pronunciation_install" | "pronunciation_remove"
+        | "pronunciation_lookup" | "pronunciation_audio" => {
             tauri::async_runtime::spawn_blocking(move || {
-                let result = if lemma.eq_ignore_ascii_case(&surface) {
-                    local.clone()
-                } else {
-                    dictionary::lookup(&path.with_file_name("wiktionary.sqlite3"), &lemma)?
-                };
-                Ok(dictionary::resolve_fallback(
-                    &surface, &lemma, &local, &result, &proposed,
-                ))
-            })
-            .await
-            .map_err(|_| "无法查询词典原形")?
+                let root = path.with_file_name("pronunciation-dictionaries");
+                let field = |key, max| store::field(&payload, key, max, true);
+                match op.as_str() {
+                    "pronunciation_list" => pronunciation::list(&root),
+                    "pronunciation_install" => pronunciation::install(&root, std::path::Path::new(field("folder", 4096)?)),
+                    "pronunciation_remove" => pronunciation::remove(&root, field("id", 36)?),
+                    "pronunciation_lookup" => pronunciation::lookup(&root, field("id", 36)?, field("word", 240)?, store::field(&payload,"base",240,false)?),
+                    _ => pronunciation::audio(&root, field("id", 36)?, field("key", 1024)?),
+                }
+            }).await.map_err(|_| "无法读取发音词典")?
+        }
+        "pronunciation_estimate" => {
+            let word = store::field(&payload, "word", 240, true)?;
+            let context = store::field(&payload, "context", 6000, false)?;
+            let key = ai::request_key(&path, &payload)?;
+            ai::estimate_pronunciation(&payload, key, word, context).await
         }
         "import_web" => {
             let url = web_import::parse_url(store::field(&payload, "url", 4096, true)?)?;
@@ -251,40 +230,28 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
 }
 
 #[tauri::command]
-async fn dictionary_install(
-    app: tauri::AppHandle,
-    state: State<'_, Database>,
-    progress: tauri::ipc::Channel<dictionary::Progress>,
-    download: bool,
-) -> Result<Value> {
+async fn kokoro_install(state: State<'_, Database>, variant: kokoro::Variant, progress: tauri::ipc::Channel<kokoro::Progress>) -> Result<()> {
+    let root = state.0.with_file_name(variant.directory());
+    kokoro::install(&root, variant, progress).await
+}
+
+#[tauri::command]
+async fn kokoro_read(state: State<'_, Database>, variant: kokoro::Variant, asset: usize, offset: u64, length: usize) -> Result<tauri::ipc::Response> {
+    let root = state.0.with_file_name(variant.directory());
+    let data = tauri::async_runtime::spawn_blocking(move || kokoro::read(&root, variant, asset, offset, length))
+        .await.map_err(|_| "无法读取 Kokoro 模型")??;
+    Ok(tauri::ipc::Response::new(data))
+}
+
+#[tauri::command]
+async fn pronunciation_folder(app: tauri::AppHandle) -> Result<Value> {
     use tauri_plugin_dialog::DialogExt;
-    let path = state.0.with_file_name("wiktionary.sqlite3");
-    if download {
-        let input = dictionary::download(path.parent().ok_or("找不到词典目录")?, &progress).await?;
-        return tauri::async_runtime::spawn_blocking(move || {
-            dictionary::install(&path, input.path(), |value| {
-                let _ = progress.send(value);
-            })
-        })
-        .await
-        .map_err(|_| "无法安装本地词典")?;
-    }
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(input) = app
-            .dialog()
-            .file()
-            .add_filter("Wiktextract JSONL", &["jsonl", "gz"])
-            .blocking_pick_file()
-        else {
+        let Some(folder) = app.dialog().file().blocking_pick_folder() else {
             return Ok(Value::Null);
         };
-        let input = input.into_path().map_err(|_| "请选择本地词典文件")?;
-        dictionary::install(&path, &input, |value| {
-            let _ = progress.send(value);
-        })
-    })
-    .await
-    .map_err(|_| "无法安装本地词典")?
+        pronunciation::preview(&folder.into_path().map_err(|_| "请选择本地词典文件夹")?)
+    }).await.map_err(|_| "无法读取词典文件夹")?
 }
 
 #[tauri::command]
@@ -485,7 +452,9 @@ fn main() {
             import_file,
             restore_backup_file,
             pdf_range,
-            dictionary_install
+            pronunciation_folder,
+            kokoro_install,
+            kokoro_read
         ])
         .run(tauri::generate_context!())
         .expect("Semantic Reader 启动失败");

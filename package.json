@@ -1,6 +1,6 @@
 {
   "name": "semantic-reader",
-  "version": "0.20.20",
+  "version": "0.20.21",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@tesseract.js-data/eng": "^1.0.0",
+    "onnxruntime-web": "1.31.1",
     "pdfjs-dist": "^5.7.284",
     "react": "18.3.1",
     "react-dom": "18.3.1",

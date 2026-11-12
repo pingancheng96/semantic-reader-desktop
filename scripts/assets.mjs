@@ -18,3 +18,8 @@ for (const name of ['tesseract.min.js','worker.min.js']) {
 }
 await copyFile('node_modules/tesseract.js-core/tesseract-core-lstm.wasm.js','dist/ocr/tesseract-core-lstm.wasm.js');
 await copyFile('node_modules/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz','dist/ocr/eng.traineddata.gz');
+
+await mkdir('dist/ort', {recursive:true});
+for (const name of ['ort.wasm.min.mjs','ort-wasm-simd-threaded.mjs','ort-wasm-simd-threaded.wasm']) {
+  await copyFile('node_modules/onnxruntime-web/dist/'+name,'dist/ort/'+name);
+}

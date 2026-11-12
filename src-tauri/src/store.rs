@@ -683,6 +683,99 @@ pub fn followup_groups(db: &Db, terms: &V, previous: &V) -> Result<Vec<V>> {
     Ok(matches)
 }
 
+// These are possible inflections. The context still determines which sense applies.
+fn inflection_keys(word: &str) -> Vec<String> {
+    let normalized = normalize(word);
+    let mut keys = vec![normalized.clone()];
+    let (first, tail) = normalized.split_once(' ').unwrap_or((&normalized, ""));
+    if !first.bytes().all(|c| c.is_ascii_lowercase()) {
+        return keys;
+    }
+    let mut add = |base: &str| {
+        let key = if tail.is_empty() {
+            base.to_owned()
+        } else {
+            format!("{base} {tail}")
+        };
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    };
+    for (base, forms) in [
+        ("be", "am is are was were been being"),
+        ("go", "goes went gone"),
+        ("have", "has had"),
+        ("do", "does did done"),
+        ("take", "took taken"),
+        ("get", "got gotten"),
+        ("run", "ran"),
+        ("write", "wrote written"),
+        ("see", "saw seen"),
+        ("come", "came"),
+        ("bring", "brought"),
+        ("think", "thought"),
+        ("buy", "bought"),
+        ("make", "made"),
+        ("find", "found"),
+        ("give", "gave given"),
+        ("child", "children"),
+        ("person", "people"),
+        ("man", "men"),
+        ("woman", "women"),
+        ("mouse", "mice"),
+        ("foot", "feet"),
+        ("tooth", "teeth"),
+    ] {
+        if forms.split_whitespace().any(|form| form == first) {
+            add(base);
+        }
+    }
+    for (suffix, replacement) in [("ies", "y"), ("ied", "y"), ("ves", "f"), ("ves", "fe")] {
+        if let Some(stem) = first.strip_suffix(suffix).filter(|stem| stem.len() >= 2) {
+            add(&format!("{stem}{replacement}"));
+        }
+    }
+    if let Some(stem) = first.strip_suffix("es").filter(|stem| {
+        ["s", "x", "z", "ch", "sh", "o"]
+            .iter()
+            .any(|end| stem.ends_with(end))
+    }) {
+        add(stem);
+    }
+    if !first.ends_with("ss") {
+        if let Some(stem) = first.strip_suffix('s').filter(|stem| stem.len() >= 3) {
+            add(stem);
+        }
+    }
+    for suffix in ["ed", "ing"] {
+        if let Some(stem) = first.strip_suffix(suffix).filter(|stem| stem.len() >= 2) {
+            add(stem);
+            add(&format!("{stem}e"));
+            let bytes = stem.as_bytes();
+            let last = bytes[bytes.len() - 1];
+            if last == bytes[bytes.len() - 2] && !b"aeiou".contains(&last) {
+                add(&stem[..stem.len() - 1]);
+            }
+        }
+    }
+    keys
+}
+
+fn matching_inflections(db: &Db, word: &str) -> Result<Vec<V>> {
+    let keys = inflection_keys(word);
+    Ok(db
+        .query("SELECT normalized FROM expressions", &[])?
+        .into_iter()
+        .filter_map(|row| {
+            let normalized = row["normalized"].as_str()?;
+            inflection_keys(normalized)
+                .iter()
+                .any(|key| keys.contains(key))
+                .then(|| row["normalized"].clone())
+        })
+        .collect())
+}
+
 pub fn candidates(db: &Db, p: &V) -> Result<V> {
     let (doc, start, end, surface, context) = selection(db, p)?;
     let saved_sense = db.query(
@@ -690,14 +783,15 @@ pub fn candidates(db: &Db, p: &V) -> Result<V> {
          JOIN expressions e ON e.id=s.expression_id WHERE o.document_id=?1 AND o.start=?2 AND o.end=?3",
         &[doc,start,end],
     )?.into_iter().next();
+    let forms = matching_inflections(db, &surface)?;
     let exact = db.query(
         &format!(
-            "{SENSES} WHERE e.normalized=?1 OR e.id IN (
+            "{SENSES} WHERE e.normalized IN (SELECT value FROM json_each(?1)) OR e.id IN (
             SELECT prior.expression_id FROM occurrences o JOIN senses prior ON prior.id=o.sense_id
             WHERE o.surface=?2 COLLATE NOCASE
-        ) ORDER BY s.meaning,s.id LIMIT 30"
+        ) ORDER BY (e.normalized=?3) DESC,s.meaning,s.id LIMIT 30"
         ),
-        &[json!(normalize(&surface)), json!(surface)],
+        &[json!(V::Array(forms).to_string()), json!(surface), json!(normalize(&surface))],
     )?;
     let reused = db.query("SELECT DISTINCT s.id, s.group_id, s.meaning, e.lemma
         FROM occurrences o JOIN senses s ON s.id=o.sense_id JOIN expressions e ON e.id=s.expression_id
@@ -787,15 +881,40 @@ fn annotate(db: &Db, p: &V) -> Result<V> {
             id(p, "group_id")?
         };
         let normalized = json!(normalize(lemma));
-        db.query(
-            "INSERT INTO expressions VALUES(?1,?2,?3) ON CONFLICT(normalized) DO NOTHING",
-            &[uuid(), json!(lemma), normalized.clone()],
+        let forms = matching_inflections(db, lemma)?;
+        let existing = db.query(
+            &format!(
+                "{SENSES} WHERE s.group_id=?1 AND s.meaning=?2
+                AND e.normalized IN (SELECT value FROM json_each(?3))
+                ORDER BY (e.normalized=?4) DESC, s.id LIMIT 2"
+            ),
+            &[
+                group.clone(),
+                json!(meaning),
+                json!(V::Array(forms).to_string()),
+                normalized.clone(),
+            ],
         )?;
-        let expression = db.one(
-            "SELECT id FROM expressions WHERE normalized=?1",
-            &[normalized],
-        )?;
-        let sense = upsert_sense(db, &expression["id"], &group, &json!(meaning))?;
+        let sense = match existing.as_slice() {
+            [sense] => sense["id"].clone(),
+            [sense, _]
+                if normalize(sense["lemma"].as_str().unwrap_or_default())
+                    == normalized.as_str().unwrap_or_default() =>
+            {
+                sense["id"].clone()
+            }
+            _ => {
+                db.query(
+                    "INSERT INTO expressions VALUES(?1,?2,?3) ON CONFLICT(normalized) DO NOTHING",
+                    &[uuid(), json!(lemma), normalized.clone()],
+                )?;
+                let expression = db.one(
+                    "SELECT id FROM expressions WHERE normalized=?1",
+                    &[normalized],
+                )?;
+                upsert_sense(db, &expression["id"], &group, &json!(meaning))?
+            }
+        };
         reindex(db, &group)?;
         sense
     };
@@ -1530,6 +1649,35 @@ mod tests {
         data["lemma"] = json!("plunge");
         data["meaning"] = json!(meaning);
         run(db, "annotate", &data).unwrap()
+    }
+
+    #[test]
+    fn inflected_selection_finds_and_reuses_an_existing_sense() {
+        let db = memory();
+        let group = create(&db, "Attack");
+        let saved_doc = import(&db, "First.txt", "txt", "They assailed us.").unwrap();
+        run(&db, "annotate", &json!({
+            "document_id":saved_doc,"start":5,"end":13,"group_id":group,
+            "lemma":"assailed","meaning":"猛烈攻击"
+        })).unwrap();
+
+        let doc = import(&db, "Second.txt", "txt", "They assail the plan.").unwrap();
+        let mut selection = json!({"document_id":doc,"start":5,"end":11});
+        assert_eq!(candidates(&db, &selection).unwrap()["notes"][0]["lemma"], "assailed");
+        selection["group_id"] = group.clone();
+        selection["lemma"] = json!("assail");
+        selection["meaning"] = json!("猛烈攻击");
+        selection["context_meaning"] = json!("猛烈批评这项计划");
+        run(&db, "annotate", &selection).unwrap();
+        assert_eq!(run(&db, "group_senses", &json!({"id":group})).unwrap().as_array().unwrap().len(), 1);
+
+        let doc = import(&db, "Third.txt", "txt", "Doubts assailing her.").unwrap();
+        selection["document_id"] = doc;
+        selection["start"] = json!(7);
+        selection["end"] = json!(16);
+        selection["meaning"] = json!("困扰");
+        run(&db, "annotate", &selection).unwrap();
+        assert_eq!(run(&db, "group_senses", &json!({"id":group})).unwrap().as_array().unwrap().len(), 2);
     }
 
     #[test]

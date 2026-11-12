@@ -130,21 +130,12 @@ button.delete-document { color: #a22f29; }
 .word-details dd { margin: 0; overflow-wrap: anywhere; }
 
 .dictionary-panel { margin-top: 1rem; }
-.dictionary-panel h3 { margin: 0 0 .6rem; }
-.dictionary-entry { background: #f7faf3; padding: .55rem .65rem; border-radius: .5rem; margin-bottom: .4rem; }
-.dictionary-entry > small, .dictionary-entry li > small { margin-left: .45rem; color: #537065; }
-.dictionary-entry .word-details { margin: .4rem 0 0; }
-.dictionary-entry ul { list-style: none; padding: 0; margin: 0; }
-.dictionary-credit, .legacy-ipa { font-size: .78rem; color: #537065; }
+.legacy-ipa { font-size: .78rem; color: #537065; }
 
 .bulk-controls { display: grid; gap: .35rem; margin-top: .7rem; }
 .bulk-controls .delete-confirm { font-size: .85rem; }
 .bulk-group { display: flex; align-items: flex-start; gap: .5rem; padding: .4rem .25rem; overflow-wrap: anywhere; }
-.dictionary-progress progress { width: 100%; accent-color: #39735b; }
 
-.dictionary-panel > summary { cursor: pointer; color: #31584a; }
-.dictionary-panel > h3 { margin-top: .65rem; }
-.dictionary-panel > .dictionary-entry:first-of-type { margin-top: .5rem; }
 
 
 
@@ -250,3 +241,36 @@ button.delete-document { color: #a22f29; }
 .pdf-zoom { display: flex; align-items: center; gap: .3rem; padding-left: .45rem; border-left: 1px solid #dce0d7; }
 .pdf-pagination .pdf-zoom-fit { font-size: .85rem; min-width: 3.45rem; line-height: 1.2; }
 .pdf-paper.zoomed { touch-action: pan-x pan-y; }
+
+.pronunciation-panel {
+  display: grid;
+  gap: 0.35rem;
+}
+.pronunciation-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.45rem;
+}
+.pronunciation-row button {
+  padding: 0.2rem 0.45rem;
+}
+.pronunciation-row small {
+  grid-column: 2 / -1;
+}
+
+.merge-group-comparison {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+  gap: .65rem;
+  margin: .65rem 0;
+}
+.merge-group-words {
+  padding: .7rem;
+  border: 1px solid #dce5d9;
+  border-radius: .5rem;
+  overflow-wrap: anywhere;
+}
+.merge-group-words h5 { margin: 0 0 .5rem; font-size: .95rem; }
+.merge-group-words p { margin: .45rem 0; }
+.merge-group-words ul { margin: .35rem 0 .7rem; padding-left: 1.2rem; }

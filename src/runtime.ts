@@ -12,10 +12,25 @@ export async function readPdfRange(id:string, begin:number, end:number) {
 }
 export const call = <T>(op: string, payload: object = {}) => tauri.core.invoke<T>('request', {op, payload});
 
-export type DictionaryStatus = {filename:string; words:number};
-export type DictionaryProgress = {phase:'download'|'index'; bytes:number; total:number|null};
-export function installDictionary(download:boolean, onProgress:(value:DictionaryProgress)=>void) {
-  const progress = new tauri.core.Channel<DictionaryProgress>();
+export const choosePronunciationFolder = <T>() => tauri.core.invoke<T|null>('pronunciation_folder',{});
+
+export type KokoroVariant = 'fp32'|'int8';
+export type KokoroStatus = Record<KokoroVariant,boolean>;
+
+export function installKokoro(variant:KokoroVariant,onProgress:(value:{bytes:number;total:number})=>void) {
+  const progress = new tauri.core.Channel<{bytes:number;total:number}>();
   progress.onmessage = onProgress;
-  return tauri.core.invoke<DictionaryStatus|null>('dictionary_install',{download,progress});
+  return tauri.core.invoke<void>('kokoro_install',{variant,progress});
+}
+
+export async function readKokoro(variant:KokoroVariant,asset:number,size:number) {
+  const data = new Uint8Array(size);
+  for (let offset=0;offset<size;offset+=8*1024*1024) {
+    const length = Math.min(8*1024*1024,size-offset);
+    const part = await tauri.core.invoke<ArrayBuffer|number[]>('kokoro_read',{variant,asset,offset,length});
+    const bytes = part instanceof ArrayBuffer ? new Uint8Array(part) : Uint8Array.from(part);
+    if (bytes.length!==length) throw new Error('Kokoro 模型读取不完整');
+    data.set(bytes,offset);
+  }
+  return data.buffer;
 }

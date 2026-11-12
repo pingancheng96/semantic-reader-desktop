@@ -1,8 +1,9 @@
+import {PronunciationPanel, PronunciationSettings} from './pronunciation.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import {PdfReader} from './pdf-reader.js';
 import {waitForVoice} from './speech-voices.js';
 import type {ClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode} from 'react';
-import {React, ReactDOM, call, exportFile, importLocalFile, restoreBackupFile, installDictionary, type DictionaryStatus, type DictionaryProgress} from './runtime.js';
+import {React, ReactDOM, call, exportFile, importLocalFile, restoreBackupFile} from './runtime.js';
 import {articleMatches, changedRanges, keepUnchanged, readingLines, selectedOffsets, type Piece} from './reading.js';
 import {captionNodes, type WebNode} from './web-captions.js';
 import {facets, type Tag, type TagLink} from './tag-filters.js';
@@ -34,9 +35,6 @@ type GroupFields = {name: string; description: string; vocabulary: string; tags:
 type Learning = {usage_note: string; example: string; etymology?:string|null; mnemonic?:string|null;
   ipa_uk?:string|null; ipa_us?:string|null; part_of_speech?:string|null;
   related: {expression: string; kind: 'synonym' | 'related' | 'collocation'; note: string}[]};
-type LexicalFallback = Pick<Learning,'ipa_uk'|'ipa_us'|'part_of_speech'> & {word?:string};
-type LemmaResult = {lemma:string|null; dictionary?:DictionaryResult|null; fallback?:LexicalFallback|null};
-type VerifiedDictionary = {word:string; data:DictionaryResult; revision:number};
 type Suggestion = {suggestion: {lemma: string; meaning: string; context_meaning:string; group_id: string | null; sense_id?: string | null; group_reason?: string | null;
   group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean};
 const blank = (): GroupFields => ({name: '', description: '', vocabulary: '', tags:[]});
@@ -92,11 +90,11 @@ function Pronunciation({ipa, word, locale}: {ipa?:string|null; word:string; loca
   </>;
 }
 
-function LearningPanel({learning, word}: {learning: Learning; word:string}) {
+function LearningPanel({learning, word, hideIpa}: {learning: Learning; word:string; hideIpa?:boolean}) {
   const kinds = {synonym:'近义表达', related:'相关概念', collocation:'常见搭配'};
   return <section className="learning">
     {learning.part_of_speech && <p className="muted">语境词性（AI） · {learning.part_of_speech}</p>}
-    {(learning.ipa_uk || learning.ipa_us) && <details className="legacy-ipa">
+    {!hideIpa && (learning.ipa_uk || learning.ipa_us) && <details className="legacy-ipa">
       <summary>笔记保存的 AI 音标</summary>
       <dl className="word-details"><dt>英式</dt><dd><Pronunciation ipa={learning.ipa_uk} word={word} locale="en-GB"/></dd>
         <dt>美式</dt><dd><Pronunciation ipa={learning.ipa_us} word={word} locale="en-US"/></dd></dl>
@@ -114,6 +112,51 @@ function LearningPanel({learning, word}: {learning: Learning; word:string}) {
       <b lang="en">{item.expression}</b> <small>{kinds[item.kind]}</small><br/>{item.note}
     </li>)}</ul>
     </>}
+  </section>;
+}
+
+function MergeGroupWords({label,detail}: {label:string;detail:Detail}) {
+  return <section className="merge-group-words">
+    <h5>{label} · {detail.group.name}</h5>
+    <p>已收录义项（{detail.senses.length}）</p>
+    {detail.senses.length ? <ul>{detail.senses.map(sense=>
+      <li key={sense.id}><b lang="en">{sense.lemma}</b> · {sense.meaning}</li>)}</ul> : <p className="muted">暂无义项</p>}
+    <p>核心词与搭配（{detail.vocabulary.length}）</p>
+    {detail.vocabulary.length ? <ul>{detail.vocabulary.map(word=>
+      <li key={word.expression}><b lang="en">{word.expression}</b>{word.nuance && <> · {word.nuance}</>}</li>)}</ul> : <p className="muted">暂无核心词与搭配</p>}
+  </section>;
+}
+
+function MergeSuggestion({source,destination,reason,busy,apply}: {
+  source:Detail;destination:Group|undefined;reason:string;busy:boolean;apply:()=>void;
+}) {
+  const [target,setTarget] = useState<Detail|null>(null);
+  const [error,setError] = useState(false);
+  const [retry,setRetry] = useState(0);
+  const id = destination?.id;
+  useEffect(()=>{
+    if (!id) return;
+    let current = true;
+    void call<Detail>('group',{id}).then(
+      detail=>{if(current)setTarget(detail);},
+      ()=>{if(current)setError(true);}
+    );
+    return ()=>{current=false;};
+  },[id,retry]);
+  return <section>
+    <h4>建议将「{source.group.name}」合并到「{destination?.name ?? '目标组已不存在'}」</h4>
+    <p>{reason}</p>
+    <div className="merge-group-comparison">
+      <MergeGroupWords label="并入方" detail={source}/>
+      {destination && target ? <MergeGroupWords label="接收方" detail={target}/> :
+        <section className="merge-group-words">
+          <h5>接收方 · {destination?.name ?? '目标组已不存在'}</h5>
+          {destination && (error ? <><p role="status">无法读取接收方词项。</p>
+            <button type="button" onClick={()=>{setError(false);setRetry(value=>value+1);}}>重试</button></> :
+            <p role="status">正在读取接收方词项…</p>)}
+        </section>}
+    </div>
+    <button type="button" disabled={busy || !destination || !target} onClick={apply}>填入合并建议</button>
   </section>;
 }
 
@@ -164,75 +207,7 @@ function GroupSenses({groupId, exclude, lemma, meaning, ai}: {
   </section>;
 }
 
-type DictionaryEntry = {word:string; pos:string; region:''|'UK'|'US'|'other'; ipa:string; labels:string};
-type DictionaryResult = {installed:boolean; entries:DictionaryEntry[]};
-const posLabels:Record<string,string> = {noun:'名词',verb:'动词',adj:'形容词',adv:'副词',pron:'代词',prep:'介词',
-  conj:'连词',det:'限定词',name:'专有名词',intj:'感叹词',phrase:'短语',num:'数词',article:'冠词',
-  particle:'小品词',proverb:'谚语',contraction:'缩约词',prefix:'前缀',suffix:'后缀',character:'字符'};
 
-function DictionaryPanel({word, revision, fallback, verified}: {word:string; revision:number; fallback?:LexicalFallback|null; verified?:VerifiedDictionary|null}) {
-  const [result,setResult] = useState<{word:string; data:DictionaryResult|null} | null>(null);
-  const lookup = word.trim();
-  const verifiedData = verified?.word===lookup && verified.revision===revision ? verified.data : null;
-  useEffect(()=>{
-    if (!lookup || lookup.length>240 || verifiedData) return;
-    let current = true;
-    const delay = window.setTimeout(()=>{
-      void call<DictionaryResult>('dictionary_lookup',{word:lookup}).then(
-        data=>{if(current)setResult({word:lookup,data});},
-        ()=>{if(current)setResult({word:lookup,data:null});}
-      );
-    },120);
-    return ()=>{current=false;window.clearTimeout(delay);};
-  },[lookup,revision,verifiedData]);
-  if (!lookup || (!verifiedData && result?.word!==lookup)) return null;
-  const data = verifiedData ?? result?.data;
-  if (!data) return <p className="muted">本地词典暂时无法读取。</p>;
-  const ipa = !data.entries.some(row=>row.ipa) && Boolean(fallback?.ipa_uk || fallback?.ipa_us);
-  const pos = !data.entries.length && fallback?.part_of_speech;
-  const supplement = (ipa || pos) && <div className="dictionary-entry">
-    <h3>AI 补充{fallback?.word ? ` · ${fallback.word}` : ''}</h3>
-    <dl className="word-details">
-      {ipa && <><dt>英式 IPA</dt><dd><Pronunciation ipa={fallback?.ipa_uk} word={fallback?.word || lookup} locale="en-GB"/></dd>
-        <dt>美式 IPA</dt><dd><Pronunciation ipa={fallback?.ipa_us} word={fallback?.word || lookup} locale="en-US"/></dd></>}
-      {pos && <><dt>语境词性</dt><dd>{pos}</dd></>}
-    </dl>
-  </div>;
-  if (!data.installed || !data.entries.length) return <details className="dictionary-panel" key={lookup}>
-    <summary>音标与词典</summary>
-    <p className="muted">{data.installed ? `Wiktionary 未收录「${lookup}」。` : '尚未安装 Wiktionary 离线词典。'}</p>
-    {supplement}
-  </details>;
-  const entries = new Map<string,DictionaryEntry[]>();
-  for (const row of data.entries) {
-    const key = row.word + ' / ' + row.pos;
-    const list = entries.get(key) ?? [];
-    list.push(row);
-    entries.set(key,list);
-  }
-  return <details className="dictionary-panel" key={lookup}>
-    <summary>音标与词典 · {lookup}</summary>
-    <h3>Wiktionary 离线词典</h3>
-    {[...entries].map(([key,rows])=>{
-      const render = (region:DictionaryEntry['region'])=> {
-        const sounds = rows.filter(row=>row.region===region && row.ipa);
-        return sounds.length ? <ul>{sounds.map(row=><li key={row.ipa+row.labels}>
-          <Pronunciation ipa={row.ipa} word={row.word} locale={region==='UK' ? 'en-GB' : region==='US' ? 'en-US' : undefined}/>{row.labels && <small>{row.labels}</small>}
-        </li>)}</ul> : '—';
-      };
-      return <div key={key} className="dictionary-entry">
-        <b lang="en">{rows[0].word}</b><small>{posLabels[rows[0].pos] ?? rows[0].pos}</small>
-        <dl className="word-details">
-          <dt>英式 IPA</dt><dd>{render('UK')}</dd>
-          <dt>美式 IPA</dt><dd>{render('US')}</dd>
-          {rows.some(row=>row.region==='other') && <><dt>其他或未标注地区</dt><dd>{render('other')}</dd></>}
-        </dl>
-      </div>;
-    })}
-    {supplement}
-    <p className="muted dictionary-credit">来源 Wiktionary 贡献者 · Wiktextract · CC BY-SA 4.0</p>
-  </details>;
-}
 
 function readLearning(raw?: string | null): Learning | null {
   return raw ? JSON.parse(raw) as Learning : null;
@@ -705,9 +680,6 @@ function App() {
   const [selection,setSelection] = useState<Selection | null>(null);
   const [activeMark,setActiveMark] = useState<Mark | null>(null);
   const [candidate,setCandidate] = useState<Candidates | null>(null);
-  const [verifiedDictionary,setVerifiedDictionary] = useState<VerifiedDictionary|null>(null);
-  const [lexicalFallback,setLexicalFallback] = useState<LexicalFallback|null>(null);
-  const [lemmaNotice,setLemmaNotice] = useState('');
   const [autoSuggest,setAutoSuggest] = useState(()=>localStorage.getItem('autoSuggestOnDoubleClick')!=='off');
   const [suggesting,setSuggesting] = useState(false);
   const selectionRequest = useRef(0);
@@ -743,9 +715,7 @@ function App() {
   const [endpoint,setEndpoint] = useState(savedAi.endpoint);
   const [model,setModel] = useState(savedAi.model);
   const [keyState,setKeyState] = useState('尚未配置');
-  const [dictionaryProgress,setDictionaryProgress] = useState<DictionaryProgress|null>(null);
-  const [dictionaryStatus,setDictionaryStatus] = useState<DictionaryStatus|null>(null);
-  const [dictionaryRevision,setDictionaryRevision] = useState(0);
+  const [pronunciationLibrary,setPronunciationLibrary] = useState(()=>localStorage.getItem('pronunciationLibrary') ?? '');
   const [keyRevision,setKeyRevision] = useState(0);
   const aiConfigured = Boolean(savedAi.endpoint && savedAi.model);
   const [key,setKey] = useState('');
@@ -753,7 +723,6 @@ function App() {
   const [error,setError] = useState('');
   const [busy,setBusy] = useState(false);
   const lock = useRef(false);
-  const lemmaRequests = useRef(new Map<string,Promise<LemmaResult>>());
   const [snapshots,setSnapshots] = useState<Snapshot[]>([]);
   const [snapshotId,setSnapshotId] = useState('');
   const [confirmSnapshot,setConfirmSnapshot] = useState<'restore'|'delete'|null>(null);
@@ -797,61 +766,6 @@ function App() {
     );
     return () => { current = false; };
   }, [mode,savedAi,aiConfigured,keyRevision]);
-
-  useEffect(()=>{
-    if(mode!=='settings') return;
-    let current = true;
-    void call<DictionaryStatus|null>('dictionary_status').then(
-      value=>{if(current)setDictionaryStatus(value);},
-      ()=>{if(current)setError('无法读取本地词典状态');}
-    );
-    return ()=>{current=false;};
-  },[mode,dictionaryRevision]);
-
-  useEffect(()=>{
-    if (!selection || !aiConfigured || !autoLemma || (autoAnalysis.current && suggesting) || mode!=='reader') return;
-    let current = true;
-    const chosen = selection;
-    setLemmaNotice('');
-    const timer = window.setTimeout(()=>{
-      const key = JSON.stringify([chosen.document_id,chosen.start,chosen.end,savedAi,dictionaryRevision]);
-      let pending = lemmaRequests.current.get(key);
-      if (!pending) {
-        pending = call<LemmaResult>('dictionary_resolve',{...chosen,...savedAi});
-        if (lemmaRequests.current.size>=128) {
-          const oldest = lemmaRequests.current.keys().next().value;
-          if (oldest !== undefined) lemmaRequests.current.delete(oldest);
-        }
-        lemmaRequests.current.set(key,pending);
-      }
-      void pending.then(
-        result=>{
-          if (!current) return;
-          const base = result.lemma || result.fallback?.word;
-          if (base) setLemma(word=>word===chosen.surface ? base : word);
-          setLexicalFallback(result.fallback ?? null);
-          if (result.lemma && result.dictionary) {
-            setVerifiedDictionary({word:result.lemma,data:result.dictionary,revision:dictionaryRevision});
-          }
-        },
-        ()=>{lemmaRequests.current.delete(key);if(current)setLemmaNotice('未能自动查找原形。可以手动修改「原形或表达」，或请求 AI 建议。');}
-      );
-    },250);
-    return ()=>{current=false;window.clearTimeout(timer);};
-  },[selection,aiConfigured,autoLemma,suggesting,mode,savedAi,dictionaryRevision]);
-
-  function getDictionary(download:boolean) {
-    void task(async()=>{
-      setDictionaryProgress({phase:download?'download':'index',bytes:0,total:null});
-      try {
-        const installed = await installDictionary(download,setDictionaryProgress);
-        if (installed) {
-          setDictionaryStatus(installed);setDictionaryRevision(value=>value+1);
-          setNotice(`词典已安装 · ${installed.words.toLocaleString()} 个词条`);
-        }
-      } finally {setDictionaryProgress(null);}
-    });
-  }
 
   function saveAi() {
     const config = {endpoint:endpoint.trim(),model:model.trim()};
@@ -995,7 +909,7 @@ function App() {
     autoAnalysis.current = automatic;
     setSuggesting(automatic);
     setSelection(s); setActiveMark(null); setCandidate(null); setAiNote(''); setLearning(null);
-    setVerifiedDictionary(null);setLexicalFallback(null);setLemmaNotice('');setLemma(s.surface); setMeaning(''); setContextMeaning(''); setAttachGroup(''); setAttachSense(''); setNewFields(blank());
+    setLemma(s.surface); setMeaning(''); setContextMeaning(''); setAttachGroup(''); setAttachSense(''); setNewFields(blank());
     void call<Candidates>('candidates',s).then(options=>{
       if (selectionRequest.current !== request) return;
       setCandidate(options);
@@ -1020,9 +934,8 @@ function App() {
   const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()];
   const selectedSense = candidateSenses.find(sense=>sense.id===attachSense);
   const selectedGroup = attachSense ? selectedSense?.group_id : attachGroup;
-  const verifiedWord = verifiedDictionary?.revision===dictionaryRevision ? verifiedDictionary.word : undefined;
   const lookupWord = selection ? dictionaryLookupWord(selection.surface,lemma,
-    candidateSenses.find(sense=>sense.id===attachSense)?.lemma,verifiedWord) : '';
+    candidateSenses.find(sense=>sense.id===attachSense)?.lemma,undefined) : '';
   const tagResults = useMemo(()=>facets(listed.groups,lib.tags,lib.tag_links,selectedTags,untagged),
     [listed.groups,lib.tags,lib.tag_links,selectedTags,untagged]);
   const sidebar = mode === 'library' ? tagResults.results : listed.documents;
@@ -1121,10 +1034,15 @@ function App() {
             {libraryPlans.filter(({group})=>lib.groups.some(item=>item.id===group.id)).map(({group,plan})=>
               (['merge','split'] as const).filter(kind=>plan[kind]).map(kind=>{
                 const label = kind==='merge' ? '合并' : '拆分';
+                const source = lib.groups.find(item=>item.id===group.id)?.name ?? group.name;
+                const destination = lib.groups.find(item=>item.id===plan.merge?.target_id)?.name;
+                const summary = kind==='merge'
+                  ? `将「${source}」合并到「${destination ?? '目标组已不存在'}」`
+                  : `${source} · ${label}`;
                 return <div className="row" key={group.id + kind}>
                   <button className="quiet" type="button" disabled={busy} onClick={()=>void task(async()=>{
                     await openGroup(group.id);setOrganizationPlan(plan);setOrganizing(true);
-                  })}>{group.name} · {label}</button>
+                  })}>{summary}</button>
                   <button className="quiet" type="button" aria-label={`忽略「${group.name}」的${label}建议`}
                     disabled={busy && !scanProgress?.running} onClick={()=>ignoreLibrarySuggestion(plan,kind)}>忽略</button>
                 </div>;
@@ -1249,15 +1167,18 @@ function App() {
           {activeMark ? <>
 
             <h2>{activeMark.surface}</h2>
+            <PronunciationPanel id={pronunciationLibrary} word={activeMark.surface}
+              base={activeMark.lemma} pos={activeLearning?.part_of_speech} context={activeMark.context}
+              ai={aiConfigured && autoLemma ? savedAi : undefined}/>
             <p className="muted">{activeMark.lemma}</p>
             <p><b>本句释义</b> · {activeMark.context_meaning || activeMark.meaning}</p>
             <p><b>通用义项</b> · {activeMark.meaning}</p>
             <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
             <DeleteSense key={activeMark.sense_id} sense={activeMark} busy={busy}
               remove={()=>void task(()=>deleteSense(activeMark.sense_id,activeMark.group_id))}/>
-            <DictionaryPanel word={activeMark.lemma || activeMark.surface} revision={dictionaryRevision} fallback={activeLearning}/>
+
             <GroupSenses key={activeMark.group_id} groupId={activeMark.group_id} exclude={activeMark.sense_id} lemma={activeMark.lemma} meaning={activeMark.meaning} ai={aiConfigured ? savedAi : undefined}/>
-            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
+            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
             {(!activeLearning?.part_of_speech || !activeLearning.usage_note || (activeLearning.etymology === undefined && activeLearning.mnemonic === undefined)) && markSuggestion?.id !== activeMark.id && <p>
               <button disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
                 const result = await call<Suggestion>('suggest',{
@@ -1276,7 +1197,7 @@ function App() {
               })}>补充学习笔记</button>
             </p>}
             {markSuggestion?.id === activeMark.id && <>
-              <LearningPanel learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
+              <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
               <button disabled={busy} onClick={()=>void task(async()=>{
                 const updated = {...activeMark,learning:JSON.stringify(markSuggestion.learning)};
                 await call('learning_save',{id:activeMark.id,learning:markSuggestion.learning});
@@ -1286,18 +1207,15 @@ function App() {
             </>}
           </> : selection ? <>
             <h2>{selection.surface}</h2>
-            <DictionaryPanel word={lookupWord} verified={verifiedDictionary}
-              revision={dictionaryRevision} fallback={
-                !attachSense && lexicalFallback?.word?.toLowerCase()===lemma.trim().toLowerCase() ? lexicalFallback : null
-              }/>
-            {verifiedWord && lookupWord===verifiedWord && <p className="muted">已按 Wiktionary 原形「{verifiedWord}」显示。</p>}
-            {lemmaNotice && <p className="muted">{lemmaNotice}</p>}
+            <PronunciationPanel id={pronunciationLibrary} word={selection.surface}
+              base={lookupWord} pos={learning?.part_of_speech} context={candidate?.context}
+              ai={aiConfigured && autoLemma ? savedAi : undefined}/>
             {candidate?.notes.length ? <section className="saved-notes">
               <h3>词库笔记</h3>
               {candidate.notes.length > 1 && <p className="muted">找到多个义项，请按当前语境查看。</p>}
               {candidate.notes.map(note=><div className="saved-note" key={note.id}>
                 <b>{note.lemma}</b><p>{note.meaning}</p>
-                {note.learning && <LearningPanel learning={readLearning(note.learning)!} word={note.lemma}/>}
+                {note.learning && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={readLearning(note.learning)!} word={note.lemma}/>}
                 <div className="row">
                   <button className="quiet" disabled={busy} onClick={()=>void task(()=>openGroup(note.group_id))}>{note.group_name} →</button>
                   <button disabled={busy || suggesting} onClick={()=>{setAttachSense(note.id);setLearning(null);}}>复用此义项</button>
@@ -1312,19 +1230,11 @@ function App() {
             </button>
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
             {aiNote && <p className="muted" role="status">{aiNote}</p>}
-            {learning && <LearningPanel learning={learning} word={lookupWord}/>}
+            {learning && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={learning} word={lookupWord}/>}
             {selectedGroup && <GroupSenses key={selectedGroup} groupId={selectedGroup} exclude={attachSense} lemma={selectedSense?.lemma ?? lemma} meaning={selectedSense?.meaning ?? meaning}
               ai={aiConfigured ? savedAi : undefined}/>}
             <form onSubmit={e=>submit(e,async ()=>{
-              let savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
-              if (!attachSense && lexicalFallback?.word?.toLowerCase()===lemma.trim().toLowerCase()) {
-                savedLearning = {
-                  usage_note:'',example:'',related:[],...savedLearning,
-                  ipa_uk:savedLearning?.ipa_uk || lexicalFallback.ipa_uk,
-                  ipa_us:savedLearning?.ipa_us || lexicalFallback.ipa_us,
-                  part_of_speech:savedLearning?.part_of_speech || lexicalFallback.part_of_speech
-                };
-              }
+              const savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
               await call('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
                 sense_id:attachSense || null,group_id:attachGroup || null,
                 new_group:newFields});
@@ -1440,14 +1350,13 @@ function App() {
             <h3>AI 整理建议</h3>
             {!organizationPlan.merge && !organizationPlan.split && <p>没有找到明确的整理建议。</p>}
             {!organizationPlan.split_checked && detail.senses.length > 60 && <p>该组超过 60 条义项，拆分请手动选择。</p>}
-            {organizationPlan.merge && <section>
-              <h4>建议合并到「{lib.groups.find(group=>group.id===organizationPlan.merge?.target_id)?.name}」</h4>
-              <p>{organizationPlan.merge.reason}</p>
-              <button type="button" disabled={busy} onClick={()=>{
+            {organizationPlan.merge && <MergeSuggestion
+              key={detail.group.id + ':' + organizationPlan.merge.target_id} source={detail}
+              destination={lib.groups.find(group=>group.id===organizationPlan.merge?.target_id)}
+              reason={organizationPlan.merge.reason} busy={busy} apply={()=>{
                 if (!organizationPlan.merge) return;
                 setOperation('merge');setTarget(organizationPlan.merge.target_id);
-              }}>填入合并建议</button>
-            </section>}
+              }}/>}
             {organizationPlan.split && <section>
               <h4>建议拆出「{organizationPlan.split.name}」</h4>
               <p>{organizationPlan.split.reason}</p>
@@ -1571,7 +1480,7 @@ function App() {
 
       {mode==='settings' && <main className="page manage">
         <p className="eyebrow">PREFERENCES</p><h1>设置</h1>
-        <section><h2>AI 分类接口</h2><p>请求 AI 建议或补充学习提示时，会发送选中文字、附近语境和最多五个候选组。查词时也可能发送同词的已有义项，用来判断是否复用。建议新建组且本地补查找到其他候选时，会再请求一次归组判断。开启自动查原形后，词典缺少读音时也会发送选区和附近语境。补充提示也会发送已保存的义项。</p>
+        <section><h2>AI 分类接口</h2><p>请求 AI 建议或补充学习提示时，会发送选中文字、附近语境和最多五个候选组。查词时也可能发送同词的已有义项，用来判断是否复用。建议新建组且本地补查找到其他候选时，会再请求一次归组判断。允许 AI 补音标时，应用也会发送选词和附近语境。补充提示也会发送已保存的义项。</p>
           <label className="check"><input type="checkbox" checked={autoSuggest} onChange={e=>{
             setAutoSuggest(e.target.checked);
             localStorage.setItem('autoSuggestOnDoubleClick', e.target.checked ? 'on' : 'off');
@@ -1593,27 +1502,11 @@ function App() {
             await call('key_remove',savedAi);setKeyRevision(v=>v+1);setKey('');setNotice('已清除当前地址的密钥');
           })}>清除密钥</button></div>
         </section>
-        <section><h2>Wiktionary 离线词典</h2>
-          <p>{dictionaryStatus
-            ? `已安装 ${dictionaryStatus.words.toLocaleString()} 个词条 · ${dictionaryStatus.filename}`
-            : '尚未安装。选择从 Kaikki.org 下载的 Wiktextract JSONL 或 JSONL.GZ 文件。'}</p>
-          <p className="muted">安装后，选词或打开已收录的笔记即可离线查看词典音标和词性。安装新版本会替换词典快照。</p>
-          <label className="check"><input type="checkbox" checked={autoLemma} onChange={e=>{
-            setAutoLemma(e.target.checked);localStorage.setItem('autoDictionaryLemma',e.target.checked?'on':'off');
-          }}/>词典缺少读音时，用 AI 查找原形并补充缺失数据（会发送选区和附近语境）</label>
-          <div className="row">
-            <button className="primary" disabled={busy} onClick={()=>getDictionary(true)}>一键下载并安装（约 3.2 GB）</button>
-            <button disabled={busy} onClick={()=>getDictionary(false)}>{dictionaryStatus?'更换本地词典文件':'从本地文件安装'}</button>
-          </div>
-          {dictionaryProgress && <div className="dictionary-progress" aria-live="polite">
-            <p>{dictionaryProgress.phase==='download'?'正在下载词典':'正在建立离线索引'} · {
-              (dictionaryProgress.bytes/1_000_000).toLocaleString(undefined,{maximumFractionDigits:0})} MB
-              {dictionaryProgress.total ? ` / ${Math.round(dictionaryProgress.total/1_000_000).toLocaleString()} MB` : ''}
-            </p>
-            <progress aria-label="词典安装进度" max={dictionaryProgress.total || 1}
-              value={dictionaryProgress.total ? dictionaryProgress.bytes : undefined}/>
-          </div>}
-        </section>
+        <PronunciationSettings active={pronunciationLibrary} select={id=>{
+          setPronunciationLibrary(id);localStorage.setItem('pronunciationLibrary',id);
+        }} autoIpa={autoLemma} setAutoIpa={enabled=>{
+          setAutoLemma(enabled);localStorage.setItem('autoDictionaryLemma',enabled?'on':'off');
+        }}/>
         <LibraryGlossOrganizer busy={busy} configured={aiConfigured}
           scan={(resume,receive,stopped)=>void task(async()=>{
             if (!resume) setSnapshots(await call<Snapshot[]>('snapshot_create'));
@@ -1811,13 +1704,13 @@ function HelpPage() {
     <section>
       <h2>3. 配置 AI</h2>
       <p>在「设置」填写服务商提供的完整 <code>/chat/completions</code> 地址、模型名和 API Key，再点「保存密钥」。密钥会保存在当前用户的应用数据中，未加密。</p>
-      <p>AI 请求会发送所选文字、附近语境和少量候选语义组。建议新建组时，应用会先用 AI 给出的检索词补查本地词库。有新候选才追加一次归组请求。可在设置里关闭双击自动请求，也可单独关闭词典缺少读音时的 AI 原形查询。手动填写和收录无需配置 AI。</p>
+      <p>AI 请求会发送所选文字、附近语境和少量候选语义组。建议新建组时，应用会先用 AI 给出的检索词补查本地词库。有新候选才追加一次归组请求。可在设置里关闭双击自动请求，也可单独关闭词典缺少音标时的 AI 补充。手动填写和收录无需配置 AI。</p>
     </section>
 
     <section>
       <h2>4. 安装离线词典和播放读音</h2>
-      <p>在「设置」的一键下载入口安装 Wiktionary，也可选择本地 Wiktextract 文件。安装后，展开右栏「音标与词典」查看已有的音标和词性。</p>
-      <p>点英式或美式音标旁的扬声器，会用对应的本地系统语音朗读。可用口音取决于设备上安装的语音。</p>
+      <p>在「设置 → 发音词典」导入含 MDX 和配套 MDD 的文件夹，然后选择当前发音库。阅读器右栏会直接显示英美音标。</p>
+      <p>点扬声器优先播放词典录音。缺少录音时，可用 Kokoro 离线合成。</p>
     </section>
 
     <section>
