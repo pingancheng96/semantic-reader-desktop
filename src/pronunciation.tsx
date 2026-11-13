@@ -192,12 +192,12 @@ export function PronunciationPanel({id,word,base,pos,ai,context}: {
   }
   const spoken = uk?.word || us?.word;
   return <div className="dictionary-panel pronunciation-panel" aria-label="音标与发音">
+    {spoken && spoken!==word.toLowerCase().trim() && <small>原形发音 · {spoken}</small>}
     {allPositions.length>1 && <label>发音词性<select value={selected} onChange={event=>setChoice(event.target.value)}>
       {allPositions.map(label=><option key={label} value={label}>{positions[label] || label}</option>)}
     </select></label>}
     {row('UK',uk,estimate?.ipa_uk)}{row('US',us,estimate?.ipa_us)}
     {!sounds && <small>正在查询发音词典…</small>}
-    {spoken && spoken!==word.toLowerCase().trim() && <small>原形发音 · {spoken}</small>}
     {error && <p role="status">{error}</p>}
   </div>;
 }

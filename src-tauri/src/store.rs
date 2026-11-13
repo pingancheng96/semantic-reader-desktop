@@ -1460,6 +1460,22 @@ fn restore(db: &Db, p: &V) -> Result<V> {
     Ok(V::Null)
 }
 
+fn delete_sense(db: &Db, key: &V) -> Result<()> {
+    let args = std::slice::from_ref(key);
+    let sense = db.one(&format!("{SENSES} WHERE s.id=?1"), args)?;
+    let group = &sense["group_id"];
+    db.query("DELETE FROM occurrences WHERE sense_id=?1", args)?;
+    db.write("DELETE FROM senses WHERE id=?1", args)?;
+    // The vocabulary list is separate. Remove this lemma only when the group
+    // no longer has a sense that uses it.
+    db.query("DELETE FROM group_vocabulary WHERE group_id=?1 AND expression=?2 COLLATE NOCASE
+        AND NOT EXISTS(SELECT 1 FROM senses WHERE group_id=?1 AND expression_id=?3)",
+        &[group.clone(), sense["lemma"].clone(), sense["expression_id"].clone()])?;
+    reindex(db, group)?;
+    db.batch("DELETE FROM operation_history")?;
+    Ok(())
+}
+
 pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
     match op {
         "list" => {
@@ -1567,20 +1583,21 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
         )?)),
         "gloss_apply" => db.transaction(|| apply_glosses(db, p)),
         "sense_merge" => db.transaction(|| merge_senses(db, p)),
+        "mark_delete" => db.transaction(|| {
+            let mark = id(p, "id")?;
+            let document = id(p, "document_id")?;
+            let args = &[mark, document];
+            let occurrence = db.one("SELECT sense_id FROM occurrences WHERE id=?1 AND document_id=?2", args)?;
+            db.write("DELETE FROM occurrences WHERE id=?1 AND document_id=?2", args)?;
+            let sense = &occurrence["sense_id"];
+            let last = db.query("SELECT 1 FROM occurrences WHERE sense_id=?1 LIMIT 1", std::slice::from_ref(sense))?.is_empty();
+            if last {
+                delete_sense(db, sense)?;
+            }
+            Ok(json!(last))
+        }),
         "sense_delete" => db.transaction(|| {
-            let key = id(p, "id")?;
-            let args = std::slice::from_ref(&key);
-            let sense = db.one(&format!("{SENSES} WHERE s.id=?1"), args)?;
-            let group = &sense["group_id"];
-            db.query("DELETE FROM occurrences WHERE sense_id=?1", args)?;
-            db.write("DELETE FROM senses WHERE id=?1", args)?;
-            // The vocabulary list is separate. Remove this lemma only when the group
-            // no longer has a sense that uses it.
-            db.query("DELETE FROM group_vocabulary WHERE group_id=?1 AND expression=?2 COLLATE NOCASE
-                AND NOT EXISTS(SELECT 1 FROM senses WHERE group_id=?1 AND expression_id=?3)",
-                &[group.clone(), sense["lemma"].clone(), sense["expression_id"].clone()])?;
-            reindex(db, group)?;
-            db.batch("DELETE FROM operation_history")?;
+            delete_sense(db, &id(p, "id")?)?;
             Ok(V::Null)
         }),
         "document_delete" => db.transaction(|| {
@@ -2357,6 +2374,25 @@ mod tests {
         assert_eq!(after["marks"][0]["id"], first);
         assert_eq!(after["marks"][0]["context"], "🙂 Prices ⟦plunged⟧. They rose.");
         assert_eq!(group_senses(&db, &group).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_one_mark_preserves_its_sense_and_other_links() {
+        let db = memory();
+        let text = "Prices plunged. They plunged.";
+        let first = import(&db, "First.txt", "txt", text).unwrap();
+        let second = import(&db, "Second.txt", "txt", text).unwrap();
+        let group = create(&db, "Decline");
+        let removed = annotate_at(&db, anchor(text, &first, 7), &group, "下降");
+        let kept = annotate_at(&db, anchor(text, &second, 7), &group, "下降");
+        run(&db, "mark_delete", &json!({"id":removed,"document_id":first})).unwrap();
+        let detail = run(&db, "group", &json!({"id":group})).unwrap();
+        assert_eq!(detail["senses"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["marks"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["marks"][0]["id"], kept);
+        assert_eq!(run(&db, "mark_delete", &json!({"id":kept,"document_id":second})).unwrap(), true);
+        assert!(group_senses(&db, &group).unwrap().is_empty());
+        assert_eq!(run(&db, "document", &json!({"id":first})).unwrap()["document"]["content"], text);
     }
 
     #[test]

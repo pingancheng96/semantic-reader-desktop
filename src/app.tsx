@@ -90,10 +90,17 @@ function Pronunciation({ipa, word, locale}: {ipa?:string|null; word:string; loca
   </>;
 }
 
-function LearningPanel({learning, word, hideIpa}: {learning: Learning; word:string; hideIpa?:boolean}) {
+function WordHeading({surface,pos}: {surface:string;pos?:string|null}) {
+  return <header className="word-heading">
+    <p className="muted">原文词形{pos?.trim() && <> · {pos.trim()}</>}</p>
+    <h2 lang="en">{surface}</h2>
+  </header>;
+}
+
+function LearningPanel({learning, word, hideIpa, hidePos}: {learning: Learning; word:string; hideIpa?:boolean; hidePos?:boolean}) {
   const kinds = {synonym:'近义表达', related:'相关概念', collocation:'常见搭配'};
   return <section className="learning">
-    {learning.part_of_speech && <p className="muted">语境词性（AI） · {learning.part_of_speech}</p>}
+    {!hidePos && learning.part_of_speech && <p className="muted">语境词性（AI） · {learning.part_of_speech}</p>}
     {!hideIpa && (learning.ipa_uk || learning.ipa_us) && <details className="legacy-ipa">
       <summary>笔记保存的 AI 音标</summary>
       <dl className="word-details"><dt>英式</dt><dd><Pronunciation ipa={learning.ipa_uk} word={word} locale="en-GB"/></dd>
@@ -262,6 +269,18 @@ const webTags = new Set(['div','section','article','header','p','h1','h2','h3','
 
 type InlineEdit = {start:number; end:number; text:string; unchanged:ReturnType<typeof keepUnchanged>};
 type EditedDocument = {content:string; positions:{id:string; start:number|null}[]; webNodes?:WebNode[]};
+
+function DeleteMark({busy, remove}: {busy:boolean;remove:()=>void}) {
+  const [confirm,setConfirm] = useState(false);
+  return confirm ? <div className="delete-confirm">
+    <p>删除这处原文标注？如果这是该义项的最后一处标注，也会删除词库中的义项，并清除语义组关系调整的撤销记录。</p>
+    <div className="row">
+      <button type="button" disabled={busy} onClick={()=>setConfirm(false)}>取消</button>
+      <button type="button" className="delete-document" disabled={busy} onClick={remove}>确认删除此处</button>
+    </div>
+  </div> : <button type="button" className="quiet delete-document" disabled={busy}
+    onClick={()=>setConfirm(true)}>删除此处标注</button>;
+}
 
 function DeleteSense({sense, busy, remove}: {
   sense: Pick<Sense,'lemma'|'meaning'>; busy: boolean; remove: () => void;
@@ -1166,19 +1185,30 @@ function App() {
           <p className="eyebrow">CONTEXT PANEL</p>
           {activeMark ? <>
 
-            <h2>{activeMark.surface}</h2>
+            <WordHeading surface={activeMark.surface} pos={(markSuggestion?.id === activeMark.id ? markSuggestion.learning : activeLearning)?.part_of_speech}/>
             <PronunciationPanel id={pronunciationLibrary} word={activeMark.surface}
               base={activeMark.lemma} pos={activeLearning?.part_of_speech} context={activeMark.context}
               ai={aiConfigured && autoLemma ? savedAi : undefined}/>
-            <p className="muted">{activeMark.lemma}</p>
-            <p><b>本句释义</b> · {activeMark.context_meaning || activeMark.meaning}</p>
-            <p><b>通用义项</b> · {activeMark.meaning}</p>
+            <section className="word-meaning">
+              <h3>本句释义</h3>
+              <p>{activeMark.context_meaning?.trim() || <span className="muted">沿用通用释义</span>}</p>
+            </section>
+            <section className="word-meaning">
+              <h3>通用释义{activeMark.lemma && activeMark.lemma.trim().toLowerCase()!==activeMark.surface.trim().toLowerCase() &&
+                <> <small>原形 · <b lang="en">{activeMark.lemma}</b></small></>}</h3>
+              <p>{activeMark.meaning}</p>
+            </section>
             <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
-            <DeleteSense key={activeMark.sense_id} sense={activeMark} busy={busy}
-              remove={()=>void task(()=>deleteSense(activeMark.sense_id,activeMark.group_id))}/>
+            <DeleteMark key={activeMark.id} busy={busy} remove={()=>void task(async()=>{
+              const deletedSense = await call<boolean>('mark_delete',{id:activeMark.id,document_id:activeMark.document_id});
+              setRead(previous=>previous && {...previous,marks:previous.marks.filter(mark=>mark.id!==activeMark.id)});
+              resetSelection();
+              await refresh();
+              setNotice(deletedSense ? '已删除最后一处标注及其义项' : '已删除此处标注');
+            })}/>
 
             <GroupSenses key={activeMark.group_id} groupId={activeMark.group_id} exclude={activeMark.sense_id} lemma={activeMark.lemma} meaning={activeMark.meaning} ai={aiConfigured ? savedAi : undefined}/>
-            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
+            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
             {(!activeLearning?.part_of_speech || !activeLearning.usage_note || (activeLearning.etymology === undefined && activeLearning.mnemonic === undefined)) && markSuggestion?.id !== activeMark.id && <p>
               <button disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
                 const result = await call<Suggestion>('suggest',{
@@ -1197,7 +1227,7 @@ function App() {
               })}>补充学习笔记</button>
             </p>}
             {markSuggestion?.id === activeMark.id && <>
-              <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
+              <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
               <button disabled={busy} onClick={()=>void task(async()=>{
                 const updated = {...activeMark,learning:JSON.stringify(markSuggestion.learning)};
                 await call('learning_save',{id:activeMark.id,learning:markSuggestion.learning});
@@ -1206,7 +1236,7 @@ function App() {
               })}>保存学习提示</button>
             </>}
           </> : selection ? <>
-            <h2>{selection.surface}</h2>
+            <WordHeading surface={selection.surface} pos={learning?.part_of_speech}/>
             <PronunciationPanel id={pronunciationLibrary} word={selection.surface}
               base={lookupWord} pos={learning?.part_of_speech} context={candidate?.context}
               ai={aiConfigured && autoLemma ? savedAi : undefined}/>
@@ -1230,7 +1260,7 @@ function App() {
             </button>
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
             {aiNote && <p className="muted" role="status">{aiNote}</p>}
-            {learning && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={learning} word={lookupWord}/>}
+            {learning && <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={learning} word={lookupWord}/>}
             {selectedGroup && <GroupSenses key={selectedGroup} groupId={selectedGroup} exclude={attachSense} lemma={selectedSense?.lemma ?? lemma} meaning={selectedSense?.meaning ?? meaning}
               ai={aiConfigured ? savedAi : undefined}/>}
             <form onSubmit={e=>submit(e,async ()=>{
@@ -1247,10 +1277,15 @@ function App() {
                 {candidateSenses.map(s=><option key={s.id} value={s.id}>{s.lemma} · {s.meaning}</option>)}
               </select></label>}
               <label>本句释义<textarea value={contextMeaning} maxLength={1200}
-                placeholder="可留空，沿用通用义项" onChange={e=>setContextMeaning(e.target.value)}/></label>
+                placeholder="可留空，沿用通用释义" onChange={e=>setContextMeaning(e.target.value)}/></label>
+              {selectedSense && <section className="word-meaning">
+                <h3>通用释义{selectedSense.lemma.trim().toLowerCase()!==selection.surface.trim().toLowerCase() &&
+                  <> <small>原形 · <b lang="en">{selectedSense.lemma}</b></small></>}</h3>
+                <p>{selectedSense.meaning}</p>
+              </section>}
               {!attachSense && <>
                 <label>原形或表达<input value={lemma} required maxLength={240} onChange={e=>setLemma(e.target.value)}/></label>
-                <label>通用义项<textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
+                <label>通用释义<textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
                 <GroupPicker groups={lib.groups} value={attachGroup} change={setAttachGroup} placeholder="新建语义组"/>
                   {!attachGroup && <GroupEditor value={newFields} change={setNewFields} tags={lib.tags}/>}
               </>}
@@ -1715,7 +1750,7 @@ function HelpPage() {
 
     <section>
       <h2>5. 管理语义组</h2>
-      <p>点击已收录的原文标注，或在组详情的「已收录义项」中选择「删除义项」。确认后，该义项和它在所有文章中的原文链接会一起删除。</p>
+      <p>在阅读器点击原文标注，可选择「删除此处标注」。在语义库的组详情中选择「删除义项」，会同时删除该义项和它在所有文章中的原文链接。</p>
       <p>在「语义库」搜索组名、词语或义项，也可以用标签筛选。打开组后可编辑说明、核心词和标签，也可以点「整理语义组」移动义项、拆组或合并组。「AI 扫描」可以检查当前组，左栏「AI 整理全库」则逐组扫描并集中列出建议。点建议可预填表单，确认后才会修改词库。拆分时可点「填入所选核心词」再编辑，留空则按拆出的义项生成核心词。点原文出现记录可跳回文章中的标注。</p>
     </section>
 

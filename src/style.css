@@ -274,3 +274,11 @@ button.delete-document { color: #a22f29; }
 .merge-group-words h5 { margin: 0 0 .5rem; font-size: .95rem; }
 .merge-group-words p { margin: .45rem 0; }
 .merge-group-words ul { margin: .35rem 0 .7rem; padding-left: 1.2rem; }
+
+.word-heading p { margin: 0 0 .25rem; font-size: .8rem; }
+.word-heading h2 { margin: 0; overflow-wrap: anywhere; }
+.word-heading + .pronunciation-panel { margin-top: .55rem; }
+.word-meaning { margin: .85rem 0; }
+.word-meaning h3 { margin: 0 0 .3rem; font-size: .9rem; }
+.word-meaning h3 small { margin-left: .35rem; font-weight: normal; }
+.word-meaning p { margin: 0; overflow-wrap: anywhere; }
