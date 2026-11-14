@@ -405,12 +405,26 @@ export class View extends HTMLElement {
     }
     #createOverlayer({ doc, index }) {
         const overlayer = new Overlayer()
+        const cursorStyle = doc.createElement('style')
+        cursorStyle.textContent = ':root.semantic-reader-annotation-hover, :root.semantic-reader-annotation-hover * { cursor: pointer !important; }'
+        const styleHost = doc.head ?? doc.documentElement
+        styleHost.append(cursorStyle)
+        const setHover = active => doc.documentElement.classList.toggle('semantic-reader-annotation-hover', active)
+        const isAnnotation = value => !value.startsWith(SEARCH_PREFIX)
+        doc.addEventListener('mousemove', event => {
+            const [value] = overlayer.hitTest(event, isAnnotation)
+            setHover(Boolean(value))
+        }, true)
+        doc.documentElement.addEventListener('pointerleave', () => setHover(false))
         doc.addEventListener('click', e => {
-            const [value, range] = overlayer.hitTest(e)
-            if (value && !value.startsWith(SEARCH_PREFIX)) {
+            if (doc.getSelection()?.isCollapsed === false) return
+            const [value, range] = overlayer.hitTest(e, isAnnotation)
+            if (value) {
+                e.preventDefault()
+                e.stopPropagation()
                 this.#emit('show-annotation', { value, index, range })
             }
-        }, false)
+        }, true)
 
         const list = this.#searchResults.get(index)
         if (list) for (const item of list) this.addAnnotation(item)

@@ -42,7 +42,26 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
         migrate_context_meaning(db)?;
         migrate_pdf(db)
     })?;
-    db.batch("CREATE TABLE IF NOT EXISTS epub_files (
+    db.transaction(|| {
+        if !db.query("PRAGMA table_info(semantic_groups)", &[])?.iter().any(|row| row["name"] == "sil_code") {
+            db.batch("ALTER TABLE semantic_groups ADD COLUMN sil_code TEXT;")?;
+        }
+        Ok(())
+    })?;
+    db.batch("CREATE TABLE IF NOT EXISTS sense_sil (
+        sense_id TEXT NOT NULL REFERENCES senses(id) ON DELETE CASCADE,
+        code TEXT NOT NULL, PRIMARY KEY(sense_id,code)
+    );
+    CREATE TABLE IF NOT EXISTS sil_diagnostics (
+        sense_id TEXT PRIMARY KEY REFERENCES senses(id) ON DELETE CASCADE,
+        payload TEXT NOT NULL
+    );
+    CREATE VIEW IF NOT EXISTS sense_sil_memberships AS
+        SELECT sense_id,code FROM sense_sil WHERE code<>''
+        UNION
+        SELECT s.id,g.sil_code FROM senses s JOIN semantic_groups g ON g.id=s.group_id
+        WHERE g.sil_code IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sense_sil m WHERE m.sense_id=s.id AND m.code='');
+    CREATE TABLE IF NOT EXISTS epub_files (
         document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
         data TEXT NOT NULL
     );")
@@ -325,7 +344,7 @@ fn put_group(db: &Db, p: &V) -> Result<V> {
     let key = if p["id"].is_null() {
         let key = uuid();
         db.write(
-            "INSERT INTO semantic_groups VALUES(?1,?2,?3)",
+            "INSERT INTO semantic_groups(id,name,description) VALUES(?1,?2,?3)",
             &[key.clone(), json!(name), json!(description)],
         )?;
         key
@@ -341,6 +360,10 @@ fn put_group(db: &Db, p: &V) -> Result<V> {
         )?;
         key
     };
+    if let Some(code) = p.get("sil_code") {
+        let code = checked_sil_code(code)?;
+        db.query("UPDATE semantic_groups SET sil_code=?2 WHERE id=?1", &[key.clone(), code])?;
+    }
     for line in vocab.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let (expression, nuance) = line.split_once('|').unwrap_or((line, ""));
         if expression.trim().is_empty() {
@@ -667,6 +690,134 @@ pub fn organization_input(db: &Db, p: &V) -> Result<V> {
     Ok(json!({"current":current,"senses":senses,"allow_split":allow_split,"candidates":matches}))
 }
 
+pub fn sil_batch(db: &Db, cursor: &str, parent: &str) -> Result<V> {
+    let mut rows = db.query(
+        "SELECT s.id,e.lemma,s.meaning,g.sil_code AS current_code,(SELECT substr(o.context,1,400) FROM occurrences o
+         WHERE o.sense_id=s.id ORDER BY o.rowid LIMIT 1) AS context
+         FROM senses s JOIN expressions e ON e.id=s.expression_id
+         JOIN semantic_groups g ON g.id=s.group_id WHERE s.id>?1 AND (EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id AND m.code=?2) OR (?2='' AND NOT EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id))) ORDER BY s.id LIMIT 101",
+        &[json!(cursor),json!(parent)],
+    )?;
+    let next = if rows.len()>100 {
+        rows.pop();
+        rows.last().unwrap()["id"].clone()
+    } else { V::Null };
+    Ok(json!({"rows":rows,"next":next}))
+}
+
+pub fn sil_audit_rows(db: &Db, code: &str, descendants: bool) -> Result<Vec<V>> {
+    let mut rows = db.query("SELECT s.id,e.lemma,s.meaning FROM senses s
+        JOIN expressions e ON e.id=s.expression_id WHERE EXISTS(
+          SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id
+          AND (m.code=?1 OR (?2=1 AND m.code LIKE ?1 || '.%')))
+        ORDER BY s.id", &[json!(code),json!(i32::from(descendants))])?;
+    for row in &mut rows {
+        row["categories"] = json!(db.query("SELECT code FROM sense_sil_memberships WHERE sense_id=?1 ORDER BY code",
+            &[row["id"].clone()])?.into_iter().map(|membership| membership["code"].clone()).collect::<Vec<_>>());
+    }
+    Ok(rows)
+}
+
+pub fn sil_count(db: &Db, parent: &str) -> Result<V> {
+    Ok(db.one("SELECT count(*) AS n FROM senses s JOIN semantic_groups g ON g.id=s.group_id
+        WHERE EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id AND m.code=?1) OR (?1='' AND NOT EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id))", &[json!(parent)])?["n"].clone())
+}
+
+fn apply_sil(db: &Db, p: &V, manual: bool) -> Result<V> {
+    let rows = p["rows"].as_array().filter(|rows| rows.len() <= 10000).ok_or("义项清单无效")?;
+    let mut touched = std::collections::HashSet::new();
+    let mut destination = V::Null;
+    for row in rows {
+        let code = row["code"].as_str().ok_or("缺少 SIL 编号")?;
+        let returning = code=="unclassified";
+        let name = if returning { "待重新归类" } else { crate::sil::name(code).ok_or("SIL 编号无效")? };
+        let parent = p["parent"].as_str().ok_or("缺少当前分类")?;
+        if row["current_code"].as_str().unwrap_or_default()!=parent
+            || (!manual && row["manual"] != true && row["ranked_move"] != true && !(returning && !parent.is_empty() || crate::sil::children(parent).iter().any(|child|child[0]==code))) {
+            return Err("义项只能移到当前分类的直属子类".into());
+        }
+        let sense = db.one("SELECT * FROM senses WHERE id=?1", &[row["id"].clone()])?;
+        let current = db.one("SELECT sil_code FROM semantic_groups WHERE id=?1", &[sense["group_id"].clone()])?;
+        if sense["meaning"] != row["meaning"] || current["sil_code"] != row["current_code"] { return Err("义项已修改，请重新复核".into()); }
+        let source = sense["group_id"].clone();
+        let existing = if returning {
+            db.query("SELECT id FROM semantic_groups WHERE sil_code IS NULL AND name=?1 AND description=?2 ORDER BY id LIMIT 1",
+                &[json!(name),json!("从 SIL 分类退回的义项")])?
+        } else {
+            db.query("SELECT id FROM semantic_groups WHERE sil_code=?1 ORDER BY id LIMIT 1", &[json!(code)])?
+        };
+        let target = if let Some(group) = existing.first() {
+            let target = group["id"].clone();
+            db.query("UPDATE semantic_groups SET name=?2 WHERE id=?1", &[target.clone(),json!(name)])?;
+            target
+        } else if returning {
+            new_group(db,&json!({"name":name,"description":"从 SIL 分类退回的义项"}))?
+        } else {
+            new_group(db,&json!({"name":name,"sil_code":code}))?
+        };
+        destination = target.clone();
+        if source != target {
+            let duplicate = db.query("SELECT id FROM senses WHERE group_id=?1 AND expression_id=?2 AND meaning=?3",
+                &[target.clone(),sense["expression_id"].clone(),sense["meaning"].clone()])?;
+            if let Some(existing) = duplicate.first() {
+                db.query("UPDATE occurrences SET sense_id=?2 WHERE sense_id=?1", &[sense["id"].clone(),existing["id"].clone()])?;
+                db.write("DELETE FROM senses WHERE id=?1", &[sense["id"].clone()])?;
+            } else {
+                db.write("UPDATE senses SET group_id=?2 WHERE id=?1", &[sense["id"].clone(),target.clone()])?;
+            }
+            db.query("INSERT OR IGNORE INTO group_tags SELECT ?2,tag_id FROM group_tags WHERE group_id=?1",
+                &[source.clone(),target.clone()])?;
+            db.query("INSERT OR IGNORE INTO group_vocabulary SELECT ?2,expression,nuance FROM group_vocabulary WHERE group_id=?1",
+                &[source.clone(),target.clone()])?;
+        }
+        touched.insert(source.as_str().unwrap_or_default().to_owned());
+        touched.insert(target.as_str().unwrap_or_default().to_owned());
+    }
+    for group in touched {
+        let key = json!(group);
+        if db.one("SELECT count(*) AS n FROM senses WHERE group_id=?1", &[key.clone()])?["n"] == 0 {
+            db.query("DELETE FROM group_search WHERE group_id=?1", &[key.clone()])?;
+            db.write("DELETE FROM semantic_groups WHERE id=?1", &[key])?;
+        } else {
+            reindex(db,&key)?;
+        }
+    }
+    db.query("DELETE FROM operation_history", &[])?;
+    Ok(if manual { destination } else { json!(rows.len()) })
+}
+
+fn checked_sil_code(value: &V) -> Result<V> {
+    match value {
+        V::Null => Ok(V::Null),
+        V::String(code) if code.is_empty() => Ok(V::Null),
+        V::String(code) if crate::sil::valid(code) => Ok(value.clone()),
+        _ => Err("SIL 分类编号无效".into()),
+    }
+}
+
+pub fn sil_followup_groups(db: &Db, terms: &V, previous: &V, code: &V) -> Result<Vec<V>> {
+    let mut groups = followup_groups(db, terms, previous)?;
+    if let Some(code) = code.as_str() {
+        let nearby = db.query(
+            "SELECT * FROM semantic_groups WHERE sil_code=?1 OR sil_code LIKE ?1 || '.%'
+             OR ?1 LIKE sil_code || '.%' ORDER BY sil_code=?1 DESC,name LIMIT 12",
+            &[json!(code)],
+        )?;
+        let mut added = Vec::new();
+        for mut group in nearby {
+            if previous.as_array().into_iter().flatten().chain(groups.iter()).any(|seen| seen["id"]==group["id"]) {
+                continue;
+            }
+            group["vocabulary"] = json!(vocabulary(db, &group["id"])?);
+            added.push(group);
+            if added.len()==2 { break; }
+        }
+        added.extend(groups);
+        groups = added;
+    }
+    Ok(groups)
+}
+
 pub fn followup_groups(db: &Db, terms: &V, previous: &V) -> Result<Vec<V>> {
     let query = terms
         .as_array()
@@ -880,7 +1031,13 @@ fn annotate(db: &Db, p: &V) -> Result<V> {
     } else {
         let lemma = field(p, "lemma", 240, true)?;
         let meaning = field(p, "meaning", 1200, true)?;
-        let group = if p["group_id"].is_null() {
+        let group = if p["ungrouped_capture"] == true {
+            let existing = db.query("SELECT id FROM semantic_groups WHERE name='未归类' AND sil_code IS NULL ORDER BY id LIMIT 1", &[])?;
+            match existing.first() {
+                Some(group) => group["id"].clone(),
+                None => new_group(db,&json!({"name":"未归类"}))?,
+            }
+        } else if p["group_id"].is_null() {
             if !p["new_group"]["id"].is_null() {
                 return Err("新组不能带已有 ID".into());
             }
@@ -1183,11 +1340,12 @@ fn undo(db: &Db) -> Result<V> {
     let target = &u["target"];
     if u["operation"] == "merge" {
         db.write(
-            "INSERT INTO semantic_groups VALUES(?1,?2,?3)",
+            "INSERT INTO semantic_groups(id,name,description,sil_code) VALUES(?1,?2,?3,?4)",
             &[
                 source.clone(),
                 u["source_group"]["name"].clone(),
                 u["source_group"]["description"].clone(),
+                u["source_group"]["sil_code"].clone(),
             ],
         )?;
         if let Some(target_tags) = u["target_tags"].as_array() {
@@ -1278,7 +1436,7 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
     ("epub_files", &["document_id", "data"]),
     ("pdf_files", &["document_id", "data"]),
     ("pdf_pages", &["document_id", "page", "offset", "text", "layer"]),
-    ("semantic_groups", &["id", "name", "description"]),
+    ("semantic_groups", &["id", "name", "description", "sil_code"]),
     ("tags", &["id", "name"]),
     ("tag_names", &["normalized", "name", "tag_id"]),
     (
@@ -1289,6 +1447,7 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
     ("group_vocabulary", &["group_id", "expression", "nuance"]),
     ("expressions", &["id", "lemma", "normalized"]),
     ("senses", &["id", "expression_id", "group_id", "meaning"]),
+    ("sense_sil", &["sense_id", "code"]),
     (
         "occurrences",
         &[
@@ -1355,7 +1514,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
         if table == "tag_scopes" && p["version"].as_u64().unwrap_or(0) < 6 {
             continue;
         }
-        if table == "epub_files" && p[table].is_null() { continue; }
+        if matches!(table,"epub_files"|"sense_sil") && p[table].is_null() { continue; }
         let rows = p[table]
             .as_array()
             .ok_or_else(|| format!("导出缺少 {table}"))?;
@@ -1388,6 +1547,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                             _ => Err("本句释义格式无效".into()),
                         };
                     }
+                    if col == "sil_code" { return checked_sil_code(&row[col]); }
                     if col == "learning" {
                         return match &row[col] {
                             V::Null => Ok(V::Null),
@@ -1504,7 +1664,11 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
                 "SELECT EXISTS(SELECT 1 FROM operation_history) AS available",
                 &[],
             )?;
-            Ok(json!({"documents":docs,"groups":groups(db,q,None)?,"undo":undo["available"],"tags":tags::catalog(db)?,"tag_links":db.query("SELECT * FROM group_tags",&[])?}))
+            let counts = db.query("WITH paths(sense_id,code) AS (
+                SELECT sense_id,code FROM sense_sil_memberships UNION
+                SELECT id,'unclassified' FROM senses s WHERE NOT EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id)
+                ) SELECT code,count(*) AS count,group_concat(sense_id) AS ids FROM paths GROUP BY code", &[])?;
+            Ok(json!({"sil_counts":counts,"documents":docs,"groups":groups(db,q,None)?,"undo":undo["available"],"tags":tags::catalog(db)?,"tag_links":db.query("SELECT * FROM group_tags",&[])?}))
         }
         "document" => {
             let key = id(p, "id")?;
@@ -1557,6 +1721,33 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
                 &[key,json!(page)])?["layer"].clone())
         }
         "pdf_index_page" => db.transaction(|| save_pdf_page(db, p)),
+        "sil_senses" => {
+            let code = field(p,"code",32,false)?;
+            let query = field(p,"q",200,false)?;
+            let mut senses = db.query(
+                "SELECT s.id,s.group_id,e.lemma,s.meaning,o.context FROM senses s
+                 JOIN expressions e ON e.id=s.expression_id
+                 LEFT JOIN occurrences o ON o.rowid=(SELECT min(m.rowid) FROM occurrences m WHERE m.sense_id=s.id)
+                 WHERE (?1='' OR EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id AND
+                    (m.code=?1 OR (?2=1 AND m.code LIKE ?1 || '.%')))
+                 OR (?1='unclassified' AND NOT EXISTS(SELECT 1 FROM sense_sil_memberships m WHERE m.sense_id=s.id)))
+                 AND (?3='' OR instr(lower(e.lemma),lower(?3))>0 OR instr(s.meaning,?3)>0)
+                 ORDER BY e.lemma COLLATE NOCASE,s.id",
+                &[json!(code),json!(i32::from(p["descendants"]==true)),json!(query)],
+            )?;
+            for sense in &mut senses {
+                sense["links"] = json!(db.query(
+                    &format!("{MARKS} WHERE s.id=?1 ORDER BY d.title,o.start"),
+                    &[sense["id"].clone()],
+                )?);
+                let codes = db.query("SELECT code FROM sense_sil_memberships WHERE sense_id=?1 ORDER BY code", &[sense["id"].clone()])?;
+                sense["categories"] = json!(codes.into_iter().map(|row|row["code"].clone()).collect::<Vec<_>>());
+                if let Some(record) = db.query("SELECT payload FROM sil_diagnostics WHERE sense_id=?1", &[sense["id"].clone()])?.first() {
+                    sense["sil_diagnostic"] = serde_json::from_str(record["payload"].as_str().unwrap_or_default()).unwrap_or(V::Null);
+                }
+            }
+            Ok(json!(senses))
+        }
         "group_senses" => {
             let key = id(p, "id")?;
             Ok(json!(group_senses(db, &key)?))
@@ -1677,6 +1868,69 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             // Undo is valid only while subsequent changes are also undoable.
             db.batch("DELETE FROM operation_history")?;
             Ok(value)
+        }),
+        "sil_audit_apply" => db.transaction(|| {
+            let rows = p["rows"].as_array().ok_or("无效审查结果")?;
+            let code = field(p,"code",32,true)?;
+            if !crate::sil::valid(&code) { return Err("分类编号无效".into()); }
+            for row in rows {
+                let key = id(row,"id")?;
+                let sense = db.one("SELECT meaning FROM senses WHERE id=?1", &[key.clone()])?;
+                let existing = db.query("SELECT code FROM sense_sil_memberships WHERE sense_id=?1 ORDER BY code", &[key.clone()])?
+                    .into_iter().map(|entry|entry["code"].clone()).collect::<Vec<_>>();
+                if sense["meaning"] != row["meaning"] || row["categories"].as_array() != Some(&existing) {
+                    return Err("义项或分类已变化，请重新审查".into());
+                }
+                db.query("INSERT OR IGNORE INTO sense_sil SELECT sense_id,code FROM sense_sil_memberships WHERE sense_id=?1", &[key.clone()])?;
+                db.query("INSERT OR IGNORE INTO sense_sil VALUES(?1,'')", &[key.clone()])?;
+                for (action,sql) in [("add","INSERT OR IGNORE INTO sense_sil VALUES(?1,?2)"),
+                    ("remove","DELETE FROM sense_sil WHERE sense_id=?1 AND code=?2")] {
+                    for item in row[action].as_array().ok_or("无效分类变更")? {
+                        let target = item.as_str().filter(|target|crate::sil::valid(target)).ok_or("分类编号无效")?;
+                        if action=="remove" && target!=code && !(p["descendants"]==true &&
+                            target.strip_prefix(&code).is_some_and(|suffix|suffix.starts_with('.'))) {
+                            return Err("不能移除审查范围外的归属".into());
+                        }
+                        db.query(sql,&[key.clone(),item.clone()])?;
+                    }
+                }
+            }
+            Ok(json!(rows.len()))
+        }),
+        "sil_memberships" => db.transaction(|| {
+            let rows = p["rows"].as_array().filter(|rows|rows.len()<=10000).ok_or("义项清单无效")?;
+            for row in rows {
+                let key = id(row,"id")?;
+                let sense = db.one("SELECT meaning FROM senses WHERE id=?1", &[key.clone()])?;
+                if sense["meaning"]!=row["meaning"] { return Err("义项已修改，请刷新".into()); }
+                let codes = row["codes"].as_array().ok_or("分类清单无效")?;
+                db.query("INSERT OR IGNORE INTO sense_sil SELECT sense_id,code FROM sense_sil_memberships WHERE sense_id=?1", &[key.clone()])?;
+                db.query("INSERT OR IGNORE INTO sense_sil VALUES(?1,'')", &[key.clone()])?;
+                for code in codes {
+                    if !code.as_str().is_some_and(crate::sil::valid) { return Err("SIL 分类编号无效".into()); }
+                    let sql = if p["remove"]==true { "DELETE FROM sense_sil WHERE sense_id=?1 AND code=?2" }
+                        else { "INSERT OR IGNORE INTO sense_sil VALUES(?1,?2)" };
+                    db.query(sql,&[key.clone(),code.clone()])?;
+                }
+                if row["classification_trace"].is_object() {
+                    let stored = db.query("SELECT code FROM sense_sil_memberships WHERE sense_id=?1 ORDER BY code", &[key.clone()])?;
+                    let record = json!({"model_output":row["classification_trace"],"lemma":row["lemma"],
+                        "meaning":row["meaning"],"selected_codes":codes,"stored_categories":stored});
+                    db.query("INSERT OR REPLACE INTO sil_diagnostics VALUES(?1,?2)", &[key,json!(record.to_string())])?;
+                }
+            }
+            Ok(json!(rows.len()))
+        }),
+        "sil_reset" => db.transaction(|| {
+            let count = db.one("SELECT count(*) AS n FROM semantic_groups WHERE sil_code IS NOT NULL", &[])?["n"].clone();
+            db.query("UPDATE semantic_groups SET sil_code=NULL WHERE sil_code IS NOT NULL", &[])?;
+            db.query("DELETE FROM sense_sil", &[])?;
+            Ok(count)
+        }),
+        "sil_apply" => db.transaction(|| apply_sil(db,p,false)),
+        "sil_move_sense" => db.transaction(|| {
+            let row = &p["sense"];
+            apply_sil(db,&json!({"parent":row["current_code"].as_str().unwrap_or_default(),"rows":[row]}),true)
         }),
         "merge" | "split" | "move" | "reclassify" => db.transaction(|| regroup(db, op, p)),
         "undo" => db.transaction(|| undo(db)),

@@ -119,4 +119,4 @@ rustup target add x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 ```
 
-打包过程需要联网。生成的 `*-setup.exe` 位于 `src-tauri/target/windows-package/x86_64-pc-windows-msvc/release/bundle/nsis/`，安装程序包含 WebView2 离线安装组件。SQLite 静态链接并启用 FTS5。Windows 和 macOS 均可在应用设置中直接保存密钥。
+打包过程需要联网。生成的 `*-setup.exe` 位于 `src-tauri/target/windows-package/x86_64-pc-windows-msvc/release/bundle/nsis/`，安装程序复用系统已有的 WebView2，缺少时从微软下载。也可以从[微软 WebView2 下载页](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download)单独下载 Evergreen 独立安装程序，在离线电脑上先安装运行时。SQLite 静态链接并启用 FTS5。Windows 和 macOS 均可在应用设置中直接保存密钥。

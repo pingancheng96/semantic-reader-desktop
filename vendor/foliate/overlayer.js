@@ -38,12 +38,13 @@ export class Overlayer {
             obj.rects = rects
         }
     }
-    hitTest({ x, y }) {
+    hitTest({ clientX: x, clientY: y }, accepts = () => true) {
         const arr = Array.from(this.#map.entries())
         // loop in reverse to hit more recently added items first
         for (let i = arr.length - 1; i >= 0; i--) {
             const [key, obj] = arr[i]
-            for (const { left, top, right, bottom } of obj.rects)
+            if (!accepts(key)) continue
+            for (const { left, top, right, bottom } of obj.range.getClientRects())
                 if (top <= y && left <= x && bottom > y && right > x)
                     return [key, obj.range]
         }

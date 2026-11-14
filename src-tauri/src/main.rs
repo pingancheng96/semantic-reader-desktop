@@ -8,6 +8,7 @@ mod pronunciation;
 mod snapshots;
 mod pdf_geometry;
 mod sqlite;
+mod sil;
 mod store;
 mod tags;
 mod updates;
@@ -25,6 +26,7 @@ struct Database(PathBuf);
 async fn request(state: State<'_, Database>, op: String, payload: Value) -> Result<Value> {
     let path = state.0.clone();
     match op.as_str() {
+        "sil_catalog" => Ok(sil::catalog()),
         "update_info" => Ok(updates::info()),
         "update_check" => updates::check().await,
         "update_open_link" => updates::open_link(payload["url"].as_str().unwrap_or_default()),
@@ -98,6 +100,30 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             .map_err(|_| "读取同组词项失败")??;
             ai::compare_group_senses(&payload, key, input).await
         }
+        "sil_count" | "sil_review" => {
+            let review = op == "sil_review";
+            let params = payload.clone();
+            let parent = payload["parent"].as_str().ok_or("缺少当前分类")?;
+            if !parent.is_empty() && !sil::valid(parent) { return Err("分类编号无效".into()); }
+            let (batch,key) = tauri::async_runtime::spawn_blocking(move || {
+                let db = Db::open(&path)?;
+                let parent = params["parent"].as_str().unwrap();
+                if !review { return Ok::<_, String>((store::sil_count(&db,parent)?,None)); }
+                let batch = db.snapshot(|| store::sil_batch(&db,params["cursor"].as_str().unwrap_or_default(),parent))?;
+                Ok((batch,ai::request_key(&path,&params)?))
+            }).await.map_err(|_| "无法读取当前分类")??;
+            if review { ai::review_sil(&payload,key,batch,parent).await } else { Ok(batch) }
+        }
+        "sil_audit" => {
+            let params = payload.clone();
+            let (rows,key) = tauri::async_runtime::spawn_blocking(move || {
+                let code = params["code"].as_str().filter(|code| sil::valid(code)).ok_or("分类编号无效")?;
+                let db = Db::open(&path)?;
+                let rows = db.snapshot(|| store::sil_audit_rows(&db, code, params["descendants"] == true))?;
+                Ok::<_, String>((rows, ai::request_key(&path, &params)?))
+            }).await.map_err(|_| "无法读取当前分类")??;
+            ai::audit_sil(&payload, key, rows).await
+        }
         "organize_glosses" => {
             let params = payload.clone();
             let (input, key) = tauri::async_runtime::spawn_blocking(move || {
@@ -135,12 +161,13 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             let context = local["context"].clone();
             let saved = !local["saved_sense"].is_null();
             let mut response = ai::suggest(payload.clone(), local, key.clone()).await?;
-            if !saved && response["suggestion"]["group_id"].is_null() {
+            if payload["ungrouped_capture"] != true && !saved && response["suggestion"]["group_id"].is_null() {
                 let name = response["suggestion"]["group_name"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
                 let terms = response["suggestion"]["group_search_terms"].clone();
+                let code = response["suggestion"]["sil_code"].clone();
                 let lookup = tauri::async_runtime::spawn_blocking(move || {
                     let db = Db::open(&path)?;
                     db.snapshot(|| {
@@ -148,7 +175,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
                         let groups = if exact.is_some() {
                             Vec::new()
                         } else {
-                            store::followup_groups(&db, &terms, &previous)?
+                            store::sil_followup_groups(&db, &terms, &previous, &code)?
                         };
                         Ok::<_, String>((exact, groups))
                     })

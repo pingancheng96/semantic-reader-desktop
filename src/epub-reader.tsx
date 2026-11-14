@@ -272,14 +272,13 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
             event.preventDefault();setSearchOpen(true);
           }
         });
-        doc.addEventListener('click',event=>{
-          if (doc.getSelection()?.isCollapsed===false) return;
-          const caret=doc.caretRangeFromPoint?.(event.clientX,event.clientY);
-          const offset=anchors.find(anchor=>anchor.node===caret?.startContainer)?.offsets[caret?.startOffset ?? 0];
-          const mark=callbacks.current.marks.find(mark=>offset!==undefined && mark.start<=offset && offset<mark.end);
-          if (mark) callbacks.current.onMark(mark);
-        });
       }
+      renderer.addEventListener('show-annotation',event=>{
+        const {value,range}=(event as CustomEvent<{value:string;range:Range}>).detail;
+        if (range.startContainer.ownerDocument?.getSelection()?.isCollapsed===false) return;
+        const mark=callbacks.current.marks.find(mark=>overlays.current.get(mark.id)===value);
+        if (mark) callbacks.current.onMark(mark);
+      });
       renderer.addEventListener('load',event=>attach((event as CustomEvent<{doc:Document;index:number}>).detail));
       poll=window.setInterval(()=>{
         for (const section of renderer?.renderer?.getContents() ?? []) {
@@ -288,14 +287,27 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
         }
       },180);
       renderer.addEventListener('draw-annotation',event=>{
-        const {draw}=(event as CustomEvent<{draw:(fn:(rects:DOMRect[])=>SVGElement)=>void}>).detail;
+        const {draw,annotation}=(event as CustomEvent<{draw:(fn:(rects:DOMRect[])=>SVGElement)=>void;annotation:{id:string}}>).detail;
         draw(rects=>{
           const group=document.createElementNS('http://www.w3.org/2000/svg','g');
+          group.style.pointerEvents='visiblePainted';
+          group.style.cursor='pointer';
+          group.addEventListener('click',click=>{
+            const mark=callbacks.current.marks.find(mark=>mark.id===annotation.id);
+            if (!mark) return;
+            click.stopPropagation();
+            callbacks.current.onMark(mark);
+          });
           for (const rect of rects) {
-            const line=document.createElementNS(group.namespaceURI,'rect');
-            for (const [name,value] of Object.entries({x:rect.left,y:rect.bottom-2,width:rect.width,height:2,fill:'#56886b'}))
-              line.setAttribute(name,String(value));
-            group.append(line);
+            const shapes = [
+              {x:rect.left,y:rect.top,width:rect.width,height:rect.height,fill:'#a8ce88','fill-opacity':.35,rx:3},
+              {x:rect.left,y:rect.bottom-2,width:rect.width,height:2,fill:'#56886b'},
+            ];
+            for (const attributes of shapes) {
+              const shape=document.createElementNS(group.namespaceURI,'rect');
+              for (const [name,value] of Object.entries(attributes)) shape.setAttribute(name,String(value));
+              group.append(shape);
+            }
           }
           return group;
         });

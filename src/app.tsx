@@ -1,3 +1,4 @@
+import {DestinationSelect,SilOrganizer,clearSilProgress} from './sil-organizer.js';
 import {UpdateSettings} from './update-settings.js';
 import {TextLibrary} from './text-library.js';
 import {ReaderToolbar} from './reader-toolbar.js';
@@ -11,12 +12,11 @@ import type {ClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, Rea
 import {React, ReactDOM, call, exportFile, importLocalFile, restoreBackupFile} from './runtime.js';
 import {articleMatches, changedRanges, keepUnchanged, readingLines, selectedOffsets, type Piece} from './reading.js';
 import {captionNodes, type WebNode} from './web-captions.js';
-import {facets, type Tag, type TagLink} from './tag-filters.js';
 import {dictionaryLookupWord} from './dictionary-word.js';
 const {useState, useEffect, useLayoutEffect, useMemo, useRef} = React;
 
 type Item = {id: string; title: string; format: 'md' | 'txt'; source_url?: string | null};
-type Group = {id: string; name: string; description: string};
+type Group = {sil_code?:string|null; id: string; name: string; description: string};
 type Vocabulary = {expression: string; nuance: string};
 type Sense = {id: string; lemma: string; meaning: string; group_id: string};
 type Mark = {id: string; document_id: string; title: string; sense_id: string; start: number; end: number;
@@ -24,26 +24,21 @@ type Mark = {id: string; document_id: string; title: string; sense_id: string; s
 type Snapshot = {id:string; timestamp:number; safety:boolean};
 const snapshotLabel = (snapshot:Snapshot) =>
   new Date(snapshot.timestamp).toLocaleString() + (snapshot.safety ? ' · 恢复前自动备份' : '');
-type Library = {documents: Item[]; groups: Group[]; undo: number; tags:Tag[]; tag_links:TagLink[]};
+type Library = {sil_counts?:{code:string;count:number;ids?:string}[]; documents: Item[]; groups: Group[]; undo: number};
 type WebLayout = {nodes:WebNode[]; images:(string|null)[]; image_errors?:(string|null)[]};
 type Read = {document: Item & {content: string; web_layout?: string | null; pdf?:number; epub?:number}; marks: Mark[]};
-type Detail = {group: Group; senses: Sense[]; marks: Mark[]; vocabulary: Vocabulary[]; tags:{id:string; name:string}[]};
+type Detail = {group: Group; senses: Sense[]; marks: Mark[]; vocabulary: Vocabulary[]};
 type Selection = {document_id: string; start: number; end: number; surface: string};
 type SavedNote = Sense & {group_name:string; learning?:string|null};
 type Candidates = {context: string; exact: Sense[]; reused: Sense[]; groups: Group[]; notes:SavedNote[]};
-type OrganizationPlan = {
-  merge?: {target_id:string; reason:string} | null;
-  split?: {sense_ids:string[]; name:string; description:string; reason:string} | null;
-  split_checked:boolean;
-};
-type GroupFields = {name: string; description: string; vocabulary: string; tags:string[]};
+type GroupFields = {name: string; description: string; vocabulary: string; sil_code?:string|null};
 type Learning = {usage_note: string; example: string; etymology?:string|null; mnemonic?:string|null;
   ipa_uk?:string|null; ipa_us?:string|null; part_of_speech?:string|null;
   related: {expression: string; kind: 'synonym' | 'related' | 'collocation'; note: string}[]};
 type Suggestion = {suggestion: {lemma: string; meaning: string; context_meaning:string; group_id: string | null; sense_id?: string | null; group_reason?: string | null;
-  group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean};
-const blank = (): GroupFields => ({name: '', description: '', vocabulary: '', tags:[]});
-const empty: Library = {documents: [], groups: [], undo: 0, tags:[], tag_links:[]};
+  sil_code?:string|null; group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean};
+const blank = (): GroupFields => ({name: '', description: '', vocabulary: ''});
+const empty: Library = {documents: [], groups: [], undo: 0};
 
 let pendingPronunciation: AbortController | undefined;
 
@@ -127,51 +122,6 @@ function LearningPanel({learning, word, hideIpa, hidePos}: {learning: Learning; 
   </section>;
 }
 
-function MergeGroupWords({label,detail}: {label:string;detail:Detail}) {
-  return <section className="merge-group-words">
-    <h5>{label} · {detail.group.name}</h5>
-    <p>已收录义项（{detail.senses.length}）</p>
-    {detail.senses.length ? <ul>{detail.senses.map(sense=>
-      <li key={sense.id}><b lang="en">{sense.lemma}</b> · {sense.meaning}</li>)}</ul> : <p className="muted">暂无义项</p>}
-    <p>核心词与搭配（{detail.vocabulary.length}）</p>
-    {detail.vocabulary.length ? <ul>{detail.vocabulary.map(word=>
-      <li key={word.expression}><b lang="en">{word.expression}</b>{word.nuance && <> · {word.nuance}</>}</li>)}</ul> : <p className="muted">暂无核心词与搭配</p>}
-  </section>;
-}
-
-function MergeSuggestion({source,destination,reason,busy,apply}: {
-  source:Detail;destination:Group|undefined;reason:string;busy:boolean;apply:()=>void;
-}) {
-  const [target,setTarget] = useState<Detail|null>(null);
-  const [error,setError] = useState(false);
-  const [retry,setRetry] = useState(0);
-  const id = destination?.id;
-  useEffect(()=>{
-    if (!id) return;
-    let current = true;
-    void call<Detail>('group',{id}).then(
-      detail=>{if(current)setTarget(detail);},
-      ()=>{if(current)setError(true);}
-    );
-    return ()=>{current=false;};
-  },[id,retry]);
-  return <section>
-    <h4>建议将「{source.group.name}」合并到「{destination?.name ?? '目标组已不存在'}」</h4>
-    <p>{reason}</p>
-    <div className="merge-group-comparison">
-      <MergeGroupWords label="并入方" detail={source}/>
-      {destination && target ? <MergeGroupWords label="接收方" detail={target}/> :
-        <section className="merge-group-words">
-          <h5>接收方 · {destination?.name ?? '目标组已不存在'}</h5>
-          {destination && (error ? <><p role="status">无法读取接收方词项。</p>
-            <button type="button" onClick={()=>{setError(false);setRetry(value=>value+1);}}>重试</button></> :
-            <p role="status">正在读取接收方词项…</p>)}
-        </section>}
-    </div>
-    <button type="button" disabled={busy || !destination || !target} onClick={apply}>填入合并建议</button>
-  </section>;
-}
-
 function GroupSenses({groupId, exclude, lemma, meaning, ai}: {
   groupId:string; exclude?:string; lemma:string; meaning:string; ai?:{endpoint:string;model:string}
 }) {
@@ -225,38 +175,204 @@ function readLearning(raw?: string | null): Learning | null {
   return raw ? JSON.parse(raw) as Learning : null;
 }
 
-function GroupEditor({value, change, tags}: {value: GroupFields; change: (fields: GroupFields) => void; tags:Tag[]}) {
-  const [draft,setDraft] = useState('');
-  const normalize = (name:string) => name.trim().replace(/\s+/g,' ').toLowerCase();
-  const q = normalize(draft);
-  const matches = tags.filter(tag=>!value.tags.some(name=>normalize(name)===normalize(tag.name)) &&
-    (!q || [tag.name,...tag.aliases].some(name=>normalize(name).includes(q)))).slice(0,8);
-  function add(input:string) {
-    const text = input.trim().replace(/\s+/g,' ');
-    if (!text || value.tags.length >= 32) return;
-    const existing = tags.find(tag=>[tag.name,...tag.aliases].some(name=>normalize(name)===normalize(text)));
-    const name = existing?.name ?? text;
-    if (!value.tags.some(tag=>normalize(tag)===normalize(name))) change({...value,tags:[...value.tags,name]});
-    setDraft('');
+type SilDomain = {code:string;name:string};
+let silCatalogRequest:Promise<SilDomain[]>|undefined;
+function useSilCatalog() {
+  const [domains,setDomains] = useState<SilDomain[]>([]);
+  useEffect(()=>{
+    let active = true;
+    silCatalogRequest ??= call<SilDomain[]>('sil_catalog').catch(error=>{
+      silCatalogRequest = undefined;
+      throw error;
+    });
+    void silCatalogRequest.then(data=>{if (active) setDomains(data);}).catch(()=>{});
+    return ()=>{active=false;};
+  },[]);
+  return domains;
+}
+function silPath(domains:SilDomain[],code:string) {
+  const parts = code.split('.');
+  return parts.map((_,index)=>{
+    const prefix = parts.slice(0,index+1).join('.');
+    return domains.find(item=>item.code===prefix)?.name ?? prefix;
+  }).join(' › ');
+}
+function SilNavigation({domains,value,change,disabled,counts,directOnly,setDirectOnly}:{
+  domains:SilDomain[];value:string;change:(code:string)=>void;disabled:boolean;counts:NonNullable<Library['sil_counts']>;directOnly:boolean;setDirectOnly:(value:boolean)=>void;
+}) {
+  const parent = value.slice(0,Math.max(0,value.lastIndexOf('.')));
+  const children = domains.filter(domain=>
+    domain.code.slice(0,Math.max(0,domain.code.lastIndexOf('.')))===value);
+  const title = value==='unclassified' ? '未归类' : domains.find(domain=>domain.code===value)?.name ?? 'SIL 分类';
+  const [showEmpty,setShowEmpty] = useState(false);
+  const branches = children.map(domain=>({...domain,count:new Set(counts.filter(item=>
+    item.code===domain.code || item.code.startsWith(domain.code+'.')).flatMap(item=>item.ids?.split(',') ?? [])).size}));
+  const shown = showEmpty ? branches : branches.filter(domain=>domain.count>0);
+  return <nav className="sil-navigation" aria-label="SIL 分类目录">
+    {value && <button className="sil-back" type="button" disabled={disabled} onClick={()=>change(parent)}>
+      <span aria-hidden="true">‹</span> {parent ? '返回上一级' : '返回分类目录'}
+    </button>}
+    <h2 aria-current={value ? 'page' : undefined}>{title}</h2>
+    {children.length>0 && value && <div className="sil-branches">
+      <button type="button" disabled={disabled} aria-pressed={!directOnly} onClick={()=>setDirectOnly(false)}>整个分支</button>
+      <button type="button" disabled={disabled} aria-pressed={directOnly} onClick={()=>setDirectOnly(true)}>
+        <span>尚未细分</span><small>{counts.find(item=>item.code===value)?.count ?? 0}</small>
+      </button>
+    </div>}
+    {children.length>0 || !value ? <ul className="sil-branches">
+      {!value && <li><button type="button" disabled={disabled} onClick={()=>change('unclassified')}>
+        <span>未归类</span><small>{counts.find(item=>item.code==='unclassified')?.count ?? 0} ›</small>
+      </button></li>}
+      {shown.map(domain=><li key={domain.code}><button type="button" disabled={disabled}
+        onClick={()=>change(domain.code)}><span>{domain.name}</span><small>{domain.count} ›</small></button></li>)}
+    </ul> : null}
+    {branches.some(domain=>domain.count===0) && <button type="button" className="sil-back"
+      aria-pressed={showEmpty} onClick={()=>setShowEmpty(!showEmpty)}>{showEmpty ? '隐藏空分类' : '显示空分类'}</button>}
+  </nav>;
+}
+
+function SilPicker({code,change}:{code?:string|null; change:(code:string|null)=>void}) {
+  const domains = useSilCatalog();
+  return <fieldset>
+    <legend>SIL 语义分类</legend>
+    <DestinationSelect domains={domains} row={{code:code ?? 'unclassified'}} parent="" disabled={!domains.length}
+      change={value=>change(value==='unclassified' ? null : value)}/>
+    <small>SIL Global · Semantic Domains v4 · CC BY-SA 4.0</small>
+  </fieldset>;
+}
+
+function SenseSilEditor({current,busy,save}:{
+  current:string|null;busy:boolean;save:(code:string|null)=>void;
+}) {
+  const [open,setOpen] = useState(false);
+  const [code,setCode] = useState<string|null>(current);
+  return open ? <div>
+    <SilPicker code={code} change={setCode}/>
+    <button type="button" disabled={busy || code===current} onClick={()=>save(code)}>移动此义项</button>
+    <button type="button" disabled={busy} onClick={()=>setOpen(false)}>取消</button>
+  </div> : <button type="button" disabled={busy} onClick={()=>{setCode(current);setOpen(true);}}>更改 SIL 分类</button>;
+}
+
+function SilSenseList({category,query,library,busy,onCount,openCategory,openDocument,move,remove,directOnly}:{
+  category:string;query:string;library:Library;busy:boolean;onCount:(count:number)=>void;openCategory:(code:string)=>void;openDocument:(id:string,mark:string)=>void;move:(sense:Sense,code:string)=>void;remove:(sense:Sense,code:string)=>void;directOnly:boolean;
+}) {
+  const domains = useSilCatalog();
+  const [data,setData] = useState<{rows:(Sense & {context:string|null;categories:string[];links?:Mark[];sil_diagnostic?:unknown})[]; error:string}|null>(null);
+  useEffect(()=>{
+    let active = true;
+    void call<(Sense & {context:string|null;categories:string[];links?:Mark[];sil_diagnostic?:unknown})[]>('sil_senses',{code:category,descendants:!directOnly,q:query}).then(
+      rows=>{if (active) {setData({rows,error:''});onCount(rows.length);}},
+      error=>{if (active) setData({rows:[],error:String(error)});}
+    );
+    return ()=>{active=false;};
+  },[category,library,directOnly,query]);
+  if (!data) return <p role="status">正在读取义项…</p>;
+  if (data.error) return <p role="alert">{data.error}</p>;
+  const sections = new Map<string,typeof data.rows>();
+  for (const row of data.rows) {
+    const code = row.categories.find(code=>code===category) ??
+      row.categories.find(code=>code.startsWith(category+'.')) ?? category;
+    const section = sections.get(code) ?? [];
+    section.push(row);
+    sections.set(code,section);
   }
+  return <section aria-label="分类义项">
+    <p className="muted">{data.rows.length} 个{directOnly ? '直属' : ''}义项</p>
+    {[...sections].map(([code,rows])=><section key={code} className="sil-senses">
+      {code!==category && <h2><button type="button" className="quiet sil-section-link"
+        title={silPath(domains,code)} onClick={()=>openCategory(code)}>
+        {silPath(domains,code).split(' › ').at(-1)} <span aria-hidden="true">↗</span>
+      </button></h2>}
+      <ul>{rows.map(row=><li key={row.id}>
+        <details><summary><b lang="en">{row.lemma}</b> <span>{row.meaning}</span></summary>
+          {row.sil_diagnostic != null && <details>
+            <summary>查看上次 AI 分类排错记录</summary>
+            <pre style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}>{JSON.stringify(row.sil_diagnostic,null,2)}</pre>
+          </details>}
+          {row.context && <blockquote>{row.context}</blockquote>}
+          <div className="row">
+            <div className="row" aria-label="所属分类">
+              {row.categories.length ? row.categories.map(code=>{
+                const name = domains.find(domain=>domain.code===code)?.name ?? code;
+                return <span className="row" key={code}>
+                  <button type="button" title={silPath(domains,code)} onClick={()=>openCategory(code)}>{name} ↗</button>
+                  <button type="button" className="quiet" disabled={busy} aria-label={'移除 '+name}
+                    title={'移除 '+name} onClick={()=>remove(row,code)}>×</button>
+                </span>;
+              }) : <button type="button" onClick={()=>openCategory('unclassified')}>未归类 ↗</button>}
+            </div>
+            <SilPicker code={null} change={code=>{if(code)move(row,code);}}/>
+          </div>
+          {row.links?.map(link=><div className="backlink" key={link.id}>
+            <button className="quiet" disabled={busy} onClick={()=>openDocument(link.document_id,link.id)}>{link.title} ↗</button>
+            <p>{link.context}</p>
+            {link.context_meaning && <p>本句释义 · {link.context_meaning}</p>}
+          </div>)}
+        </details>
+      </li>)}</ul>
+    </section>)}
+  </section>;
+}
+
+type SilAuditChange = Pick<Sense,'id'|'lemma'|'meaning'> & {
+  categories:string[]; add:string[]; remove:string[]; reason:string;
+};
+
+function SilAudit({code,descendants,count,domains,config,busy,configured,task,refresh}:{
+  code:string;descendants:boolean;count:number;domains:SilDomain[];config:object;busy:boolean;configured:boolean;
+  task:(action:()=>Promise<void>)=>Promise<void>;refresh:()=>Promise<void>;
+}) {
+  const [result,setResult] = useState<{count:number;changes:SilAuditChange[];tokens:number;usage_incomplete:boolean;invalid_codes:number}|null>(null);
+  const [selected,setSelected] = useState<string[]>([]);
+  const selectionKey = (id:string,action:string,category:string)=>[id,action,category].join('/');
+  const picked = (row:SilAuditChange,action:'add'|'remove') =>
+    row[action].filter(category=>selected.includes(selectionKey(row.id,action,category)));
+  const changes = result?.changes.map(row=>({...row,add:picked(row,'add'),remove:picked(row,'remove')}))
+    .filter(row=>row.add.length || row.remove.length) ?? [];
+  return <section aria-label="AI 审查分类">
+    <p>将审查{descendants ? '整个分支的' : '直属的'} {count} 个义项。</p>
+    <button type="button" disabled={busy || !configured || !count} onClick={()=>void task(async()=>{
+      const preview = await call<{count:number;changes:SilAuditChange[];tokens:number;usage_incomplete:boolean;invalid_codes:number}>('sil_audit',{...config,code,descendants});
+      setResult(preview);
+      setSelected(preview.changes.flatMap(row=>row.add.map(category=>selectionKey(row.id,'add',category))));
+    })}>{result ? '重新审查' : '开始审查'}</button>
+    {result && <>
+      <p role="status">已审查 {result.count} 个义项，{result.changes.length ? result.changes.length+' 个义项有调整建议' : result.invalid_codes ? '没有有效的调整建议' : '无需调整'}。{result.usage_incomplete && !result.tokens ? '服务未报告 token 用量。' :
+        `已报告 ${result.tokens.toLocaleString()} token${result.usage_incomplete ? '（部分批次未报告）' : ''}。`}{result.invalid_codes>0 && `已跳过 ${result.invalid_codes} 个无效分类编号。`}</p>
+      {result.changes.map(row=>{
+        const pending = changes.find(change=>change.id===row.id);
+        const becomesUnclassified = pending && !pending.add.length &&
+          row.categories.every(category=>pending.remove.includes(category));
+        return <fieldset key={row.id} disabled={busy}>
+          <legend><b>{row.lemma}</b> · {row.meaning}</legend>
+          <p className="muted">当前分类 · {row.categories.map(category=>silPath(domains,category)).join('；')}</p>
+          {row.reason && <p>{row.reason}</p>}
+          {(['add','remove'] as const).flatMap(action=>row[action].map(category=>{
+            const key = selectionKey(row.id,action,category);
+            return <label className="check" key={key}>
+              <input type="checkbox" checked={selected.includes(key)} onChange={()=>setSelected(current=>toggle(current,key))}/>
+              {action==='add' ? '新增' : '移除'} {silPath(domains,category)}
+            </label>;
+          }))}
+          {becomesUnclassified && <p>应用后将回到未归类。</p>}
+        </fieldset>;
+      })}
+      {result.changes.length>0 && <button type="button" className="primary" disabled={busy || !changes.length}
+        onClick={()=>void task(async()=>{
+          await call('sil_audit_apply',{code,descendants,rows:changes});
+          setResult(null);setSelected([]);await refresh();
+        })}>应用 {changes.length} 条变更</button>}
+    </>}
+  </section>;
+}
+
+function GroupEditor({value, change}: {value: GroupFields; change: (fields: GroupFields) => void}) {
   return <>
     <label>组名<input value={value.name} maxLength={120} required onChange={e => change({...value,name:e.target.value})}/></label>
     <label>组说明<textarea value={value.description} maxLength={2000} onChange={e => change({...value,description:e.target.value})}/></label>
     <label>核心词与搭配<textarea placeholder={'每行一个，可写成 plummet | 强调急剧下降'} value={value.vocabulary}
       maxLength={6000} onChange={e => change({...value,vocabulary:e.target.value})}/></label>
-    <div className="tag-editor">
-      <label>标签<input value={draft} maxLength={48} placeholder="输入标签名，或点选已有标签"
-        onChange={e=>setDraft(e.target.value)} onKeyDown={e=>{
-          if(e.key==='Enter' && !e.nativeEvent.isComposing && draft.trim()){e.preventDefault();add(draft);}
-        }}/></label>
-      <div className="chips">
-        {value.tags.map(name=><button type="button" key={name} className="tag-chip active"
-          aria-label={`移除标签 ${name}`} onClick={()=>change({...value,tags:value.tags.filter(tag=>tag!==name)})}>{name} ×</button>)}
-        {draft.trim() && <button type="button" onClick={()=>add(draft)}>添加「{draft.trim()}」</button>}
-      </div>
-      {matches.length>0 && <div className="chips" aria-label="复用已有标签">{matches.map(tag=>
-        <button key={tag.id} type="button" onClick={()=>add(tag.name)}>＋ {tag.name}</button>)}</div>}
-    </div>
+    <SilPicker code={value.sil_code} change={sil_code=>change({...value,sil_code})}/>
   </>;
 }
 
@@ -693,8 +809,8 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
       const a = Math.max(start,m.start);
       const b = Math.min(end,m.end);
       if (a > cursor) nodes.push(...highlight(cursor,a));
-      nodes.push(<a key={m.id} id={a === m.start ? 'mark-' + m.id : undefined} href={'#group-' + m.group_id}
-        title={m.group_name + ' · ' + m.meaning} className={focused === m.id ? 'focused' : ''}
+      nodes.push(<a key={m.id} id={a === m.start ? 'mark-' + m.id : undefined} href={'#mark-' + m.id}
+        title={m.meaning} className={focused === m.id ? 'focused' : ''}
         onClick={e => {
           e.preventDefault();
           window.getSelection()?.removeAllRanges();
@@ -809,20 +925,6 @@ function App() {
   const [webUrl,setWebUrl] = useState('');
   const [query,setQuery] = useState('');
   const [filter,setFilter] = useState('');
-  const [tagQuery,setTagQuery] = useState('');
-  const [selectedTags,setSelectedTags] = useState<string[]>([]);
-  const [untagged,setUntagged] = useState(false);
-  const [manageTags,setManageTags] = useState(false);
-  const [tagToEdit,setTagToEdit] = useState('');
-  const [libraryTagQuery,setLibraryTagQuery] = useState('');
-  const [mergeTagQuery,setMergeTagQuery] = useState('');
-  const [tagScope,setTagScope] = useState('');
-  const [newLibraryTag,setNewLibraryTag] = useState('');
-  const [newLibraryScope,setNewLibraryScope] = useState('');
-  const [tagName,setTagName] = useState('');
-  const [mergeTag,setMergeTag] = useState('');
-  const [confirmTagMerge,setConfirmTagMerge] = useState(false);
-  const [search,setSearch] = useState<Library | null>(null);
   const [read,setRead] = useState<Read | null>(null);
   const [editing,setEditing] = useState(false);
   const navigation = useReaderNavigation();
@@ -872,11 +974,6 @@ function App() {
   const [reclassMeaning,setReclassMeaning] = useState('');
   const [target,setTarget] = useState('');
   const [organizing,setOrganizing] = useState(false);
-  const [organizationPlan,setOrganizationPlan] = useState<OrganizationPlan|null>(null);
-  const [showLibraryScan,setShowLibraryScan] = useState(false);
-  const [libraryPlans,setLibraryPlans] = useState<{group:Group;plan:OrganizationPlan}[]>([]);
-  const [scanProgress,setScanProgress] = useState<{done:number;total:number;failed:number;running:boolean}|null>(null);
-  const stopLibraryScan = useRef(false);
   const [operation,setOperation] = useState('move');
   const [splitFields,setSplitFields] = useState(blank);
   const [savedAi,setSavedAi] = useState(() => ({
@@ -921,7 +1018,6 @@ function App() {
   }
   async function refresh() {
     setLib(await call<Library>('list'));
-    if (filter) setSearch(await call<Library>('list',{q:filter}));
   }
   useEffect(() => {void task(refresh);}, []);
 
@@ -972,65 +1068,20 @@ function App() {
   function clearGroup() {
     setDeleteGroupId('');
     setDetail(null); setGroupFields(blank()); setSelectedSenses([]); setSelectedMarks([]);
-    setOrganizing(false); setOrganizationPlan(null); setTarget(''); setOperation('move'); setSplitFields(blank()); setMarkSense(''); setMarkFilter(''); setReclassMeaning('');
+    setOrganizing(false); setTarget(''); setOperation('move'); setSplitFields(blank()); setMarkSense(''); setMarkFilter(''); setReclassMeaning('');
   }
-  function ignoreLibrarySuggestion(plan: OrganizationPlan, kind: 'merge'|'split') {
-    const remaining = {...plan,[kind]:null};
-    const hasSuggestions = Boolean(remaining.merge || remaining.split);
-    setLibraryPlans(current=>current.flatMap(entry=>entry.plan!==plan
-      ? [entry] : hasSuggestions ? [{...entry,plan:remaining}] : []));
-    setOrganizationPlan(current=>current===plan ? hasSuggestions ? remaining : null : current);
-  }
-  function scanLibrary() {
-    void task(async()=>{
-      const groups = [...lib.groups];
-      const pairs = new Set<string>();
-      let done = 0, failed = 0, consecutiveFailures = 0;
-      stopLibraryScan.current = false;
-      setLibraryPlans([]);
-      setScanProgress({done,total:groups.length,failed,running:true});
-      for (const group of groups) {
-        if (stopLibraryScan.current || consecutiveFailures >= 3) break;
-        try {
-          const plan = await call<OrganizationPlan>('organize_group',{...savedAi,id:group.id});
-          consecutiveFailures = 0;
-          if (plan.merge) {
-            const pair = [group.id,plan.merge.target_id].sort().join(':');
-            if (pairs.has(pair)) plan.merge = null;
-            else pairs.add(pair);
-          }
-          if (plan.merge || plan.split) {
-            setLibraryPlans(current=>[...current,{group,plan}]);
-          }
-        } catch {
-          failed++;
-          consecutiveFailures++;
-        }
-        setScanProgress({done:++done,total:groups.length,failed,running:true});
-      }
-      setScanProgress({done,total:groups.length,failed,running:false});
-      if (consecutiveFailures >= 3) setNotice('连续三组扫描失败，已停止。请检查 AI 配置后重试。');
-    });
-  }
-
-  async function openGroup(id: string) {
-    const data = await call<Detail>('group',{id});
-    clearGroup(); setManageTags(false); setDetail(data); setMode('library');
-    setGroupFields({...data.group,tags:data.tags.map(tag=>tag.name),vocabulary:data.vocabulary.map(v => v.expression + (v.nuance ? ' | '+v.nuance : '')).join('\n')});
+  function openLibrarySense(lemma: string) {
+    setSilFilter(''); setQuery(lemma); setFilter(lemma); setMode('library');
   }
   async function importFile() {
     const imported = await importLocalFile();
     if (!imported) return;
     await refresh(); await openDoc(imported.id); setNotice('已导入 ' + imported.title);
   }
-  async function deleteSense(id: string, groupId: string) {
+  async function deleteSense(id: string) {
     await call('sense_delete',{id});
     setRead(previous=>previous && {...previous,marks:previous.marks.filter(mark=>mark.sense_id!==id)});
     resetSelection();
-    if (detail?.group.id === groupId) {
-      if (mode==='library') await openGroup(groupId);
-      else clearGroup();
-    }
     await refresh();
     setNotice('已删除义项及其原文链接');
   }
@@ -1044,7 +1095,7 @@ function App() {
     setSuggesting(true);
     setAiNote('');
     try {
-      const response = await call<Suggestion>('suggest',{...chosen,...savedAi});
+      const response = await call<Suggestion>('suggest',{...chosen,...savedAi,ungrouped_capture:true});
       if (selectionRequest.current !== request) return;
       const s = response.suggestion;
       setLearning(s.learning);
@@ -1056,8 +1107,8 @@ function App() {
         const lines = terms.map(term =>
           [term.expression,term.note].map(value=>value.replace(/[|\r\n]+/g,' ').trim()).join(' | ')
         );
-        setNewFields(previous=>({name:s.group_name ?? '',description:s.group_description || s.meaning,
-          vocabulary:[...new Set(lines)].join('\n'),tags:previous.tags}));
+        setNewFields({name:s.group_name ?? '',description:s.group_description || s.meaning,
+          vocabulary:[...new Set(lines)].join('\n'),sil_code:s.sil_code});
       }
       setAiNote((s.sense_id ? 'AI 建议复用已有义项 · 置信度 ' : 'AI 建议 · 置信度 ') + Math.round(s.confidence*100) + '%' +
         (typeof response.usage?.total_tokens === 'number' ? ' · ' + response.usage.total_tokens + ' tokens' : '') +
@@ -1107,34 +1158,36 @@ function App() {
     e.preventDefault();
     void task(action);
   }
-  const listed = search ?? lib;
   const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()];
   const selectedSense = candidateSenses.find(sense=>sense.id===attachSense);
-  const selectedGroup = attachSense ? selectedSense?.group_id : attachGroup;
   const lookupWord = selection ? dictionaryLookupWord(selection.surface,lemma,
     candidateSenses.find(sense=>sense.id===attachSense)?.lemma,undefined) : '';
-  const tagResults = useMemo(()=>facets(listed.groups,lib.tags,lib.tag_links,selectedTags,untagged),
-    [listed.groups,lib.tags,lib.tag_links,selectedTags,untagged]);
-  const bulkVisible = tagResults.results.slice(0,500).map(group=>group.id);
-  const bulkAllVisible = bulkVisible.length>0 && bulkVisible.every(id=>bulkGroups.includes(id));
-  const editedTag = lib.tags.find(tag=>tag.id===tagToEdit);
+  const silDomains = useSilCatalog();
+  const [silFilter,setSilFilter] = useState('');
+  const [directOnly,setDirectOnly] = useState(false);
+  useEffect(()=>{setDirectOnly(false);},[silFilter]);
+  const [newSemanticGroup,setNewSemanticGroup] = useState(false);
+  const silTitle = silFilter==='unclassified' ? '未归类' : silDomains.find(domain=>domain.code===silFilter)?.name ?? silFilter;
+
+  const [silOrganizerCategory,setSilOrganizerCategory] = useState<string|null>(null);
+  const [silPageRevision,setSilPageRevision] = useState(0);
+  const [auditCount,setAuditCount] = useState(0);
+  const showSilOrganizer = silOrganizerCategory===silFilter;
+  const silOrganizer = silFilter ? <SilOrganizer key={silFilter} parent={silFilter==='unclassified' ? '' : silFilter} busy={busy} configured={aiConfigured} config={savedAi} apply={(rows,backup,keepOpen,done)=>void task(async()=>{
+          if (backup) setSnapshots(await call<Snapshot[]>('snapshot_create'));
+          const count = await call<number>('sil_memberships',{rows:rows.map(row=>({...row,codes:row.codes ?? (row.code && row.code!=='unclassified' ? [row.code] : [])})).filter(row=>row.codes.length)});
+          done();
+          resetSelection();
+          if (!keepOpen) {
+            setSilOrganizerCategory(null);
+            clearGroup();
+            setSilPageRevision(revision=>revision+1);
+          }
+          await refresh();
+          setNotice(`已应用 ${count} 条 SIL 分类`);
+          if (read) setRead(await call<Read>('document',{id:read.document.id}));
+        })}/> : null;
   const activeLearning = readLearning(activeMark?.learning);
-  const controlledCount = lib.tags.filter(tag=>tag.scope).length;
-  const defaultConcepts = lib.tags.filter(tag=>tag.source_url?.startsWith('https://vocabularies.unesco.org/')).length;
-  function tagOptionsFor(query:string, selected:string, excluded?:string) {
-    const q=query.trim().toLowerCase();
-    const matches=lib.tags.filter(tag=>tag.id!==excluded &&
-      [tag.name,tag.source_label ?? '',...tag.aliases].some(name=>name.toLowerCase().includes(q)));
-    const visible=matches.slice(0,80);
-    const current=lib.tags.find(tag=>tag.id===selected && tag.id!==excluded);
-    if (current && !visible.some(tag=>tag.id===selected)) visible.unshift(current);
-    return visible;
-  }
-  const targetTag = lib.tags.find(tag=>tag.id===mergeTag);
-  const tagOptions = tagResults.options.filter(tag=>[tag.name,...tag.aliases].some(name=>
-    name.toLowerCase().includes(tagQuery.trim().toLowerCase())));
-
-
   return <div className={mode==='reader' && read ? 'app pdf-app' : 'app'}>
     <header className="top"><div className="brand"><img src="./icon.png" alt=""/> Semantic Reader</div>
       <nav aria-label="工作区">
@@ -1184,105 +1237,17 @@ function App() {
       </div>
       {mode==='library' && <aside className="shelf">
         <div className="eyebrow">SEMANTIC LIBRARY</div>
-        <button className="primary full" disabled={busy} onClick={()=>{clearGroup();setManageTags(false);}}>＋ 新建语义组</button>
         <form className="search" onSubmit={e => submit(e,async () => {
-          const q = query.trim(); setFilter(q); setSearch(q ? await call<Library>('list',{q}) : null);
+          const q = query.trim(); setFilter(q);
         })}>
-          <input aria-label="搜索" placeholder="搜索语义组、词或义项" value={query} maxLength={200} onChange={e=>setQuery(e.target.value)}/>
+          <input aria-label="搜索" placeholder="搜索词或释义" value={query} maxLength={200} onChange={e=>setQuery(e.target.value)}/>
           <button disabled={busy} aria-label="执行搜索">⌕</button>
         </form>
-        {filter && <button className="quiet" onClick={()=>{setQuery('');setFilter('');setSearch(null);}}>清除搜索 ×</button>}
-        <section className="tag-navigation" aria-label="标签筛选">
-          <div className="eyebrow">按标签浏览</div>
-          <div className="chips">
-            <button className="tag-chip" aria-pressed={!untagged && !selectedTags.length}
-              onClick={()=>{setUntagged(false);setSelectedTags([]);setTagQuery('');}}>全部</button>
-            <button className="tag-chip" aria-pressed={untagged}
-              onClick={()=>{setUntagged(true);setSelectedTags([]);setTagQuery('');}}>无标签 {tagResults.untaggedCount}</button>
-          </div>
-          {selectedTags.length>0 && <div className="chips" aria-label="当前标签路径">
-            {selectedTags.map(id=><button key={id} className="tag-chip active" onClick={()=>setSelectedTags(selectedTags.filter(tag=>tag!==id))}>
-              {lib.tags.find(tag=>tag.id===id)?.name} ×</button>)}
-          </div>}
-          {tagResults.options.length>8 && <input aria-label="查找可用标签" placeholder="查找标签或别名"
-            value={tagQuery} onChange={e=>setTagQuery(e.target.value)}/>}
-          <div className="chips tag-options">{(tagResults.options.length>8 ? tagOptions : tagResults.options).map(tag=><button className="tag-chip" key={tag.id}
-            onClick={()=>{setSelectedTags([...selectedTags,tag.id]);setTagQuery('');}}>{tag.name} {tag.count}</button>)}</div>
-          <button className="quiet" onClick={()=>{setManageTags(!manageTags);setConfirmTagMerge(false);}}>
-            {manageTags ? '返回语义组' : '管理标签'}
-          </button>
-        </section>
-        <section className="tag-navigation" aria-label="AI 整理全库">
-          <button type="button" aria-expanded={showLibraryScan}
-            onClick={()=>setShowLibraryScan(!showLibraryScan)}>AI 整理全库</button>
-          {showLibraryScan && <>
-            <p className="muted">逐组扫描当前词库。每组最多一次 AI 请求，结果由你逐条确认。</p>
-            <button type="button" disabled={busy || !aiConfigured || !lib.groups.length} onClick={scanLibrary}>开始扫描</button>
-            {scanProgress?.running && <button type="button" onClick={()=>{stopLibraryScan.current=true;}}>本组完成后停止</button>}
-            {scanProgress && <p role="status">已扫描 {scanProgress.done}/{scanProgress.total} 组，{libraryPlans.length} 组待查看
-              {scanProgress.failed ? '，失败 '+scanProgress.failed+' 组' : ''}
-              {!scanProgress.running && scanProgress.done < scanProgress.total ? ' · 已停止' : ''}</p>}
-            {libraryPlans.filter(({group})=>lib.groups.some(item=>item.id===group.id)).map(({group,plan})=>
-              (['merge','split'] as const).filter(kind=>plan[kind]).map(kind=>{
-                const label = kind==='merge' ? '合并' : '拆分';
-                const source = lib.groups.find(item=>item.id===group.id)?.name ?? group.name;
-                const destination = lib.groups.find(item=>item.id===plan.merge?.target_id)?.name;
-                const summary = kind==='merge'
-                  ? `将「${source}」合并到「${destination ?? '目标组已不存在'}」`
-                  : `${source} · ${label}`;
-                return <div className="row" key={group.id + kind}>
-                  <button className="quiet" type="button" disabled={busy} onClick={()=>void task(async()=>{
-                    await openGroup(group.id);setOrganizationPlan(plan);setOrganizing(true);
-                  })}>{summary}</button>
-                  <button className="quiet" type="button" aria-label={`忽略「${group.name}」的${label}建议`}
-                    disabled={busy && !scanProgress?.running} onClick={()=>ignoreLibrarySuggestion(plan,kind)}>忽略</button>
-                </div>;
-              }))}
-          </>}
-        </section>
-        <div className="bulk-controls">
-          <button className="quiet" disabled={busy} onClick={()=>{
-            setBulkMode(!bulkMode);setBulkGroups([]);setBulkConfirm(false);
-          }}>{bulkMode?'退出批量选择':'批量选择语义组'}</button>
-          {bulkMode && <>
-            <button className="quiet" disabled={busy || !bulkVisible.length} onClick={()=>{
-              setBulkGroups(current=>bulkAllVisible
-                ? current.filter(id=>!bulkVisible.includes(id))
-                : [...new Set([...current,...bulkVisible])].slice(0,500));
-              setBulkConfirm(false);
-            }}>{bulkAllVisible?'取消选中当前结果':tagResults.results.length>500?'选择当前前 500 组':'选择当前结果'}</button>
-            <button className="delete-document" disabled={busy || !bulkGroups.length}
-              onClick={()=>setBulkConfirm(true)}>删除所选（{bulkGroups.length}）</button>
-            {bulkConfirm && <section className="delete-confirm" aria-label="确认批量删除">
-              <p>删除选中的 {bulkGroups.length} 个语义组？这些组的核心词、义项和关联标注也会删除。文章正文会保留。此操作无法撤销，并会清除旧的语义组撤销记录。</p>
-              <button disabled={busy} onClick={()=>setBulkConfirm(false)}>取消</button>
-              <button className="delete-document" disabled={busy} onClick={()=>void task(async()=>{
-                await call('groups_delete',{ids:bulkGroups});
-                if (detail && bulkGroups.includes(detail.group.id)) clearGroup();
-                setBulkGroups([]);setBulkMode(false);setBulkConfirm(false);
-                resetSelection();await refresh();setNotice('已批量删除语义组');
-              })}>确认删除</button>
-            </section>}
-          </>}
-        </div>
-        <div className="shelf-list">
-          {tagResults.results.map(item => {
-            if (bulkMode) {
-              const checked = bulkGroups.includes(item.id);
-              return <label key={item.id} className="bulk-group">
-                <input type="checkbox" checked={checked} disabled={busy || (!checked && bulkGroups.length>=500)}
-                  onChange={()=>{setBulkGroups(toggle(bulkGroups,item.id));setBulkConfirm(false);}}/>
-                {item.name}
-              </label>;
-            }
-            const active = detail?.group.id === item.id;
-            return <button className={active ? 'selected' : ''} key={item.id} disabled={busy}
-              onClick={() => void task(() => openGroup(item.id))}>
-              {item.name}
-            </button>;
-          })}
-          {!tagResults.results.length && <p className="muted">{filter || selectedTags.length || untagged ? '没有匹配结果' : '列表为空'}</p>}
-        </div>
+        {filter && <button className="quiet" onClick={()=>{setQuery('');setFilter('');}}>清除搜索 ×</button>}
+        <SilNavigation directOnly={directOnly} setDirectOnly={setDirectOnly} key={silFilter} counts={lib.sil_counts ?? []} domains={silDomains} value={silFilter} disabled={busy} change={code=>{
+          setSilOrganizerCategory(null);setSilFilter(code);
+          setQuery('');setFilter('');
+        }}/>
       </aside>}
 
         <div ref={readerFrame} className={read ? 'reader-frame pdf-frame' : 'reader-frame'} hidden={mode!=='reader'}>
@@ -1395,7 +1360,7 @@ function App() {
                 <> <small>原形 · <b lang="en">{activeMark.lemma}</b></small></>}</h3>
               <p>{activeMark.meaning}</p>
             </section>
-            <button className="primary" disabled={busy} onClick={()=>void task(()=>openGroup(activeMark.group_id))}>{activeMark.group_name} →</button>
+            <button className="primary" disabled={busy} onClick={()=>openLibrarySense(activeMark.lemma)}>在语义库查看 →</button>
             <DeleteMark key={activeMark.id} busy={busy} remove={()=>void task(async()=>{
               const deletedSense = await call<boolean>('mark_delete',{id:activeMark.id,document_id:activeMark.document_id});
               setRead(previous=>previous && {...previous,marks:previous.marks.filter(mark=>mark.id!==activeMark.id)});
@@ -1404,7 +1369,6 @@ function App() {
               setNotice(deletedSense ? '已删除最后一处标注及其义项' : '已删除此处标注');
             })}/>
 
-            <GroupSenses key={activeMark.group_id} groupId={activeMark.group_id} exclude={activeMark.sense_id} lemma={activeMark.lemma} meaning={activeMark.meaning} ai={aiConfigured ? savedAi : undefined}/>
             {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
             {(!activeLearning?.part_of_speech || !activeLearning.usage_note || (activeLearning.etymology === undefined && activeLearning.mnemonic === undefined)) && markSuggestion?.id !== activeMark.id && <p>
               <button disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
@@ -1444,27 +1408,23 @@ function App() {
                 <b>{note.lemma}</b><p>{note.meaning}</p>
                 {note.learning && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={readLearning(note.learning)!} word={note.lemma}/>}
                 <div className="row">
-                  <button className="quiet" disabled={busy} onClick={()=>void task(()=>openGroup(note.group_id))}>{note.group_name} →</button>
+                  <button className="quiet" disabled={busy} onClick={()=>openLibrarySense(note.lemma)}>在语义库查看 →</button>
                   <button disabled={busy || suggesting} onClick={()=>{setAttachSense(note.id);setLearning(null);}}>复用此义项</button>
                 </div>
               </div>)}
             </section> : null}
             {candidate && <blockquote>{candidate.context}</blockquote>}
-            {candidate?.groups.length ? <div className="chips">{candidate.groups.map(g=>
-              <button key={g.id} disabled={suggesting} onClick={()=>{setAttachGroup(g.id);setAttachSense('');}}>{g.name}</button>)}</div> : null}
             <button disabled={busy || suggesting || !aiConfigured} onClick={()=>void suggestSelection(selection, selectionRequest.current)}>
               {suggesting ? '正在请求 AI 建议…' : '请求 AI 建议'}
             </button>
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
             {aiNote && <p className="muted" role="status">{aiNote}</p>}
             {learning && <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={learning} word={lookupWord}/>}
-            {selectedGroup && <GroupSenses key={selectedGroup} groupId={selectedGroup} exclude={attachSense} lemma={selectedSense?.lemma ?? lemma} meaning={selectedSense?.meaning ?? meaning}
-              ai={aiConfigured ? savedAi : undefined}/>}
             <form onSubmit={e=>submit(e,async ()=>{
               const savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
               await call('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
                 sense_id:attachSense || null,group_id:attachGroup || null,
-                new_group:newFields});
+                ungrouped_capture:true});
               window.getSelection()?.removeAllRanges();
               await refresh(); await openDoc(selection.document_id);setNotice('标注已保存');
             })}>
@@ -1483,8 +1443,7 @@ function App() {
               {!attachSense && <>
                 <label>原形或表达<input value={lemma} required maxLength={240} onChange={e=>setLemma(e.target.value)}/></label>
                 <label>通用释义<textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
-                <GroupPicker groups={lib.groups} value={attachGroup} change={setAttachGroup} placeholder="新建语义组"/>
-                  {!attachGroup && <GroupEditor value={newFields} change={setNewFields} tags={lib.tags}/>}
+                <p className="muted">新义项将收录到「未归类」。</p>
               </>}
               <button className="primary full" disabled={busy}>确认收录</button>
               </fieldset>
@@ -1493,219 +1452,29 @@ function App() {
           </div>
         </aside>}
 
-      {mode==='library' && manageTags && <main className="page manage">
-        <p className="eyebrow">SEMANTIC LIBRARY</p><h1>管理标签</h1>
-        <section><h2>受控标签库</h2>
-          <p>默认安装 UNESCO Thesaurus。当前词表有 {controlledCount.toLocaleString()} 个可用标签，其中 {defaultConcepts.toLocaleString()} 个参考 UNESCO。</p>
-          <button disabled={busy} onClick={()=>void task(async()=>{
-            const result=await call<{added:number}>('tag_install_starter');
-            await refresh();setNotice(result.added?`已启用 ${result.added} 个试用标签`:'试用标签已安装');
-          })}>补充古代史与书写试用标签</button>
-          <p className="muted">可选补充包参考 UNESCO Thesaurus 与 Getty AAT。已有标签和自定义范围会保留。</p>
-          <form onSubmit={e=>submit(e,async()=>{
-            await call('tag_scope_save',{name:newLibraryTag,scope:newLibraryScope});
-            setNewLibraryTag('');setNewLibraryScope('');await refresh();setNotice('标签已加入词表');
-          })}>
-            <label>新增标签<input required maxLength={48} value={newLibraryTag} onChange={e=>setNewLibraryTag(e.target.value)}/></label>
-            <label>使用范围<textarea required maxLength={500} value={newLibraryScope} onChange={e=>setNewLibraryScope(e.target.value)}/></label>
-            <button disabled={busy || !newLibraryTag.trim() || !newLibraryScope.trim()}>加入词表</button>
-          </form>
-        </section>
-        <label>查找标签<input placeholder="输入名称、英文词条或别名" value={libraryTagQuery}
-          onChange={e=>setLibraryTagQuery(e.target.value)}/></label>
-        <label>选择标签<select value={tagToEdit} onChange={e=>{
-          const id=e.target.value;setTagToEdit(id);setTagName(lib.tags.find(tag=>tag.id===id)?.name ?? '');setTagScope(lib.tags.find(tag=>tag.id===id)?.scope ?? '');
-          setMergeTag('');setMergeTagQuery('');setConfirmTagMerge(false);
-        }}><option value="">选择已有标签</option>
-          {tagOptionsFor(libraryTagQuery,tagToEdit).map(tag=><option key={tag.id} value={tag.id}>{tag.name}（{tag.count} 组）</option>)}
-        </select></label>
-        {!lib.tags.length && <p className="muted">可在语义组详情页添加标签。</p>}
-        {editedTag && <>
-          <section><h2>改名</h2>
-            {editedTag.aliases.length>0 && <p className="muted">别名 · {editedTag.aliases.join('、')}</p>}
-            <form onSubmit={e=>submit(e,async()=>{
-              await call('tag_rename',{id:editedTag.id,name:tagName});
-              setDetail(null);setGroupFields(blank());await refresh();setNotice('标签已改名，旧名称保留为别名');
-            })}>
-              <label>标签名称<input required maxLength={48} value={tagName} onChange={e=>setTagName(e.target.value)}/></label>
-              <button disabled={busy || !tagName.trim() || tagName.trim()===editedTag.name}>保存标签名称</button>
-            </form>
-          </section>
-          <section><h2>使用范围</h2>
-            {editedTag.source_label && <p className="muted">参考词条 · {editedTag.source_label}</p>}
-            <form onSubmit={e=>submit(e,async()=>{
-              await call('tag_scope_save',{id:editedTag.id,scope:tagScope});
-              await refresh();setNotice(tagScope.trim()?'已更新使用范围':'已清空使用范围');
-            })}>
-              <label>使用范围<textarea maxLength={500} value={tagScope} onChange={e=>setTagScope(e.target.value)}/></label>
-              <p className="muted">使用范围可留空。</p>
-              <button disabled={busy || tagScope.trim()===(editedTag.scope ?? '')}>保存使用范围</button>
-            </form>
-          </section>
-          <section><h2>合并标签</h2>
-            <label>查找目标标签<input placeholder="输入目标标签名称" value={mergeTagQuery}
-              onChange={e=>setMergeTagQuery(e.target.value)}/></label>
-            <label>保留的目标标签<select value={mergeTag} onChange={e=>{setMergeTag(e.target.value);setConfirmTagMerge(false);}}>
-              <option value="">选择目标标签</option>
-              {tagOptionsFor(mergeTagQuery,mergeTag,editedTag.id).map(tag=><option key={tag.id} value={tag.id}>{tag.name}</option>)}
-            </select></label>
-            <button disabled={busy || !targetTag} onClick={()=>setConfirmTagMerge(true)}>合并标签</button>
-            {confirmTagMerge && targetTag && <div className="delete-confirm">
-              <p>将「{editedTag.name}」并入「{targetTag.name}」？原标签名会成为别名，已有语义组会改用目标标签。这会清除之前的语义组操作撤销记录。</p>
-              <div className="row">
-                <button disabled={busy} onClick={()=>setConfirmTagMerge(false)}>取消</button>
-                <button disabled={busy} onClick={()=>void task(async()=>{
-                  await call('tag_merge',{source:editedTag.id,target:targetTag.id});
-                  setSelectedTags(tags=>[...new Set(tags.map(id=>id===editedTag.id?targetTag.id:id))]);
-                  setTagToEdit(targetTag.id);setTagName(targetTag.name);setTagScope(targetTag.scope ?? editedTag.scope ?? '');setMergeTag('');setConfirmTagMerge(false);
-                  setDetail(null);setGroupFields(blank());await refresh();setNotice('标签已合并');
-                })}>确认合并</button>
-              </div>
-            </div>}
-          </section>
-        </>}
-      </main>}
-
-      {mode==='library' && !manageTags && <main className="page manage">
-        <p className="eyebrow">SEMANTIC LIBRARY</p>
-        <h1>{detail?.group.name ?? '新建语义组'}</h1>
-        {detail && <button type="button" aria-expanded={organizing} onClick={()=>setOrganizing(!organizing)}>
-          {organizing ? '收起整理' : '整理语义组'}
-        </button>}
-        {detail && organizing && <section aria-label="整理语义组">
-          <button type="button" disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
-            setOrganizationPlan(null);
-            setOrganizationPlan(await call<OrganizationPlan>('organize_group',{...savedAi,id:detail.group.id}));
-          })}>AI 扫描</button>
-          <p className="muted">扫描会发送当前组的资料、最多 60 条义项摘要和最多 5 个候选组。建议可预填到下方表单，由你确认。</p>
-          {organizationPlan && <div className="action" aria-label="AI 整理建议">
-            <h3>AI 整理建议</h3>
-            {!organizationPlan.merge && !organizationPlan.split && <p>没有找到明确的整理建议。</p>}
-            {!organizationPlan.split_checked && detail.senses.length > 60 && <p>该组超过 60 条义项，拆分请手动选择。</p>}
-            {organizationPlan.merge && <MergeSuggestion
-              key={detail.group.id + ':' + organizationPlan.merge.target_id} source={detail}
-              destination={lib.groups.find(group=>group.id===organizationPlan.merge?.target_id)}
-              reason={organizationPlan.merge.reason} busy={busy} apply={()=>{
-                if (!organizationPlan.merge) return;
-                setOperation('merge');setTarget(organizationPlan.merge.target_id);
-              }}/>}
-            {organizationPlan.split && <section>
-              <h4>建议拆出「{organizationPlan.split.name}」</h4>
-              <p>{organizationPlan.split.reason}</p>
-              <ul>{detail.senses.filter(sense=>organizationPlan.split?.sense_ids.includes(sense.id)).map(sense=>
-                <li key={sense.id}><b>{sense.lemma}</b> · {sense.meaning}</li>)}</ul>
-              <button type="button" disabled={busy} onClick={()=>{
-                const split = organizationPlan.split;
-                if (!split) return;
-                setOperation('split');setSelectedSenses(split.sense_ids);
-                setSplitFields({...blank(),name:split.name,description:split.description});
-              }}>填入拆分建议</button>
-            </section>}
-          </div>}
-
-            <form className="action" onSubmit={e=>submit(e,async()=>{
-              const id=await call<string>(operation,{source:detail.group.id,target,sense_ids:selectedSenses,new_group:splitFields});
-              setLibraryPlans(plans=>plans.filter(({group,plan})=>
-                group.id!==detail.group.id && group.id!==id && plan.merge?.target_id!==detail.group.id && plan.merge?.target_id!==id));
-              await refresh(); await openGroup(id);setNotice('关系调整已保存');
-            })}>
-              <label>操作<select value={operation} onChange={e=>setOperation(e.target.value)}>
-                <option value="move">移动所选义项</option><option value="split">将所选义项拆到新组</option><option value="merge">将整个当前组合并到目标组</option>
-              </select></label>
-              {operation!=='merge' && <fieldset className="annotation-fields">
-                <legend>选择义项</legend>
-                {detail.senses.length === 0 && <p className="muted">还没有收录义项。</p>}
-                {detail.senses.map(s=><label className="check" key={s.id}>
-                  <input type="checkbox" checked={selectedSenses.includes(s.id)} onChange={()=>setSelectedSenses(toggle(selectedSenses,s.id))}/>
-                  <b>{s.lemma}</b> <span>{s.meaning}</span>
-                </label>)}
-              </fieldset>}
-              {operation==='split' ? <>
-                <GroupEditor value={splitFields} change={setSplitFields} tags={lib.tags}/>
-                <p className="muted">核心词与搭配留空时，会用拆出的义项生成核心词。也可以先填入，再补充搭配。</p>
-                <button type="button" disabled={busy || !selectedSenses.length || Boolean(splitFields.vocabulary.trim())}
-                  onClick={()=>{
-                    const selected = detail.senses.filter(sense=>selectedSenses.includes(sense.id));
-                    const rows = new Map<string,string>();
-                    for (const sense of selected) {
-                      if (rows.has(sense.lemma)) continue;
-                      const original = detail.vocabulary.find(word=>word.expression.toLowerCase()===sense.lemma.toLowerCase());
-                      const clean = (text:string)=>text.replace(/[|\r\n]+/g,' ').trim();
-                      rows.set(sense.lemma, clean(sense.lemma)+' | '+clean(original?.nuance || sense.meaning));
-                    }
-                    const vocabulary = [...rows.values()].join('\n');
-                    if (vocabulary.length > 6000) {
-                      setNotice('所选核心词超过编辑框上限。留空确认拆分时，应用会自动生成完整列表。');
-                    } else setSplitFields({...splitFields,vocabulary});
-                  }}>填入所选核心词</button>
-              </> :
-                <GroupPicker groups={lib.groups.filter(g=>g.id!==detail.group.id)} value={target} change={setTarget}/>}
-              <p className="muted">{operation==='merge' ? '当前组将移除，全部义项和核心词并入目标组。同名核心词保留目标组版本。' :
-                `已选 ${selectedSenses.length} 个义项，其下的原文链接将随义项一起更新。`}</p>
-              <button disabled={busy || (operation!=='merge' && !selectedSenses.length) || (operation!=='split' && !target)}>{operation==='merge' ? '确认合并' : operation==='split' ? '确认拆分' : '确认移动'}</button>
-            </form>
-        </section>}
-        <form onSubmit={e=>submit(e,async()=>{
-          const id=await call<string>('group_save',{...groupFields,id:detail?.group.id});
-          await refresh();await openGroup(id);setNotice('语义组已保存');
-        })}>
-          <GroupEditor value={groupFields} change={setGroupFields} tags={lib.tags}/>
-          <button className="primary" disabled={busy}>保存语义组</button>
-        </form>
-        {detail && <>
-          <button className="quiet delete-document" disabled={busy}
-            onClick={()=>setDeleteGroupId(detail.group.id)}>删除语义组</button>
-          {deleteGroupId === detail.group.id && <section className="delete-confirm" aria-label="确认删除语义组">
-            <p>删除「{detail.group.name}」及其核心词、{detail.senses.length} 个义项和 {detail.marks.length} 条原文标注？文章正文和其他组会保留。这次删除无法撤销，也会清除之前的语义组操作撤销记录。</p>
-            <div className="row">
-              <button disabled={busy} onClick={()=>setDeleteGroupId('')}>取消</button>
-              <button className="delete-document" disabled={busy} onClick={()=>void task(async()=>{
-                await call('group_delete',{id:detail.group.id});
-                clearGroup(); resetSelection(); await refresh(); setNotice('语义组已删除');
-              })}>确认删除语义组</button>
-            </div>
-          </section>}
-        </>}
-        {lib.undo > 0 && <button disabled={busy} onClick={()=>void task(async()=>{
-          const source=await call<string>('undo');await refresh();await openGroup(source);setNotice('已撤销上次关系调整');
-        })}>撤销上次关系调整</button>}
-        {detail && <>
-          {!organizing && <section>
-            <h2>已收录义项</h2>
-            {detail.senses.length ? <ul>{detail.senses.map(s=><li key={s.id}><b>{s.lemma}</b> · {s.meaning}
-              <MergeSense sense={s} busy={busy} links={detail.marks.filter(mark=>mark.sense_id===s.id).length}
-                load={receive=>void task(async()=>receive(await call<MergeTarget[]>('sense_merge_options',{id:s.id})))}
-                merge={(target,meaning)=>void task(async()=>{
-                  const groupId=await call<string>('sense_merge',{source:s.id,target,meaning});
-                  if (read) setRead(await call<Read>('document',{id:read.document.id}));
-                  resetSelection();setLibraryPlans([]);await refresh();await openGroup(groupId);
-                  setNotice('义项已合并，原文链接和学习笔记已保留');
-                })}/>
-              <DeleteSense sense={s} busy={busy} remove={()=>void task(()=>deleteSense(s.id,s.group_id))}/>
-            </li>)}</ul>
-              : <p className="muted">还没有收录义项。</p>}
-          </section>}
-          <section>
-            <h2>原文出现记录 <small>{detail.marks.length}</small></h2>
-            <label>筛选义项<select value={markSense} onChange={e=>{
-              setMarkSense(e.target.value);setSelectedMarks([]);setReclassMeaning('');
-            }}><option value="">全部义项</option>{detail.senses.map(s=><option key={s.id} value={s.id}>{s.lemma} · {s.meaning}</option>)}</select></label>
-            <label>筛选原文或语境<input value={markFilter} onChange={e=>setMarkFilter(e.target.value)}/></label>
-            {detail.marks.filter(m=>(!markSense||m.sense_id===markSense) &&
-              (m.title+' '+m.context).toLowerCase().includes(markFilter.toLowerCase())).map(m=>
-              <div className="backlink" key={m.id}>
-                {markSense && <input type="checkbox" aria-label={'选择 ' + m.surface} checked={selectedMarks.includes(m.id)} onChange={()=>setSelectedMarks(toggle(selectedMarks,m.id))}/>}
-                <div><button className="quiet" disabled={busy} onClick={()=>void task(()=>openDoc(m.document_id,m.id))}>{m.title} ↗</button>
-                  <p><b>{m.surface}</b> · {m.context}</p>
-                  <p>本句释义 · {m.context_meaning || m.meaning}</p></div>
-              </div>)}
-            {markSense && <Reclassify key={markSense} {...{groups:lib.groups,selectedMarks,reclassMeaning,setReclassMeaning,busy}}
-              apply={groupId=>void task(async()=>{
-                const id=await call<string>('reclassify',{source:detail.group.id,target:groupId,sense_id:markSense,occurrence_ids:selectedMarks,meaning:reclassMeaning});
-                await refresh(); await openGroup(id);setNotice('所选出现记录已重新分类');
-              })}/>}
-          </section>
-        </>}
+      {mode==='library' && <main key={silFilter + ':' + silPageRevision} className="page manage">
+        <header className="sil-page-header">
+          <h1>{filter ? '搜索结果' : silTitle || '语义库'}</h1>
+          {silFilter && !filter && <button type="button" aria-expanded={showSilOrganizer}
+            onClick={()=>setSilOrganizerCategory(showSilOrganizer ? null : silFilter)}>{silFilter==='unclassified' ? 'AI 推荐分类' : 'AI 审查分类'}</button>}
+        </header>
+        {!filter && showSilOrganizer && (silFilter==='unclassified' ? silOrganizer :
+          <SilAudit key={silFilter+':'+directOnly} code={silFilter} descendants={!directOnly} count={auditCount}
+            domains={silDomains} config={savedAi} busy={busy} configured={aiConfigured} task={task}
+            refresh={async()=>{await refresh();setNotice('分类调整已应用');}}/>)}
+        <SilSenseList key={silFilter + ':' + directOnly + ':' + filter}
+          directOnly={directOnly || silFilter==='unclassified'} category={silFilter} query={filter} library={lib} busy={busy}
+          onCount={setAuditCount}
+          openCategory={code=>{
+            setQuery('');setFilter('');setDirectOnly(false);setSilOrganizerCategory(null);setSilFilter(code);
+          }}
+          openDocument={(id,mark)=>void task(()=>openDoc(id,mark))}
+          move={(sense,code)=>void task(async()=>{
+            await call('sil_memberships',{rows:[{...sense,codes:[code]}]});await refresh();
+          })}
+          remove={(sense,code)=>void task(async()=>{
+            await call('sil_memberships',{rows:[{...sense,codes:[code]}],remove:true});await refresh();
+          })}/>
       </main>}
 
       {mode==='help' && <HelpPage/>}
@@ -1755,7 +1524,7 @@ function App() {
             const result=await call<{applied:number;conflicts:number}>('gloss_apply',{changes});
             done();
             if (read) setRead(await call<Read>('document',{id:read.document.id}));
-            resetSelection();clearGroup();setLibraryPlans([]);await refresh();
+            resetSelection();clearGroup();await refresh();
             setNotice(`已写入 ${result.applied} 条释义${result.conflicts ? `，跳过 ${result.conflicts} 条重复释义` : ''}`);
           })}/>
         <section><h2>备份与恢复</h2>
@@ -1767,6 +1536,19 @@ function App() {
             setConfirmSnapshot(null);setBackupPreview(null);
             setNotice('备份已自动保存');
           })}>导出备份</button>
+          <button type="button" disabled={busy} onClick={()=>void task(async()=>{
+            if (!window.confirm('把所有义项退回「未归类」？将先创建词库备份。语义组、释义和原文标注都会保留。')) return;
+            const items = await call<Snapshot[]>('snapshot_create');
+            setSnapshots(items);
+            setSnapshotId(items[0]?.id ?? '');
+            setConfirmSnapshot(null);setBackupPreview(null);
+            const count = await call<number>('sil_reset');
+            clearSilProgress();
+            setSilFilter('unclassified');
+            clearGroup();
+            await refresh();
+            setNotice(`已清空 ${count} 个语义组的 SIL 分类，所有义项都在「未归类」。`);
+          })}>重置 SIL 分类</button>
           {snapshots.length>0 ? <>
             <label>本地备份（{snapshots.length} 份）<select size={Math.max(2,Math.min(6,snapshots.length))}
               value={snapshotId} disabled={busy} onChange={e=>{
@@ -1792,7 +1574,7 @@ function App() {
                 await call('snapshot_restore',{id:selectedSnapshot.id});
                 setConfirmSnapshot(null);setSnapshotId('');setBackupPreview(null);
                 setRead(null);setFocus('');setEditing(false);readerScroll.current=0;resetSelection();clearGroup();
-                setSelectedTags([]);setBulkGroups([]);setLibraryPlans([]);setScanProgress(null);
+                setSilFilter('');setBulkGroups([]);
                 await refresh();
                 setSnapshots(await call<Snapshot[]>('snapshot_list'));
                 setNotice('已恢复快照，恢复前的数据已自动备份');
@@ -1949,7 +1731,7 @@ function HelpPage() {
     <section>
       <h2>5. 管理语义组</h2>
       <p>在阅读器点击原文标注，可选择「删除此处标注」。在语义库的组详情中选择「删除义项」，会同时删除该义项和它在所有文章中的原文链接。</p>
-      <p>在「语义库」搜索组名、词语或义项，也可以用标签筛选。打开组后可编辑说明、核心词和标签，也可以点「整理语义组」移动义项、拆组或合并组。「AI 扫描」可以检查当前组，左栏「AI 整理全库」则逐组扫描并集中列出建议。点建议可预填表单，确认后才会修改词库。拆分时可点「填入所选核心词」再编辑，留空则按拆出的义项生成核心词。点原文出现记录可跳回文章中的标注。</p>
+      <p>在「语义库」搜索组名、词语或义项，也可以按 SIL 分类筛选。打开组后可编辑说明、核心词和 SIL 分类，也可以点「整理语义组」移动义项、拆组或合并组。在左栏逐级打开 SIL 分类，右侧可以用 AI 整理当前类的直属义项。点建议可预填表单，确认后才会修改词库。拆分时可点「填入所选核心词」再编辑，留空则按拆出的义项生成核心词。点原文出现记录可跳回文章中的标注。</p>
     </section>
 
     <section>
