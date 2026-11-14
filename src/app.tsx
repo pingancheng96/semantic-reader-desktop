@@ -1,3 +1,4 @@
+import {EpubReader} from './epub-reader.js';
 import {PronunciationPanel, PronunciationSettings} from './pronunciation.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import {PdfReader} from './pdf-reader.js';
@@ -21,7 +22,7 @@ const snapshotLabel = (snapshot:Snapshot) =>
   new Date(snapshot.timestamp).toLocaleString() + (snapshot.safety ? ' · 恢复前自动备份' : '');
 type Library = {documents: Item[]; groups: Group[]; undo: number; tags:Tag[]; tag_links:TagLink[]};
 type WebLayout = {nodes:WebNode[]; images:(string|null)[]; image_errors?:(string|null)[]};
-type Read = {document: Item & {content: string; web_layout?: string | null; pdf?:number}; marks: Mark[]};
+type Read = {document: Item & {content: string; web_layout?: string | null; pdf?:number; epub?:number}; marks: Mark[]};
 type Detail = {group: Group; senses: Sense[]; marks: Mark[]; vocabulary: Vocabulary[]; tags:{id:string; name:string}[]};
 type Selection = {document_id: string; start: number; end: number; surface: string};
 type SavedNote = Sense & {group_name:string; learning?:string|null};
@@ -406,16 +407,75 @@ function LibraryGlossOrganizer({busy,configured,scan,apply}: {
   </section>;
 }
 
-function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginEdit, cancel, save}: {
+function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginEdit, cancel, save, footer, scrollPosition}: {
+  footer:HTMLElement|null; scrollPosition:{current:number};
   data: Read; visible: boolean; focused: string; onMark: (m: Mark) => void;
   onSelect: (s: Selection, doubleClick: boolean) => void;
   editing:boolean; busy:boolean; beginEdit:()=>void; cancel:()=>void; save:(edit:EditedDocument)=>void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const scrollArea = useRef<HTMLDivElement>(null);
+  useLayoutEffect(()=>{
+    if (visible && scrollArea.current) scrollArea.current.scrollTop = scrollPosition.current;
+  },[visible,scrollPosition]);
   const {content, format, id, web_layout} = data.document;
   const web = useMemo(() => web_layout ? JSON.parse(web_layout) as WebLayout : null,[web_layout]);
   const captions = useMemo(() => captionNodes(web?.nodes ?? [],content), [web,content]);
   const lines = useMemo(() => web ? [] : readingLines(content, format === 'md'), [content,format,web]);
+  const bookmarkKey = `textBookmarks:${id}`;
+  const [navigationOpen,setNavigationOpen] = useState(false);
+  const [bookmarkError,setBookmarkError] = useState('');
+  const [bookmarks,setBookmarks] = useState<{offset:number;label:string}[]>(()=>{
+    try {
+      const saved = JSON.parse(localStorage.getItem(bookmarkKey) ?? '[]');
+      return Array.isArray(saved) ? saved.filter(item=>item && Number.isSafeInteger(item.offset) &&
+        item.offset>=0 && typeof item.label==='string') : [];
+    } catch { return []; }
+  });
+  function updateBookmarks(next:typeof bookmarks) {
+    try {
+      localStorage.setItem(bookmarkKey,JSON.stringify(next));
+      setBookmarks(next);setBookmarkError('');
+    } catch {setBookmarkError('无法保存书签');}
+  }
+  function addBookmark() {
+    const anchors = ref.current?.querySelectorAll<HTMLElement>('[data-offset]');
+    if (!anchors?.length) return;
+    const top = scrollArea.current?.getBoundingClientRect().top ?? 0;
+    const anchor = Array.from(anchors).find(node=>node.getBoundingClientRect().bottom>top) ?? anchors[anchors.length-1];
+    const offset = Number(anchor.dataset.offset);
+    if (bookmarks.some(item=>item.offset===offset)) return;
+    const label = content.slice(offset).trim().split('\n')[0]?.slice(0,65) || '正文';
+    updateBookmarks([...bookmarks,{offset,label}].sort((a,b)=>a.offset-b.offset));
+  }
+  function jump(offset:number) {
+    const anchors = ref.current?.querySelectorAll<HTMLElement>('[data-offset]');
+    if (!anchors?.length) return;
+    let target = anchors[0];
+    for (const anchor of Array.from(anchors)) {
+      if (Number(anchor.dataset.offset)>offset) break;
+      target = anchor;
+    }
+    target.scrollIntoView({block:'start'});
+  }
+  const toc = useMemo(()=>{
+    if (!web) return lines.filter(line=>/^h[1-6]$/.test(line.kind) && line.pieces.length)
+      .map(line=>({offset:line.pieces[0].start,label:line.pieces.map(piece=>piece.text).join('')}));
+    const headings:{offset:number;label:string}[] = [];
+    function textNodes(node:WebNode):Extract<WebNode,{type:'text'}>[] {
+      if (node.type==='text') return [node];
+      return node.type==='element' ? node.children.flatMap(textNodes) : [];
+    }
+    function visit(node:WebNode) {
+      if (node.type!=='element') return;
+      if (/^h[1-6]$/.test(node.tag)) {
+        const parts = textNodes(node);
+        if (parts.length) headings.push({offset:parts[0].start,label:parts.map(part=>content.slice(part.start,part.end)).join('').trim()});
+      } else node.children.forEach(visit);
+    }
+    web.nodes.forEach(visit);
+    return headings;
+  },[web,lines,content]);
   const edits = useRef(new Map<number,InlineEdit>());
   const [pendingEdit,setPendingEdit] = useState<{edit:EditedDocument;removed:number}|null>(null);
   function finishEdit() {
@@ -620,15 +680,20 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
           </button>
           <button disabled={busy} onClick={cancel}>取消</button>
         </div>
-      </> : <div className="row">
+      </> : null}
+    </div>
+    {!editing && footer && ReactDOM.createPortal(<nav className="pdf-pagination text-reader-toolbar" aria-label="文章导航">
+      <button className="pdf-outline-toggle" type="button" aria-expanded={navigationOpen}
+        aria-controls="text-outline" onClick={()=>setNavigationOpen(!navigationOpen)}>目录与书签</button>
+      <button type="button" aria-label="添加当前位置书签" title="添加当前位置书签"
+        onClick={()=>{addBookmark();setNavigationOpen(true);}}>☆</button>
         <button className="reader-icon" type="button" onClick={openSearch} aria-label="文章内搜索" title="文章内搜索 · ⌘F / Ctrl+F">
           <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 5 5"/></svg>
         </button>
         <button className="primary reader-icon" type="button" disabled={busy} onClick={beginEdit} aria-label="编辑正文" title="编辑正文">
           <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m4 20 1-5L16 4a2.1 2.1 0 0 1 3 3L8 19l-4 1ZM14 6l4 4"/></svg>
         </button>
-      </div>}
-    </div>
+    </nav>,footer)}
     {!editing && searchOpen && <div className="article-search" role="search" aria-label="文章内搜索"
       onKeyDown={e=>{
         if (e.key === 'Escape' && !e.nativeEvent.isComposing) {e.preventDefault();closeSearch();}
@@ -644,7 +709,24 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
       <button type="button" disabled={!matches.length} onClick={()=>move(1)}>下一处</button>
       <button type="button" onClick={closeSearch}>关闭</button>
     </div>}
-    <div className={web ? 'reading web-reading' : 'reading'} ref={ref} tabIndex={0}
+    <div className={navigationOpen && !editing ? 'pdf-reader has-outline' : 'pdf-reader'}>
+    {!editing && navigationOpen && <aside id="text-outline" className="pdf-outline" aria-label="目录与书签">
+      <h3>书签</h3>
+      {bookmarkError && <p role="alert">{bookmarkError}</p>}
+      {bookmarks.length ? <ul>{bookmarks.map(item=><li className="bookmark-row" key={item.offset}>
+        <button type="button" onClick={()=>jump(item.offset)}>{item.label}</button>
+        <button type="button" aria-label={`删除书签：${item.label}`}
+          onClick={()=>updateBookmarks(bookmarks.filter(bookmark=>bookmark.offset!==item.offset))}>×</button>
+      </li>)}</ul> : <p className="muted">点击底栏的 ☆ 添加当前位置书签。</p>}
+      <h3>目录</h3>
+      {toc.length ? <ul>{toc.map(item=><li key={item.offset}>
+        <button type="button" onClick={()=>jump(item.offset)}>{item.label}</button>
+      </li>)}</ul> : <ul><li><button type="button" onClick={()=>jump(0)}>正文开头</button></li></ul>}
+    </aside>}
+    <div className="pdf-page-area text-reading-area" ref={scrollArea} onScroll={event=>{
+      if (visible) scrollPosition.current = event.currentTarget.scrollTop;
+    }}>
+    <div className={web ? 'reading web-reading' + (data.document.source_url ? '' : ' epub-reading') : 'reading'} ref={ref} tabIndex={0}
     onMouseUp={e => {if(e.detail < 2) capture();}} onDoubleClick={() => capture(true)}
     onKeyUp={e => {if (e.shiftKey) capture();}}>
     {web ? web.nodes.map(renderWeb) : lines.map(line => <div key={line.start} className={'line ' + line.kind}>
@@ -655,7 +737,7 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
         </Tag>;
       })}
     </div>)}
-  </div></>;
+  </div></div></div></>;
 }
 
 function App() {
@@ -684,16 +766,13 @@ function App() {
   const shelfCollapsed = mode==='reader' && readingShelfCollapsed;
   const [notesCollapsed,setNotesCollapsed] = useState(false);
   const [pdfFooter,setPdfFooter] = useState<HTMLDivElement|null>(null);
-  const readerPage = useRef<HTMLElement>(null);
   const readerScroll = useRef(0);
-  useLayoutEffect(() => {
-    if (mode === 'reader' && readerPage.current) readerPage.current.scrollTop = readerScroll.current;
-  }, [mode, read?.document.id, editing]);
   const [detail,setDetail] = useState<Detail | null>(null);
   const [bulkMode,setBulkMode] = useState(false);
   const [bulkGroups,setBulkGroups] = useState<string[]>([]);
   const [bulkConfirm,setBulkConfirm] = useState(false);
   const [deleteGroupId,setDeleteGroupId] = useState('');
+  const [renaming,setRenaming] = useState<{id:string;title:string}|null>(null);
   const [deleteDocId,setDeleteDocId] = useState('');
   const [focus,setFocus] = useState('');
   const [selection,setSelection] = useState<Selection | null>(null);
@@ -807,6 +886,7 @@ function App() {
     setSelection(null); setCandidate(null); setActiveMark(null); setAiNote(''); setLearning(null); setMarkSuggestion(null);
   }
   async function openDoc(id: string, markId = '') {
+    setRenaming(null);
     const data = await call<Read>('document',{id});
     if (read?.document.id !== id) readerScroll.current = 0;
     setEditing(false); setDeleteDocId(''); setRead(data); setFocus(markId); setMode('reader'); resetSelection();
@@ -978,7 +1058,7 @@ function App() {
     name.toLowerCase().includes(tagQuery.trim().toLowerCase())));
 
 
-  return <div className={mode==='reader' && read?.document.pdf ? 'app pdf-app' : 'app'}>
+  return <div className={mode==='reader' && read ? 'app pdf-app' : 'app'}>
     <header className="top"><div className="brand"><img src="./icon.png" alt=""/> Semantic Reader</div>
       <nav aria-label="工作区">
         <button aria-current={mode==='reader' ? 'page' : undefined} className={mode==='reader'?'current':''} onClick={() => void task(async () => { if (read && !editing) await openDoc(read.document.id); else setMode('reader'); })}>阅读器</button>
@@ -1004,7 +1084,7 @@ function App() {
         <div className="eyebrow">{mode==='library' ? 'SEMANTIC LIBRARY' : 'READING LIBRARY'}</div>
         <button className="primary full" disabled={busy} onClick={() => {
           if(mode==='library'){clearGroup();setManageTags(false);setMode('library');} else void task(importFile);
-        }}>{mode==='library' ? '＋ 新建语义组' : '＋ 导入 Markdown / TXT / PDF'}</button>
+        }}>{mode==='library' ? '＋ 新建语义组' : '＋ 导入 Markdown / TXT / PDF / EPUB'}</button>
         {mode === 'reader' && <form className="web-import" onSubmit={e=>submit(e,async()=>{
           const id = await call<string>('import_web',{url:webUrl.trim()});
           setWebUrl(''); await refresh(); await openDoc(id); setNotice('网页已导入');
@@ -1114,13 +1194,12 @@ function App() {
         </div>
       </aside>
 
-        <div className={read?.document.pdf ? 'reader-frame pdf-frame' : 'reader-frame'} hidden={mode!=='reader'}>
-        <main className="page" ref={readerPage}
-          onScroll={e=>{if (mode==='reader') readerScroll.current = e.currentTarget.scrollTop;}}>
+        <div className={read ? 'reader-frame pdf-frame' : 'reader-frame'} hidden={mode!=='reader'}>
+        <main className="page">
           {read ? <>
             <div className="reader-heading">
             <div className="reader-title-bar">
-              <h1 title={read.document.title}>{read.document.title.replace(/\.(md|markdown|txt|pdf)$/i,'')}</h1>
+              <h1 title={read.document.title}>{read.document.title.replace(/\.(md|markdown|txt|pdf|epub)$/i,'')}</h1>
               <details className="reader-document-menu" key={read.document.id} onBlur={event=>{
                 if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open=false;
               }} onKeyDown={event=>{
@@ -1133,7 +1212,7 @@ function App() {
                 <div className="reader-document-menu-panel">
                   <p className="muted">文档信息 · {read.marks.length} 条标注</p>
                   {read.document.source_url && <p className="muted">来源 · {read.document.source_url}</p>}
-                  {read.document.web_layout && <button type="button" disabled={busy || editing} onClick={event=>{
+                  {read.document.web_layout && read.document.source_url && <button type="button" disabled={busy || editing} onClick={event=>{
                     event.currentTarget.closest('details')?.removeAttribute('open');
                     void task(async()=>{
                       const id = read.document.id;
@@ -1142,13 +1221,33 @@ function App() {
                       setNotice(`已保存 ${result.saved} 张图片${result.missing ? `，仍有 ${result.missing} 张未能导入` : ''}`);
                     });
                   }}>重新下载图片</button>}
+                  <button type="button" disabled={busy || editing} onClick={event=>{
+                    event.currentTarget.closest('details')?.removeAttribute('open');
+                    setDeleteDocId('');
+                    setRenaming({id:read.document.id,title:read.document.title.replace(/\.(md|markdown|txt|pdf|epub)$/i,'')});
+                  }}>修改标题</button>
                   <button type="button" className="quiet delete-document" disabled={busy || editing} onClick={event=>{
                     event.currentTarget.closest('details')?.removeAttribute('open');
-                    setDeleteDocId(read.document.id);
+                    setRenaming(null);setDeleteDocId(read.document.id);
                   }}>删除文章</button>
                 </div>
               </details>
             </div>
+            {renaming?.id===read.document.id && <form className="rename-document" onSubmit={event=>submit(event,async()=>{
+              const title = await call<string>('document_rename',renaming);
+              setRead(previous=>previous?.document.id===renaming.id
+                ? {...previous,document:{...previous.document,title}} : previous);
+              setRenaming(null);
+              await refresh();
+              setNotice('标题已更新');
+            })}>
+              <label>文章标题<input autoFocus required maxLength={255} value={renaming.title}
+                onChange={event=>setRenaming({...renaming,title:event.target.value})}/></label>
+              <div className="row">
+                <button type="submit" className="primary" disabled={busy || !renaming.title.trim()}>保存标题</button>
+                <button type="button" disabled={busy} onClick={()=>setRenaming(null)}>取消</button>
+              </div>
+            </form>}
             {deleteDocId === read.document.id && <section className="delete-confirm" aria-label="确认删除文章">
               <p>删除《{read.document.title}》及其 {read.marks.length} 条原文标注和随标注保存的学习提示？词库义项、语义组和其他文章会保留。删除后无法在应用内撤销。</p>
               <div className="row">
@@ -1160,8 +1259,11 @@ function App() {
             {read.document.pdf ? <PdfReader key={read.document.id} id={read.document.id} marks={read.marks}
               focused={focus} selection={selection} visible={mode==='reader'} footer={pdfFooter} onSelect={capture} onClearSelection={resetSelection}
               onMark={openMarkNote}/> :
+            read.document.epub && read.document.web_layout ? <EpubReader key={read.document.id} id={read.document.id}
+              content={read.document.content} layout={read.document.web_layout} marks={read.marks} focused={focus}
+              visible={mode==='reader'} footer={pdfFooter} onSelect={capture} onMark={openMarkNote}/> :
             <Reader key={read.document.id + (editing ? ':edit' : '')} data={read} visible={mode==='reader'}
-              focused={focus} editing={editing} busy={busy} cancel={()=>setEditing(false)}
+              focused={focus} editing={editing} busy={busy} footer={pdfFooter} scrollPosition={readerScroll} cancel={()=>setEditing(false)}
               beginEdit={()=>{resetSelection();setFocus('');setDeleteDocId('');setEditing(true);}}
               save={({content,positions,webNodes})=>void task(async()=>{
                 const {id,content:original} = read.document;
@@ -1175,7 +1277,7 @@ function App() {
             <p>在原文中选中词或短语，保存它在这个语境中的含义。以后点击标注即可回到语义组。</p>
             <button className="primary" onClick={()=>void task(importFile)}>导入第一篇文章</button></div>}
         </main>
-        {read?.document.pdf ? <div className="pdf-footer" ref={setPdfFooter}/> : null}
+        {read && !editing && <div className="pdf-footer" ref={setPdfFooter}/>}
         </div>
         {mode==='reader' && <aside className="inspector" aria-label="笔记">
           <button type="button" className="notes-toggle" aria-expanded={!notesCollapsed} aria-controls="reader-notes"
@@ -1721,7 +1823,7 @@ function HelpPage() {
 
     <section>
       <h2>1. 导入和阅读</h2>
-      <p>在「阅读器」左栏导入 Markdown、TXT 或 PDF 文件。PDF 最大 100 MB，保留原版式并逐页建立文字索引。没有文字层的页面会在本地做英文 OCR。也可以粘贴网页地址后导入。左栏搜索按标题或网址查找文章。</p>
+      <p>在「阅读器」左栏导入 Markdown、TXT、PDF 或 EPUB 文件。EPUB 按章节顺序导入正文。PDF 最大 100 MB，保留原版式并逐页建立文字索引。没有文字层的页面会在本地做英文 OCR。也可以粘贴网页地址后导入。左栏搜索按标题或网址查找文章。</p>
       <p>点击阅读区右下角的铅笔可以修改正文。未改动的标注会随文字移动，改到标注时会在保存前提示。编辑时沿用阅读版式，网页图片和来源链接会保留。</p>
       <p>按 <kbd>⌘F</kbd>（Mac）或 <kbd>Ctrl+F</kbd>（Windows）搜索当前文章，也可以点击右下角的放大镜。<kbd>Enter</kbd> 跳到下一处，<kbd>Shift+Enter</kbd> 跳到上一处，按 <kbd>Esc</kbd> 或点「关闭」收起搜索。</p>
     </section>

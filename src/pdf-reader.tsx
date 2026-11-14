@@ -1,3 +1,4 @@
+import {readerGestures} from './reader-gestures.js';
 import {pdfWordAt,matchNativePdfWords,type NativeWord} from './pdf-word.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import type {PDFDocumentProxy, PDFPageProxy} from 'pdfjs-dist';
@@ -186,6 +187,22 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
   const zoomPoint = useRef<{x:number;y:number}|undefined>(undefined);
   const lastJump = useRef('');
   const [pageDraft,setPageDraft] = useState<string|null>(null);
+  const bookmarkKey = `pdfBookmarks:${id}`;
+  const [bookmarks,setBookmarks] = useState<number[]>(()=>{
+    try {
+      const saved:unknown = JSON.parse(localStorage.getItem(bookmarkKey) ?? '[]');
+      return Array.isArray(saved) ? [...new Set(saved.filter(number=>Number.isSafeInteger(number) && number>0))] : [];
+    } catch { return []; }
+  });
+  const [bookmarkError,setBookmarkError] = useState('');
+  function toggleBookmark(number:number) {
+    const next = bookmarks.includes(number) ? bookmarks.filter(value=>value!==number)
+      : [...bookmarks,number].sort((a,b)=>a-b);
+    try {
+      localStorage.setItem(bookmarkKey,JSON.stringify(next));
+      setBookmarks(next);setBookmarkError('');
+    } catch { setBookmarkError('无法保存 PDF 书签');setOutlineOpen(true); }
+  }
   const [outlineOpen,setOutlineOpen] = useState(false);
   const [outline,setOutline] = useState<OutlineEntry[]|null>(null);
   const [outlineError,setOutlineError] = useState('');
@@ -206,7 +223,6 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
   const paper = useRef<HTMLDivElement>(null);
   const pageArea = useRef<HTMLDivElement>(null);
   const touch = useRef<{x:number;y:number}|null>(null);
-  const wheelGesture = useRef({time:0,distance:0,turned:false});
   const canvasHost = useRef<HTMLDivElement>(null);
   const textHost = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -516,58 +532,18 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
       return Number.isFinite(clientX) && Number.isFinite(clientY) &&
         surface.contains(document.elementFromPoint(clientX,clientY));
     }
-    function wheel(event:WheelEvent) {
-      if (event.ctrlKey) {
-        event.preventDefault();
-        if (pdf && overPdf(event) && pinch.current===null) {
-          setPdfZoom(requestedZoom.current*Math.exp(-event.deltaY*.012),{x:event.clientX,y:event.clientY});
-        }
-        return;
-      }
-      if (!pdf || !overPdf(event) || requestedZoom.current>1 ||
-          Math.abs(event.deltaX)<=Math.abs(event.deltaY)*1.25) return;
-      event.preventDefault();
-      const gesture = wheelGesture.current;
-      if (event.timeStamp-gesture.time>200) {
-        gesture.distance=0;gesture.turned=false;
-      }
-      gesture.time=event.timeStamp;
-      if (gesture.turned) return;
-      gesture.distance += event.deltaX * (event.deltaMode===1 ? 16 : event.deltaMode===2 ? surface.clientWidth : 1);
-      if (Math.abs(gesture.distance)>=80) {
-        gesture.turned=true;
-        turn(page+(gesture.distance>0 ? 1 : -1));
-      }
-    }
-    function startPinch(event:Event) {
-      event.preventDefault();
-      if (!pdf || !overPdf(event)) return;
-      clearTimeout(zoomTimer.current);
-      pinch.current=requestedZoom.current;
-    }
-    function changePinch(event:Event) {
-      event.preventDefault();
-      if (pinch.current===null) return;
-      const gesture = event as MouseEvent & {scale:number};
-      setPdfZoom(pinch.current*gesture.scale,{x:gesture.clientX,y:gesture.clientY});
-    }
-    function endPinch(event:Event) {
-      event.preventDefault();
-      if (pinch.current===null) return;
-      pinch.current=null;
-      commitZoom();
-    }
-    const capture = {capture:true,passive:false};
-    window.addEventListener('wheel',wheel,capture);
-    window.addEventListener('gesturestart',startPinch,capture);
-    window.addEventListener('gesturechange',changePinch,capture);
-    window.addEventListener('gestureend',endPinch,capture);
+    const listeners = new AbortController();
+    const gestures = readerGestures({
+      zoom:()=>requestedZoom.current, update:setPdfZoom,
+      turn:direction=>turn(page+direction), width:()=>surface.clientWidth,
+      canTurn:()=>requestedZoom.current<=1,
+      start:()=>{clearTimeout(zoomTimer.current);pinch.current=requestedZoom.current;},
+      end:()=>{pinch.current=null;commitZoom();},
+    });
+    gestures.bind(window,listeners.signal,event=>Boolean(pdf) && overPdf(event));
     return ()=>{
       pinch.current=null;
-      window.removeEventListener('wheel',wheel,true);
-      window.removeEventListener('gesturestart',startPinch,true);
-      window.removeEventListener('gesturechange',changePinch,true);
-      window.removeEventListener('gestureend',endPinch,true);
+      listeners.abort();
       if (viewport && previousViewport!==undefined) viewport.content=previousViewport;
     };
   },[visible,pdf,page]);
@@ -583,7 +559,11 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
   }}>
     {footer && ReactDOM.createPortal(<nav className="pdf-pagination" aria-label="PDF 翻页">
       <button className="pdf-outline-toggle" type="button" disabled={!pdf}
-        aria-expanded={outlineOpen} aria-controls="pdf-outline" onClick={()=>setOutlineOpen(!outlineOpen)}>目录</button>
+        aria-expanded={outlineOpen} aria-controls="pdf-outline" onClick={()=>setOutlineOpen(!outlineOpen)}>目录与书签</button>
+      <button type="button" disabled={!pdf} aria-pressed={bookmarks.includes(page)}
+        aria-label={bookmarks.includes(page) ? '删除本页书签' : '添加本页书签'}
+        title={bookmarks.includes(page) ? '删除本页书签' : '添加本页书签'}
+        onClick={()=>toggleBookmark(page)}>{bookmarks.includes(page) ? '★' : '☆'}</button>
       <button type="button" disabled={!pdf || page<=1} onClick={()=>turn(page-1)}
         aria-label="上一页" title="上一页（←）">‹</button>
       <form onSubmit={event=>{
@@ -624,7 +604,15 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
       <button type="button" disabled={!matches.length} onClick={()=>move(1)}>下一处</button>
       <button type="button" onClick={closeSearch}>关闭</button>
     </div>}
-    {outlineOpen && <aside id="pdf-outline" className="pdf-outline" aria-label="PDF 目录">
+    {outlineOpen && <aside id="pdf-outline" className="pdf-outline" aria-label="PDF 目录与书签">
+      <h3>书签</h3>
+      {bookmarkError && <p role="alert">{bookmarkError}</p>}
+      {bookmarks.length ? <ul>{bookmarks.filter(number=>number<=(pdf?.numPages ?? 0)).map(number=>
+        <li className="bookmark-row" key={number}>
+          <button type="button" aria-current={number===page ? 'page' : undefined} onClick={()=>turn(number)}>第 {number} 页</button>
+          <button type="button" aria-label={`删除第 ${number} 页书签`} onClick={()=>toggleBookmark(number)}>×</button>
+        </li>)}</ul> : <p className="muted">点击翻页栏的 ☆ 添加本页书签。</p>}
+      <h3>目录</h3>
       {outlineError && <p role="alert">{outlineError}</p>}
       {outline ? outline.length>0 ? <OutlineTree items={outline} open={destination=>void openOutline(destination)}/>
         : <p className="muted">这份 PDF 没有内置目录。</p>

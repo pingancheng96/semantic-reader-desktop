@@ -171,7 +171,8 @@ button.delete-document { color: #a22f29; }
 .pdf-frame:not([hidden]) { display: grid; grid-template-rows: minmax(0,1fr) auto; }
 .pdf-frame > .page { display: grid; grid-template-rows: auto minmax(0,1fr); min-height: 0; overflow: hidden; padding-top: .6rem; padding-bottom: 0; }
 .reader-title-bar { display: flex; align-items: center; justify-content: space-between; gap: .65rem; min-width: 0; }
-.reader-title-bar h1 { margin: 0; font-size: 1.05rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-heading { min-width: 0; }
+.reader-title-bar h1 { flex: 1 1 0; min-width: 0; margin: 0; font-size: 1.05rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reader-document-menu { position: relative; flex: none; }
 .reader-document-menu summary { list-style: none; padding: .1rem .55rem; border: 1px solid #cbd2c9; border-radius: 6px; background: #fffefa; cursor: pointer; }
 .reader-document-menu summary::-webkit-details-marker { display: none; }
@@ -282,3 +283,40 @@ button.delete-document { color: #a22f29; }
 .word-meaning h3 { margin: 0 0 .3rem; font-size: .9rem; }
 .word-meaning h3 small { margin-left: .35rem; font-weight: normal; }
 .word-meaning p { margin: 0; overflow-wrap: anywhere; }
+
+.pdf-outline li.bookmark-row {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) auto;
+  align-items: start;
+}
+.pdf-outline .bookmark-row button:last-child { width: auto; padding-inline: .55rem; }
+.text-reading-area { padding-bottom: 4rem; }
+.reader-frame:has(.text-reading-area) .reader-tools { bottom: 3rem; }
+.text-reader-toolbar button.reader-icon {
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+}
+.text-reader-toolbar { flex-wrap: wrap; }
+
+.rename-document { margin: .5rem 0; }
+.web-reading > section + section { margin-top: 2.25rem; }
+
+.epub-reading {
+  max-width: 66ch;
+  margin-inline: auto;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.epub-reading :is(h1,h2,h3,h4,h5,h6) {
+  line-height: 1.25;
+  margin-block: 1.25em .45em;
+}
+.epub-reading p { margin-block: 0 .8em; }
+.epub-reading blockquote { margin-inline: 1.2em; }
+.epub-reading > section + section { border-top: 1px solid #dce0d7; padding-top: 1.2rem; }
+
+.epub-native { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.epub-native-host { flex: 1; min-height: 0; min-width: 0; }
+.epub-native-host foliate-view { display: block; width: 100%; height: 100%; }
+.epub-search { max-height: 12rem; overflow: auto; }

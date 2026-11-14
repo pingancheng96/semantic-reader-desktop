@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod epub;
 mod kokoro;
 mod mdict;
 mod pronunciation;
@@ -261,7 +262,7 @@ async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Resul
     let database = state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(file) = app.dialog().file()
-            .add_filter("Markdown, TXT, PDF", &["md", "markdown", "txt", "pdf"])
+            .add_filter("Markdown, TXT, PDF, EPUB", &["md", "markdown", "txt", "pdf", "epub"])
             .blocking_pick_file() else { return Ok(Value::Null); };
         let path = file.into_path().map_err(|_| "请选择本地文件")?;
         let title = path.file_name().and_then(|name| name.to_str()).ok_or("文件名无效")?;
@@ -272,6 +273,13 @@ async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Resul
         let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
         let db = Db::open(&database)?;
         let id = match extension.as_str() {
+            "epub" => {
+                let mut bytes = Vec::new();
+                file.take(30_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                if bytes.len() > 30_000_000 { return Err("EPUB 文件最大 30 MB".into()); }
+                let (content, layout) = epub::read(std::io::Cursor::new(&bytes))?;
+                store::import_rich_text(&db, title, &content, &layout, &bytes)?
+            }
             "pdf" => {
                 if file.metadata().map_err(|e| e.to_string())?.len() > store::PDF_MAX_BYTES {
                     return Err("PDF 文件最大 100 MB".into());
@@ -287,7 +295,7 @@ async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Resul
                 let content = std::str::from_utf8(&bytes).map_err(|_| "请选择 UTF-8 文本文件")?;
                 store::import(&db, title, if extension == "txt" { "txt" } else { "md" }, content)?
             }
-            _ => return Err("请选择 Markdown、TXT 或 PDF 文件".into()),
+            _ => return Err("请选择 Markdown、TXT、PDF 或 EPUB 文件".into()),
         };
         Ok(serde_json::json!({"id":id,"title":title}))
     }).await.map_err(|_| "导入文件失败")?

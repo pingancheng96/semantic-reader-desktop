@@ -23,3 +23,4 @@ await mkdir('dist/ort', {recursive:true});
 for (const name of ['ort.wasm.min.mjs','ort-wasm-simd-threaded.mjs','ort-wasm-simd-threaded.wasm']) {
   await copyFile('node_modules/onnxruntime-web/dist/'+name,'dist/ort/'+name);
 }
+await cp('vendor/foliate','dist/foliate',{recursive:true});

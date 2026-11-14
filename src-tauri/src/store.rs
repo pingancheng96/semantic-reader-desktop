@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose::STANDARD, Engine};
+
 use crate::{
     sqlite::{Db, Result},
     tags,
@@ -39,7 +41,11 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
         }
         migrate_context_meaning(db)?;
         migrate_pdf(db)
-    })
+    })?;
+    db.batch("CREATE TABLE IF NOT EXISTS epub_files (
+        document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+        data TEXT NOT NULL
+    );")
 }
 
 fn migrate_context_meaning(db: &Db) -> Result<()> {
@@ -364,6 +370,16 @@ pub fn import(db: &Db, title: &str, format: &str, content: &str) -> Result<V> {
     insert_document(db, title, format, content, None, V::Null)
 }
 
+pub fn import_rich_text(db: &Db, title: &str, content: &str, layout: &crate::web_layout::Layout, original: &[u8]) -> Result<V> {
+    let layout = serde_json::to_string(layout).map_err(|_| "无法保存 EPUB 版式")?;
+    if layout.len() > crate::web_layout::MAX_LAYOUT_BYTES { return Err("EPUB 版式数据过大".into()); }
+    db.transaction(|| {
+        let id = insert_document(db, title, "txt", content, None, json!(layout))?;
+        db.write("INSERT INTO epub_files VALUES(?1,?2)", &[id.clone(), json!(STANDARD.encode(original))])?;
+        Ok(id)
+    })
+}
+
 pub fn import_web(db: &Db, page: crate::web_import::Page) -> Result<V> {
     let layout = page
         .layout
@@ -452,7 +468,7 @@ fn insert_document(
         || title.chars().count() > 255
         || !matches!(format, "md" | "txt")
         || content.trim().is_empty()
-        || content.len() > 2_000_000
+        || content.len() > if layout.is_null() || source.is_some() { 2_000_000 } else { crate::epub::TEXT_LIMIT }
         || content.contains('\0')
     {
         return Err("请选择非空 UTF-8 Markdown/TXT 文件（最大 2 MB）".into());
@@ -538,13 +554,14 @@ fn edit_document(db: &Db, p: &V) -> Result<V> {
     if !db.query("SELECT 1 FROM pdf_files WHERE document_id=?1", args)?.is_empty() {
         return Err("原版式 PDF 不支持编辑正文".into());
     }
-    let old = db.one("SELECT content,web_layout FROM documents WHERE id=?1", args)?;
+    let old = db.one("SELECT content,web_layout,source_url FROM documents WHERE id=?1", args)?;
     if old["content"] != p["original"] {
         return Err("文章已更新，请重新打开后编辑".into());
     }
+    let limit = if old["web_layout"].is_string() && old["source_url"].is_null() { crate::epub::TEXT_LIMIT } else { 2_000_000 };
     let content = p["content"].as_str()
-        .filter(|s| !s.trim().is_empty() && s.len() <= 2_000_000 && !s.contains('\0'))
-        .ok_or("正文不能为空，且最大为 2 MB")?;
+        .filter(|s| !s.trim().is_empty() && s.len() <= limit && !s.contains('\0'))
+        .ok_or_else(|| format!("正文不能为空，且最大为 {} MB", limit / 1_000_000))?;
     if old["content"] == content {
         return Ok(json!(0));
     }
@@ -568,7 +585,7 @@ fn edit_document(db: &Db, p: &V) -> Result<V> {
     }
 
     // Vacate the old ranges before moving marks to avoid collisions with their unique index.
-    db.query("UPDATE occurrences SET start=start+2000001,end=end+2000001 WHERE document_id=?1", args)?;
+    db.query("UPDATE occurrences SET start=start+?2,end=end+?2 WHERE document_id=?1", &[key.clone(), json!(limit + 1)])?;
     let mut previous_end = 0;
     let mut previous_byte = 0;
     let mut removed = 0;
@@ -583,7 +600,7 @@ fn edit_document(db: &Db, p: &V) -> Result<V> {
             continue;
         }
         let surface = mark["surface"].as_str().unwrap();
-        let start = position["start"].as_u64().filter(|n| *n <= 2_000_000)
+        let start = position["start"].as_u64().filter(|n| *n <= limit as u64)
             .ok_or("标注位置无效")? as usize;
         let end = start + surface.encode_utf16().count();
         let gap = start.checked_sub(previous_end).ok_or("标注顺序无效")?;
@@ -1263,6 +1280,7 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
             "web_layout",
         ],
     ),
+    ("epub_files", &["document_id", "data"]),
     ("pdf_files", &["document_id", "data"]),
     ("pdf_pages", &["document_id", "page", "offset", "text", "layer"]),
     ("semantic_groups", &["id", "name", "description"]),
@@ -1342,6 +1360,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
         if table == "tag_scopes" && p["version"].as_u64().unwrap_or(0) < 6 {
             continue;
         }
+        if table == "epub_files" && p[table].is_null() { continue; }
         let rows = p[table]
             .as_array()
             .ok_or_else(|| format!("导出缺少 {table}"))?;
@@ -1402,6 +1421,11 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                             _ => Err("导出中的网页地址无效".into()),
                         };
                     }
+                    if table == "epub_files" && col == "data" {
+                        return row[col].as_str().filter(|text| text.len() <= 40_000_000)
+                            .filter(|text| STANDARD.decode(text).is_ok())
+                            .map(|text| json!(text)).ok_or_else(|| "EPUB 备份文件无效".into());
+                    }
                     if matches!(table, "pdf_files" | "pdf_pages") {
                         let limit = match col { "data" => 133_333_336, "layer" => 12_000_000, _ => 2_000_000 };
                         return row[col].as_str().filter(|value| value.len() <= limit && !value.contains('\0'))
@@ -1411,7 +1435,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                         let text = row[col]
                             .as_str()
                             .filter(|s| {
-                                s.len() <= 2_000_000 && !s.contains('\0') && (!s.trim().is_empty()
+                                s.len() <= crate::epub::TEXT_LIMIT && !s.contains('\0') && (!s.trim().is_empty()
                                     || p["pdf_files"].as_array().is_some_and(|rows|
                                         rows.iter().any(|pdf| pdf["document_id"] == row["id"])))
                             })
@@ -1489,7 +1513,7 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
         }
         "document" => {
             let key = id(p, "id")?;
-            let doc = db.one("SELECT documents.*,EXISTS(SELECT 1 FROM pdf_files WHERE document_id=id) AS pdf FROM documents WHERE id=?1", &[key.clone()])?;
+            let doc = db.one("SELECT documents.*,EXISTS(SELECT 1 FROM pdf_files WHERE document_id=id) AS pdf,EXISTS(SELECT 1 FROM epub_files WHERE document_id=id) AS epub FROM documents WHERE id=?1", &[key.clone()])?;
             let marks = db.query(
                 &format!("{MARKS} WHERE o.document_id=?1 ORDER BY o.start"),
                 &[key],
@@ -1572,6 +1596,16 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             db.batch("DELETE FROM operation_history")?;
             Ok(V::Null)
         }),
+        "epub_original" => {
+            Ok(db.one("SELECT data FROM epub_files WHERE document_id=?1", &[id(p, "id")?])?["data"].clone())
+        }
+        "document_rename" => {
+            let key = id(p, "id")?;
+            let title = field(p, "title", 255, true)?;
+            if title.chars().any(char::is_control) { return Err("标题只能为单行文字".into()); }
+            db.write("UPDATE documents SET title=?1 WHERE id=?2", &[json!(title), key])?;
+            Ok(json!(title))
+        }
         "document_edit" => db.transaction(|| edit_document(db, p)),
         "sense_merge_options" => Ok(json!(db.query(
             "SELECT s.id,s.meaning,g.name AS group_name,
