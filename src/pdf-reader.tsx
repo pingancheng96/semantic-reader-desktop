@@ -1,9 +1,11 @@
+import {ReaderToolbar} from './reader-toolbar.js';
+import {ReaderNavigation, readReaderPreference, saveReaderPreference, type ReaderNavigationState} from './reader-navigation.js';
 import {readerGestures} from './reader-gestures.js';
 import {pdfWordAt,matchNativePdfWords,type NativeWord} from './pdf-word.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import type {PDFDocumentProxy, PDFPageProxy} from 'pdfjs-dist';
 import type {Worker} from 'tesseract.js';
-import {React, ReactDOM, call, readPdfRange} from './runtime.js';
+import {React, call, readPdfRange} from './runtime.js';
 import {articleMatches, selectedOffsets} from './reading.js';
 const {useEffect,useMemo,useRef,useState} = React;
 
@@ -16,7 +18,7 @@ function pdfEngine() {
   });
   return engine;
 }
-async function loadPdf(id:string, length:number, onError:(error:unknown)=>void) {
+export async function loadPdf(id:string, length:number, onError:(error:unknown)=>void) {
   const pdf = await pdfEngine();
   const chunkSize = 256 * 1024;
   const initial = await readPdfRange(id,0,Math.min(chunkSize,length));
@@ -69,7 +71,7 @@ function combine(parts:string[]) {
   return {text,offsets};
 }
 
-async function renderPage(page:PDFPageProxy, scale:number, pixels=1, signal?:AbortSignal) {
+export async function renderPage(page:PDFPageProxy, scale:number, pixels=1, signal?:AbortSignal) {
   const viewport = page.getViewport({scale});
   const canvas = document.createElement('canvas');
   canvas.width = Math.ceil(viewport.width*pixels);
@@ -171,13 +173,19 @@ function pageHighlights(layer:HTMLElement, offset:number, native:Map<number,PdfW
   });
 }
 
-export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,footer,onMark,onSelect,onClearSelection}: {
-  id:string;marks:M[];focused:string;selection:Selection|null;visible:boolean;footer:HTMLElement|null;onMark:(mark:M)=>void;
+export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,toolbar,navigation,onMark,onSelect,onClearSelection}: {
+  id:string;marks:M[];focused:string;selection:Selection|null;visible:boolean;toolbar:HTMLElement|null;navigation:ReaderNavigationState;onMark:(mark:M)=>void;
   onSelect:(selection:Selection,doubleClick:boolean)=>void;onClearSelection:()=>void;
 }) {
   const [pdf,setPdf] = useState<PDFDocumentProxy|null>(null);
   const [pages,setPages] = useState<IndexedPage[]>([]);
+  const positionKey = `pdfReadingPosition:${id}`;
   const [page,setPage] = useState(1);
+  useEffect(()=>{
+    if (!pdf) return;
+    saveReaderPreference(positionKey,String(page));
+    saveReaderPreference(`readingProgress:${id}`,`第 ${page} / ${pdf.numPages} 页`);
+  },[pdf,page,id,positionKey]);
   const [zoom,setZoom] = useState(1);
   const requestedZoom = useRef(1);
   const paintedZoom = useRef(1);
@@ -201,9 +209,8 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
     try {
       localStorage.setItem(bookmarkKey,JSON.stringify(next));
       setBookmarks(next);setBookmarkError('');
-    } catch { setBookmarkError('无法保存 PDF 书签');setOutlineOpen(true); }
+    } catch { setBookmarkError('无法保存 PDF 书签');navigation.showBookmarks(); }
   }
-  const [outlineOpen,setOutlineOpen] = useState(false);
   const [outline,setOutline] = useState<OutlineEntry[]|null>(null);
   const [outlineError,setOutlineError] = useState('');
   const outlineRequest = useRef(0);
@@ -239,11 +246,17 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
         task = await loadPdf(id,saved.length,error=>{if (!cancelled) setError('无法读取 PDF · '+String(error));});
         if (cancelled) {await task.destroy();return;}
         const loaded = await task.promise;
-        if (!cancelled) {savedPages.current=saved.pages;setPages(saved.pages);setPdf(loaded);}
+        if (!cancelled) {
+          const savedPage = Number(readReaderPreference(positionKey));
+          setPage(Number.isSafeInteger(savedPage) && savedPage>=1 && savedPage<=loaded.numPages ? savedPage : 1);
+          savedPages.current=saved.pages;
+          setPages(saved.pages);
+          setPdf(loaded);
+        }
       } catch (error) {if (!cancelled) setError('无法打开 PDF · '+String(error));}
     })();
     return ()=>{cancelled=true;void task?.destroy();};
-  },[id]);
+  },[id,positionKey]);
 
   useEffect(()=>{
     if (!pdf) return;
@@ -492,14 +505,14 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
     pageArea.current?.scrollTo({top:0,left:0});
   }
   useEffect(()=>{
-    if (!pdf || !outlineOpen || outline) return;
+    if (!pdf || !navigation.open || outline) return;
     let cancelled = false;
     void pdf.getOutline().then(
       result=>{if (!cancelled) {setOutline(result ?? []);setOutlineError('');}},
       ()=>{if (!cancelled) setOutlineError('无法读取 PDF 目录');}
     );
     return ()=>{cancelled=true;};
-  },[pdf,outlineOpen,outline]);
+  },[pdf,navigation.open,outline]);
 
   async function openOutline(destination:string|unknown[]) {
     if (!pdf) return;
@@ -549,7 +562,7 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
   },[visible,pdf,page]);
 
   const move = (step:number) => {if(matches.length) setMatch((match+step+matches.length)%matches.length);};
-  return <div ref={frame} className={outlineOpen ? 'pdf-reader has-outline' : 'pdf-reader'} tabIndex={0} onKeyDown={event=>{
+  return <div ref={frame} className={navigation.open ? 'pdf-reader has-outline' : 'pdf-reader'} tabIndex={0} onKeyDown={event=>{
     if (event.nativeEvent.isComposing || event.altKey || event.metaKey || event.ctrlKey || event.shiftKey ||
         (event.target instanceof HTMLElement && event.target.closest('input,textarea,select,[contenteditable],.article-search'))) return;
     if (event.key==='ArrowLeft' || event.key==='ArrowRight') {
@@ -557,16 +570,11 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
       turn(page+(event.key==='ArrowRight' ? 1 : -1));
     }
   }}>
-    {footer && ReactDOM.createPortal(<nav className="pdf-pagination" aria-label="PDF 翻页">
-      <button className="pdf-outline-toggle" type="button" disabled={!pdf}
-        aria-expanded={outlineOpen} aria-controls="pdf-outline" onClick={()=>setOutlineOpen(!outlineOpen)}>目录与书签</button>
-      <button type="button" disabled={!pdf} aria-pressed={bookmarks.includes(page)}
-        aria-label={bookmarks.includes(page) ? '删除本页书签' : '添加本页书签'}
-        title={bookmarks.includes(page) ? '删除本页书签' : '添加本页书签'}
-        onClick={()=>toggleBookmark(page)}>{bookmarks.includes(page) ? '★' : '☆'}</button>
-      <button type="button" disabled={!pdf || page<=1} onClick={()=>turn(page-1)}
-        aria-label="上一页" title="上一页（←）">‹</button>
-      <form onSubmit={event=>{
+    <ReaderToolbar target={toolbar} disabled={!pdf} zoom={zoom} changeZoom={setPdfZoom} resetLabel="适合宽度"
+      bookmark={{active:bookmarks.includes(page),disabled:!pdf,toggle:()=>toggleBookmark(page)}}
+      previousDisabled={!pdf || page<=1} nextDisabled={!pdf || page>=pdf.numPages}
+      previous={()=>turn(page-1)} next={()=>turn(page+1)}
+      pageIndicator={<form onSubmit={event=>{
         event.preventDefault();
         const number = Number(pageDraft ?? page);
         if (Number.isInteger(number)) turn(number);
@@ -576,18 +584,7 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
           value={pageDraft ?? String(page)} onFocus={event=>event.currentTarget.select()}
           onChange={event=>setPageDraft(event.target.value)} onBlur={()=>setPageDraft(null)}/>
         <span>/ {pdf?.numPages ?? '…'} 页</span>
-      </form>
-      <button type="button" disabled={!pdf || page>=pdf.numPages} onClick={()=>turn(page+1)}
-        aria-label="下一页" title="下一页（→）">›</button>
-      <div className="pdf-zoom" role="group" aria-label="PDF 缩放">
-        <button type="button" disabled={!pdf || zoom<=.5} onClick={()=>setPdfZoom(requestedZoom.current-.25)}
-          aria-label="缩小" title="缩小">−</button>
-        <button className="pdf-zoom-fit" type="button" disabled={!pdf} onClick={()=>setPdfZoom(1)}
-          aria-label="适合宽度" title="适合宽度">{Math.round(zoom*100)}%</button>
-        <button type="button" disabled={!pdf || zoom>=3} onClick={()=>setPdfZoom(requestedZoom.current+.25)}
-          aria-label="放大" title="放大">+</button>
-      </div>
-    </nav>,footer)}
+      </form>}/>
     {find && <div className="article-search" role="search" aria-label="文章内搜索" onKeyDown={event=>{
       if (event.key==='Escape' && !event.nativeEvent.isComposing) {
         event.preventDefault();closeSearch();
@@ -604,20 +601,19 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,fo
       <button type="button" disabled={!matches.length} onClick={()=>move(1)}>下一处</button>
       <button type="button" onClick={closeSearch}>关闭</button>
     </div>}
-    {outlineOpen && <aside id="pdf-outline" className="pdf-outline" aria-label="PDF 目录与书签">
-      <h3>书签</h3>
+    {navigation.open && <ReaderNavigation navigation={navigation} bookmarks={<>
       {bookmarkError && <p role="alert">{bookmarkError}</p>}
       {bookmarks.length ? <ul>{bookmarks.filter(number=>number<=(pdf?.numPages ?? 0)).map(number=>
         <li className="bookmark-row" key={number}>
           <button type="button" aria-current={number===page ? 'page' : undefined} onClick={()=>turn(number)}>第 {number} 页</button>
           <button type="button" aria-label={`删除第 ${number} 页书签`} onClick={()=>toggleBookmark(number)}>×</button>
-        </li>)}</ul> : <p className="muted">点击翻页栏的 ☆ 添加本页书签。</p>}
-      <h3>目录</h3>
+        </li>)}</ul> : <p className="muted">点击标题行的 ☆ 添加本页书签。</p>}
+    </>} contents={<>
       {outlineError && <p role="alert">{outlineError}</p>}
       {outline ? outline.length>0 ? <OutlineTree items={outline} open={destination=>void openOutline(destination)}/>
         : <p className="muted">这份 PDF 没有内置目录。</p>
         : !outlineError && <p role="status">正在读取目录…</p>}
-    </aside>}
+    </>}/>}
     <div ref={pageArea} className="pdf-page-area" onClick={event=>{
       if (event.target instanceof Node && paper.current?.contains(event.target)) return;
       if (selection?.document_id===id) onClearSelection();

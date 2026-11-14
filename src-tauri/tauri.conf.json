@@ -1,6 +1,6 @@
 {
   "productName": "Semantic Reader",
-  "version": "0.20.23",
+  "version": "0.20.24",
   "identifier": "local.semanticreader.desktop",
   "build": {"frontendDist": "../dist"},
   "app": {

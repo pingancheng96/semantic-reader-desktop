@@ -10,6 +10,7 @@ mod pdf_geometry;
 mod sqlite;
 mod store;
 mod tags;
+mod updates;
 mod web_import;
 mod web_layout;
 
@@ -24,6 +25,9 @@ struct Database(PathBuf);
 async fn request(state: State<'_, Database>, op: String, payload: Value) -> Result<Value> {
     let path = state.0.clone();
     match op.as_str() {
+        "update_info" => Ok(updates::info()),
+        "update_check" => updates::check().await,
+        "update_open_link" => updates::open_link(payload["url"].as_str().unwrap_or_default()),
         "kokoro_status" => {
             let installed = |variant: kokoro::Variant| {
                 kokoro::installed(&path.with_file_name(variant.directory()), variant)

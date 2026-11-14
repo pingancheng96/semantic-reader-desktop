@@ -404,7 +404,7 @@ pub fn import_web(db: &Db, page: crate::web_import::Page) -> Result<V> {
 
 pub fn image_repair_snapshot(db: &Db, p: &V) -> Result<V> {
     let row = db.one(
-        "SELECT source_url,content,web_layout FROM documents WHERE id=?1",
+        "SELECT source_url,web_layout FROM documents WHERE id=?1",
         &[id(p, "id")?],
     )?;
     if !row["source_url"].is_string() {
@@ -414,34 +414,29 @@ pub fn image_repair_snapshot(db: &Db, p: &V) -> Result<V> {
 }
 
 pub fn seed_saved_images(page: &mut crate::web_import::Page, snapshot: &V) -> Result<()> {
-    if snapshot["content"] != page.content {
-        return Err("网页正文与导入时不同，现有文章和标注已保留。".into());
-    }
     let layout = page.layout.as_mut().ok_or("该地址没有可读取的网页版式")?;
-    if let Some(raw) = snapshot["web_layout"].as_str() {
-        let previous = serde_json::from_str(raw).map_err(|_| "旧网页版式数据无效")?;
-        layout.keep_saved_images(&previous)?;
-    }
+    let previous = saved_image_layout(snapshot)?;
+    layout.check_image_sequence(&previous)?;
+    layout.images = previous.images;
     Ok(())
+}
+
+fn saved_image_layout(row: &V) -> Result<crate::web_layout::Layout> {
+    let raw = row["web_layout"].as_str().ok_or("这篇文档没有保存网页版式")?;
+    serde_json::from_str(raw).map_err(|_| "旧网页版式数据无效".into())
 }
 
 pub fn repair_images(db: &Db, p: &V, source: &str, page: crate::web_import::Page) -> Result<V> {
     let key = id(p, "id")?;
-    let mut layout = page.layout.ok_or("该地址没有可读取的网页版式")?;
+    let downloaded = page.layout.ok_or("该地址没有可读取的网页版式")?;
     db.transaction(|| {
         let args = std::slice::from_ref(&key);
-        let old = db.one(
-            "SELECT source_url,content,web_layout FROM documents WHERE id=?1",
-            args,
-        )?;
-        if old["source_url"] != source || old["content"] != page.content {
-            return Err("网页正文与导入时不同，无法安全补图。现有文章和标注已保留。".into());
+        let old = db.one("SELECT source_url,web_layout FROM documents WHERE id=?1", args)?;
+        if old["source_url"] != source {
+            return Err("文档的网页来源已变化，请重新尝试。".into());
         }
-        if let Some(raw) = old["web_layout"].as_str() {
-            let previous = serde_json::from_str(raw).map_err(|_| "旧网页版式数据无效")?;
-            layout.keep_saved_images(&previous)?;
-        }
-        layout.cap_images();
+        let mut layout = saved_image_layout(&old)?;
+        layout.fill_missing_images(downloaded)?;
         let saved = layout.images.iter().filter(|image| image.is_some()).count();
         let missing = layout.images.len() - saved;
         let data = serde_json::to_string(&layout).map_err(|_| "无法保存补图结果")?;
@@ -1504,7 +1499,7 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
     match op {
         "list" => {
             let q = field(p, "q", 200, false)?;
-            let docs = db.query("SELECT id,title,format,source_url FROM documents WHERE instr(lower(title),lower(?1))>0 OR instr(lower(coalesce(source_url,'')),lower(?1))>0 ORDER BY created_at DESC, rowid DESC",&[json!(q)])?;
+            let docs = db.query("SELECT id,title,CASE WHEN EXISTS(SELECT 1 FROM pdf_files WHERE document_id=documents.id) THEN 'pdf' WHEN EXISTS(SELECT 1 FROM epub_files WHERE document_id=documents.id) THEN 'epub' ELSE format END AS format,source_url FROM documents WHERE instr(lower(title),lower(?1))>0 OR instr(lower(coalesce(source_url,'')),lower(?1))>0 ORDER BY created_at DESC, rowid DESC",&[json!(q)])?;
             let undo = db.one(
                 "SELECT EXISTS(SELECT 1 FROM operation_history) AS available",
                 &[],
@@ -1519,6 +1514,25 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
                 &[key],
             )?;
             Ok(json!({"document":doc,"marks":marks}))
+        }
+        "web_cover" => {
+            use crate::web_layout::Node;
+            fn first_image<'a>(nodes: &[Node], images: &'a [Option<String>]) -> Option<&'a String> {
+                nodes.iter().find_map(|node| match node {
+                    Node::Image { index, .. } => images.get(*index).and_then(Option::as_ref),
+                    Node::Element { children, .. } => first_image(children, images),
+                    Node::Text { .. } => None,
+                })
+            }
+            let row = db.one(
+                "SELECT source_url,web_layout FROM documents WHERE id=?1",
+                &[id(p, "id")?],
+            )?;
+            if !row["source_url"].is_string() || !row["web_layout"].is_string() {
+                return Ok(V::Null);
+            }
+            let layout = saved_image_layout(&row)?;
+            Ok(json!(first_image(&layout.nodes, &layout.images)))
         }
         "pdf_load" => {
             let key = id(p, "id")?;
@@ -2259,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_images_keeps_saved_images_and_annotations_and_rejects_changed_text() {
+    fn repair_images_keeps_saved_images_and_edited_text_and_annotations() {
         use crate::web_layout::{Layout, Node};
         let db = memory();
         let content = "They plunged.";
@@ -2296,17 +2310,20 @@ mod tests {
         assert!(pending.layout.as_ref().unwrap().images[0].is_some());
         assert!(pending.layout.as_ref().unwrap().images[1].is_none());
 
-        assert!(repair_images(
-            &db,
-            &params,
-            url,
-            page("Changed", vec![None, Some(png.clone())])
-        )
-        .is_err());
+        let mut changed_page = page("Different website text", vec![None, Some(png.clone())]);
+        let layout = changed_page.layout.as_mut().unwrap();
+        layout.nodes[1] = Node::Text { start: 0, end: 22 };
+        seed_saved_images(&mut changed_page, &snapshot).unwrap();
+        changed_page.layout.as_mut().unwrap().images[1] = Some(png);
         assert_eq!(
-            repair_images(&db, &params, url, page(content, vec![None, Some(png)])).unwrap(),
+            repair_images(&db, &params, url, changed_page).unwrap(),
             json!({"saved":2,"missing":0})
         );
+        let after = image_repair_snapshot(&db, &params).unwrap();
+        let before_layout: V = serde_json::from_str(snapshot["web_layout"].as_str().unwrap()).unwrap();
+        let after_layout: V = serde_json::from_str(after["web_layout"].as_str().unwrap()).unwrap();
+        assert_eq!(after_layout["nodes"], before_layout["nodes"]);
+        assert_eq!(after_layout["images"][0], before_layout["images"][0]);
         let read = run(&db, "document", &params).unwrap();
         assert_eq!(read["document"]["content"], content);
         assert_eq!(read["marks"][0]["id"], mark);

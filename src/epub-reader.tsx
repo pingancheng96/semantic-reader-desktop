@@ -1,11 +1,13 @@
+import {ReaderToolbar} from './reader-toolbar.js';
+import {ReaderNavigation, readReaderPreference, saveReaderPreference, type ReaderNavigationState} from './reader-navigation.js';
 import {readerGestures} from './reader-gestures.js';
-import {React, ReactDOM, call} from './runtime.js';
+import {React, call} from './runtime.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import type {WebNode} from './web-captions.js';
 
 const {useEffect,useRef,useState} = React;
 type Toc = {label:string;href:string;subitems?:Toc[]};
-type Location = {cfi:string;tocItem?:Toc};
+type Location = {cfi:string;tocItem?:Toc;fraction?:number};
 type View = HTMLElement & {
   open(file:File):Promise<void>; init(options:object):Promise<void>; close():void;
   isFixedLayout?:boolean;
@@ -52,8 +54,8 @@ function align(doc:Document, content:string, start:number, end:number):Anchor[] 
   return anchors;
 }
 
-export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visible,footer,onSelect,onMark}:{
-  id:string;content:string;layout:string;marks:M[];focused:string;visible:boolean;footer:HTMLElement|null;
+export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visible,toolbar,navigation,onSelect,onMark}:{
+  id:string;content:string;layout:string;marks:M[];focused:string;visible:boolean;toolbar:HTMLElement|null;navigation:ReaderNavigationState;
   onSelect:(selection:{document_id:string;surface:string;start:number;end:number},double:boolean)=>void;onMark:(mark:M)=>void;
 }) {
   const host=useRef<HTMLDivElement>(null);
@@ -92,7 +94,7 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
   const [ready,setReady]=useState(false);
   const [error,setError]=useState('');
   const [toc,setToc]=useState<Toc[]>([]);
-  const [outline,setOutline]=useState(false);
+  const positionKey = `epubReadingPosition:${id}`;
   const [location,setLocation]=useState<Location|null>(null);
   const [revision,setRevision]=useState(0);
   const key=`epubBookmarks:${id}`;
@@ -148,7 +150,14 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
       view.current=renderer;host.current?.append(renderer);
       renderer.addEventListener('external-link',event=>event.preventDefault());
       renderer.addEventListener('relocate',event=>{
-        if (alive) setLocation((event as CustomEvent<Location>).detail);
+        if (alive) {
+          const current = (event as CustomEvent<Location>).detail;
+          setLocation(current);
+          if (current.cfi) saveReaderPreference(positionKey,current.cfi);
+          const percent = typeof current.fraction==='number' ? `${Math.round(current.fraction*100)}%` : '';
+          const progress = [current.tocItem?.label,percent].filter(Boolean).join(' · ');
+          if (progress) saveReaderPreference(`readingProgress:${id}`,progress);
+        }
       });
       const attached = new WeakSet<Document>();
       const selectionReaders = new WeakMap<Document,()=>void>();
@@ -294,11 +303,11 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
       await renderer.open(new File([bytes], 'book.epub',{type:'application/epub+zip'}));
       if (!alive) {renderer.close();return;}
       setToc(renderer.book.toc ?? []);
-      await renderer.init({});
+      await renderer.init({lastLocation:readReaderPreference(positionKey)});
       if (alive) setReady(true);
     })().catch(()=>{if(alive)setError('无法打开原版 EPUB');});
     return ()=>{alive=false;listeners.abort();window.clearInterval(poll);searchVersion.current++;renderer?.close();renderer?.remove();view.current=null;sections.current.clear();overlays.current.clear();};
-  },[id,content,layout]);
+  },[id,content,layout,positionKey]);
 
   useEffect(()=>{
     const reader=view.current;
@@ -353,30 +362,21 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
     </li>)}</ul>;
   }
   const saved=bookmarks.some(item=>item.cfi===location?.cfi);
-  return <div className={outline ? 'pdf-reader has-outline' : 'pdf-reader'}>
-    {footer && ReactDOM.createPortal(<nav className="pdf-pagination" aria-label="EPUB 导航">
-      <button className="pdf-outline-toggle" onClick={()=>setOutline(!outline)} aria-expanded={outline}>目录与书签</button>
-      <button disabled={!location} aria-label={saved?'删除当前位置书签':'添加当前位置书签'} onClick={()=>{
+  return <div className={navigation.open ? 'pdf-reader has-outline' : 'pdf-reader'}>
+    <ReaderToolbar target={toolbar} disabled={!ready} zoom={zoom} changeZoom={changeZoom}
+      bookmark={{active:saved,disabled:!location,toggle:()=>{
         if (location) saveBookmarks(saved ? bookmarks.filter(item=>item.cfi!==location.cfi) :
           [...bookmarks,{cfi:location.cfi,label:location.tocItem?.label || `书签 ${bookmarks.length+1}`}]);
-      }}>{saved?'★':'☆'}</button>
-      <button disabled={!ready} aria-label="上一页" onClick={()=>navigate(()=>view.current!.prev())}>‹</button>
-      <button disabled={!ready} aria-label="下一页" onClick={()=>navigate(()=>view.current!.next())}>›</button>
-      <div className="pdf-zoom" role="group" aria-label="EPUB 缩放">
-        <button type="button" disabled={!ready || zoom<=.5} aria-label="缩小" onClick={()=>changeZoom(zoom-.25)}>−</button>
-        <button className="pdf-zoom-fit" type="button" disabled={!ready} aria-label="重置缩放" onClick={()=>changeZoom(1)}>{Math.round(zoom*100)}%</button>
-        <button type="button" disabled={!ready || zoom>=3} aria-label="放大" onClick={()=>changeZoom(zoom+.25)}>＋</button>
-      </div>
-      <button disabled={!ready} aria-label="书内搜索" onClick={()=>setSearchOpen(!searchOpen)}>⌕</button>
-    </nav>,footer)}
-    {outline && <aside className="pdf-outline" aria-label="目录与书签">
-      <h3>书签</h3>
+      }}}
+      previous={()=>navigate(()=>view.current!.prev())} next={()=>navigate(()=>view.current!.next())}>
+      <button type="button" disabled={!ready} aria-label="书内搜索" onClick={()=>setSearchOpen(!searchOpen)}>⌕</button>
+    </ReaderToolbar>
+    {navigation.open && <ReaderNavigation navigation={navigation} bookmarks={<>
       {bookmarks.length ? <ul>{bookmarks.map(item=><li key={item.cfi} className="bookmark-row">
         <button onClick={()=>navigate(()=>view.current!.goTo(item.cfi))}>{item.label}</button>
         <button aria-label={`删除书签：${item.label}`} onClick={()=>saveBookmarks(bookmarks.filter(other=>other.cfi!==item.cfi))}>×</button>
-      </li>)}</ul> : <p>点击底栏的 ☆ 添加书签。</p>}
-      <h3>目录</h3>{toc.length ? renderToc(toc) : <p>这本书没有内置目录。</p>}
-    </aside>}
+      </li>)}</ul> : <p>点击标题行的 ☆ 添加书签。</p>}
+    </>} contents={toc.length ? renderToc(toc) : <p>这本书没有内置目录。</p>}/>}
     <div className="epub-native">
       {error && <p role="alert">{error}</p>}
       {!ready && !error && <p role="status">正在打开 EPUB…</p>}

@@ -300,62 +300,46 @@ pub fn image_uri(bytes: &[u8]) -> Option<String> {
 }
 
 impl Layout {
-    fn anchors(&self) -> Vec<Vec<(usize, String)>> {
-        fn walk(nodes: &[Node], end: &mut usize, anchors: &mut [Vec<(usize, String)>]) {
+    fn image_sequence(&self) -> Vec<(usize, &str)> {
+        fn walk<'a>(nodes: &'a [Node], images: &mut Vec<(usize, &'a str)>) {
             for node in nodes {
                 match node {
-                    Node::Text { end: next, .. } => *end = *next,
-                    Node::Element { children, .. } => walk(children, end, anchors),
-                    Node::Image { index, alt } => {
-                        if let Some(slot) = anchors.get_mut(*index) {
-                            slot.push((*end, alt.clone()));
-                        }
-                    }
+                    Node::Text { .. } => {}
+                    Node::Element { children, .. } => walk(children, images),
+                    Node::Image { index, alt } => images.push((*index, alt)),
                 }
             }
         }
-        let mut anchors = vec![Vec::new(); self.images.len()];
-        walk(&self.nodes, &mut 0, &mut anchors);
-        anchors
+        let mut images = Vec::new();
+        walk(&self.nodes, &mut images);
+        images
     }
 
-    pub fn keep_saved_images(&mut self, old: &Layout) -> Result<()> {
-        let current = self.anchors();
-        let previous = old.anchors();
-        let mut keep = vec![false; self.images.len()];
-        let mut available = MAX_IMAGE_DATA;
-        for (index, data) in old.images.iter().enumerate() {
-            let Some(data) = data else {
-                continue;
-            };
-            let anchor = &previous[index];
-            let mut matches = current
-                .iter()
-                .enumerate()
-                .filter(|(_, new)| !anchor.is_empty() && *new == anchor);
-            let Some((index, _)) = matches.next() else {
-                return Err("网页图片位置与导入时不同，现有图片已保留。".into());
-            };
-            if matches.next().is_some() || keep[index] || data.len() > available {
-                return Err("无法安全匹配原有图片，现有图片已保留。".into());
-            }
-            self.images[index] = Some(data.clone());
-            keep[index] = true;
-            available -= data.len();
+    pub fn check_image_sequence(&self, other: &Layout) -> Result<()> {
+        if self.images.len() != other.images.len() || self.image_sequence() != other.image_sequence() {
+            return Err("原网页的图片列表已变化，无法匹配原来的图片位置。".into());
         }
+        Ok(())
+    }
+
+    pub fn fill_missing_images(&mut self, downloaded: Layout) -> Result<()> {
+        self.check_image_sequence(&downloaded)?;
+        let mut available = MAX_IMAGE_DATA.saturating_sub(self.images.iter().flatten().map(String::len).sum());
         self.image_errors.resize(self.images.len(), None);
-        for (index, (image, keep)) in self.images.iter_mut().zip(keep).enumerate() {
-            if keep {
-                self.image_errors[index] = None;
+        for (index, (slot, image)) in self.images.iter_mut().zip(downloaded.images).enumerate() {
+            if slot.is_some() {
                 continue;
             }
-            if let Some(data) = image {
-                if data.len() > available {
-                    *image = None;
-                    self.image_errors[index] = Some("超过本篇图片存储上限".into());
+            if let Some(image) = image {
+                if image.len() <= available {
+                    available -= image.len();
+                    *slot = Some(image);
+                    self.image_errors[index] = None;
                 } else {
-                    available -= data.len();
+                    self.image_errors[index] = Some("超过本篇图片存储上限".into());
                 }
+            } else {
+                self.image_errors[index] = downloaded.image_errors.get(index).cloned().flatten();
             }
         }
         Ok(())
