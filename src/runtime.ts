@@ -2,7 +2,7 @@ export const React = (window as unknown as {React: typeof import('react')}).Reac
 export const ReactDOM = (window as unknown as {ReactDOM: typeof import('react-dom/client') & Pick<typeof import('react-dom'),'createPortal'>}).ReactDOM;
 type ProgressChannel<T> = {onmessage:(value:T)=>void};
 type Invoke = <T>(command: string, args: object) => Promise<T>;
-const tauri = (window as unknown as {__TAURI__: {core: {invoke: Invoke; Channel: new <T>() => ProgressChannel<T>}}}).__TAURI__;
+const tauri = (window as unknown as {__TAURI__: {event:{listen:<T>(event:string, handler:(event:{payload:T})=>void)=>Promise<()=>void>}; core: {invoke: Invoke; Channel: new <T>() => ProgressChannel<T>}}}).__TAURI__;
 export const exportFile = (documentId?: string) => tauri.core.invoke<boolean>('export_file', {documentId});
 export const restoreBackupFile = () => tauri.core.invoke<boolean>('restore_backup_file',{});
 export const importLocalFile = () => tauri.core.invoke<{id:string;title:string}|null>('import_file',{});
@@ -34,3 +34,10 @@ export async function readKokoro(variant:KokoroVariant,asset:number,size:number)
   }
   return data.buffer;
 }
+
+export const listenForFileDrop = (receive:(paths:string[])=>void) =>
+  tauri.event.listen<{paths:string[]}>('tauri://drag-drop', event=>receive(event.payload.paths));
+export const importDroppedFiles = (paths:string[]) =>
+  tauri.core.invoke<{imported:number;errors:string[]}>('import_dropped_files',{paths});
+
+export const setNativeEpubKeys = (enabled:boolean) => tauri.core.invoke<void>('epub_keyboard',{enabled});

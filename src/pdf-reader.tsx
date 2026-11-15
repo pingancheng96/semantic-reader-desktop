@@ -562,14 +562,7 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,to
   },[visible,pdf,page]);
 
   const move = (step:number) => {if(matches.length) setMatch((match+step+matches.length)%matches.length);};
-  return <div ref={frame} className={navigation.open ? 'pdf-reader has-outline' : 'pdf-reader'} tabIndex={0} onKeyDown={event=>{
-    if (event.nativeEvent.isComposing || event.altKey || event.metaKey || event.ctrlKey || event.shiftKey ||
-        (event.target instanceof HTMLElement && event.target.closest('input,textarea,select,[contenteditable],.article-search'))) return;
-    if (event.key==='ArrowLeft' || event.key==='ArrowRight') {
-      event.preventDefault();
-      turn(page+(event.key==='ArrowRight' ? 1 : -1));
-    }
-  }}>
+  return <div ref={frame} className={navigation.open ? 'pdf-reader has-outline' : 'pdf-reader'} tabIndex={0}>
     <ReaderToolbar target={toolbar} disabled={!pdf} zoom={zoom} changeZoom={setPdfZoom} resetLabel="适合宽度"
       bookmark={{active:bookmarks.includes(page),disabled:!pdf,toggle:()=>toggleBookmark(page)}}
       previousDisabled={!pdf || page<=1} nextDisabled={!pdf || page>=pdf.numPages}

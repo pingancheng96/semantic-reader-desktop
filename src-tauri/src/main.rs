@@ -288,7 +288,6 @@ async fn pronunciation_folder(app: tauri::AppHandle) -> Result<Value> {
 
 #[tauri::command]
 async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Result<Value> {
-    use std::io::Read;
     use tauri_plugin_dialog::DialogExt;
     let database = state.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -296,40 +295,62 @@ async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Resul
             .add_filter("Markdown, TXT, PDF, EPUB", &["md", "markdown", "txt", "pdf", "epub"])
             .blocking_pick_file() else { return Ok(Value::Null); };
         let path = file.into_path().map_err(|_| "请选择本地文件")?;
-        let title = path.file_name().and_then(|name| name.to_str()).ok_or("文件名无效")?;
-        if title.chars().count() > 255 {
-            return Err("文件名太长".into());
-        }
-        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        let db = Db::open(&database)?;
-        let id = match extension.as_str() {
-            "epub" => {
-                let mut bytes = Vec::new();
-                file.take(30_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-                if bytes.len() > 30_000_000 { return Err("EPUB 文件最大 30 MB".into()); }
-                let (content, layout) = epub::read(std::io::Cursor::new(&bytes))?;
-                store::import_rich_text(&db, title, &content, &layout, &bytes)?
-            }
-            "pdf" => {
-                if file.metadata().map_err(|e| e.to_string())?.len() > store::PDF_MAX_BYTES {
-                    return Err("PDF 文件最大 100 MB".into());
-                }
-                store::import_pdf(&db, title, file)?
-            }
-            "md" | "markdown" | "txt" => {
-                let mut bytes = Vec::new();
-                file.take(2_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-                if bytes.len() > 2_000_000 {
-                    return Err("文件最大 2 MB".into());
-                }
-                let content = std::str::from_utf8(&bytes).map_err(|_| "请选择 UTF-8 文本文件")?;
-                store::import(&db, title, if extension == "txt" { "txt" } else { "md" }, content)?
-            }
-            _ => return Err("请选择 Markdown、TXT、PDF 或 EPUB 文件".into()),
-        };
-        Ok(serde_json::json!({"id":id,"title":title}))
+        import_local_path(&database, &path)
     }).await.map_err(|_| "导入文件失败")?
+}
+
+#[tauri::command]
+async fn import_dropped_files(paths: Vec<PathBuf>, state: State<'_, Database>) -> Result<Value> {
+    let database = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut imported = 0;
+        let mut errors = Vec::new();
+        for path in paths {
+            match import_local_path(&database, &path) {
+                Ok(_) => imported += 1,
+                Err(error) => errors.push(format!("{}：{error}", path.file_name().unwrap_or_default().to_string_lossy())),
+            }
+        }
+        Ok(serde_json::json!({"imported":imported,"errors":errors}))
+    }).await.map_err(|_| "导入文件失败")?
+}
+
+fn import_local_path(database: &std::path::Path, path: &std::path::Path) -> Result<Value> {
+    use std::io::Read;
+    let title = path.file_name().and_then(|name| name.to_str()).ok_or("文件名无效")?;
+    if title.chars().count() > 255 {
+        return Err("文件名太长".into());
+    }
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+    if !path.is_file() { return Err("请选择本地文件".into()); }
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let db = Db::open(&database)?;
+    let id = match extension.as_str() {
+        "epub" => {
+            let mut bytes = Vec::new();
+            file.take(30_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() > 30_000_000 { return Err("EPUB 文件最大 30 MB".into()); }
+            let (content, layout) = epub::read(std::io::Cursor::new(&bytes))?;
+            store::import_rich_text(&db, title, &content, &layout, &bytes)?
+        }
+        "pdf" => {
+            if file.metadata().map_err(|e| e.to_string())?.len() > store::PDF_MAX_BYTES {
+                return Err("PDF 文件最大 100 MB".into());
+            }
+            store::import_pdf(&db, title, file)?
+        }
+        "md" | "markdown" | "txt" => {
+            let mut bytes = Vec::new();
+            file.take(2_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() > 2_000_000 {
+                return Err("文件最大 2 MB".into());
+            }
+            let content = std::str::from_utf8(&bytes).map_err(|_| "请选择 UTF-8 文本文件")?;
+            store::import(&db, title, if extension == "txt" { "txt" } else { "md" }, content)?
+        }
+        _ => return Err("请选择 Markdown、TXT、PDF 或 EPUB 文件".into()),
+    };
+    Ok(serde_json::json!({"id":id,"title":title}))
 }
 
 #[tauri::command]
@@ -442,9 +463,29 @@ async fn export_file(
     .map_err(|_| "导出失败")?
 }
 
+#[tauri::command]
+fn epub_keyboard(app: tauri::AppHandle, enabled: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::menu::MenuItemKind;
+        if let Some(menu) = app.menu() {
+            if let Some(MenuItemKind::Submenu(reader)) = menu.get("epub-navigation") {
+                for id in ["epub-previous", "epub-next"] {
+                    if let Some(MenuItemKind::MenuItem(item)) = reader.get(id) {
+                        item.set_enabled(enabled).map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, enabled);
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn reader_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    use tauri::menu::{Menu, MenuItemKind, MenuItem};
+    use tauri::menu::{Menu, MenuItemKind, MenuItem, Submenu};
     let menu = Menu::default(app)?;
     for item in menu.items()? {
         if let MenuItemKind::Submenu(submenu) = item {
@@ -456,6 +497,10 @@ fn reader_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri:
             }
         }
     }
+    let reader = Submenu::with_id(app, "epub-navigation", "EPUB", true)?;
+    reader.append(&MenuItem::with_id(app, "epub-previous", "Previous Page", false, Some("ArrowLeft"))?)?;
+    reader.append(&MenuItem::with_id(app, "epub-next", "Next Page", false, Some("ArrowRight"))?)?;
+    menu.append(&reader)?;
     Ok(menu)
 }
 
@@ -463,10 +508,14 @@ fn main() {
     let builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
     let builder = builder.menu(reader_menu).on_menu_event(|app, event| {
-        if event.id() == "find-in-article" {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.eval("window.dispatchEvent(new Event('semantic-reader-find'))");
-            }
+        let message = match event.id().as_ref() {
+            "find-in-article" => "semantic-reader-find",
+            "epub-previous" => "semantic-reader-epub-previous",
+            "epub-next" => "semantic-reader-epub-next",
+            _ => return,
+        };
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.eval(format!("window.dispatchEvent(new Event('{message}'))"));
         }
     });
     builder
@@ -489,6 +538,8 @@ fn main() {
             request,
             export_file,
             import_file,
+            import_dropped_files,
+            epub_keyboard,
             restore_backup_file,
             pdf_range,
             pronunciation_folder,

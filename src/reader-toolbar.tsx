@@ -1,7 +1,14 @@
 import type {ReactNode} from 'react';
 import {React, ReactDOM} from './runtime.js';
 
-export function ReaderToolbar({target,bookmark,previous,next,zoom,changeZoom,resetLabel='重置缩放',pageIndicator,children,disabled,previousDisabled,nextDisabled}:{
+export function pageTurnDirection(event: KeyboardEvent): -1 | 0 | 1 {
+  if (event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return 0;
+  const target = event.target as Element | null;
+  if (target?.closest?.('input, textarea, select, [contenteditable], dialog, .article-search')) return 0;
+  return event.key==='ArrowLeft' ? -1 : event.key==='ArrowRight' ? 1 : 0;
+}
+
+export function ReaderToolbar({target,bookmark,previous,next,zoom,changeZoom,resetLabel='重置缩放',pageIndicator,children,disabled,previousDisabled,nextDisabled,keyboard=true}:{
   target:HTMLElement|null;
   bookmark:{active?:boolean;disabled?:boolean;toggle:()=>void};
   previous:()=>void;
@@ -14,7 +21,20 @@ export function ReaderToolbar({target,bookmark,previous,next,zoom,changeZoom,res
   disabled?:boolean;
   previousDisabled?:boolean;
   nextDisabled?:boolean;
+  keyboard?:boolean;
 }) {
+  React.useEffect(()=>{
+    if (!keyboard || !target || disabled) return;
+    const handleKey = (event:KeyboardEvent)=>{
+      const direction = pageTurnDirection(event);
+      if (!direction) return;
+      event.preventDefault();
+      if (direction<0 && !previousDisabled) previous();
+      if (direction>0 && !nextDisabled) next();
+    };
+    window.addEventListener('keydown',handleKey,true);
+    return ()=>window.removeEventListener('keydown',handleKey,true);
+  },[keyboard,target,disabled,previousDisabled,nextDisabled,previous,next]);
   return target && ReactDOM.createPortal(<nav className="reader-toolbar" aria-label="阅读工具">
     <button type="button" disabled={bookmark.disabled} aria-pressed={bookmark.active}
       aria-label={bookmark.active ? '删除当前位置书签' : '添加当前位置书签'}

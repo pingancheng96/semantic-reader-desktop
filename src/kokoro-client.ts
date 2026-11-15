@@ -44,11 +44,23 @@ export function kokoroAudio(variant:KokoroVariant,ipa:string,locale:'en-GB'|'en-
 
 let context:AudioContext|undefined;
 export async function playKokoro(variant:KokoroVariant,ipa:string,locale:'en-GB'|'en-US',current:()=>boolean) {
+  return playKokoroInput(variant,()=>ipa,locale,current);
+}
+
+export function playKokoroText(variant:KokoroVariant,text:string,locale:'en-GB'|'en-US',current:()=>boolean) {
+  return playKokoroInput(variant,async()=>{
+    const path = new URL('./phonemize.mjs',import.meta.url).href;
+    const {toIPA} = await import(path) as typeof import('phonemize');
+    return toIPA(text,locale).replace(/[.,!?;:…—–“”‘’()]/g,' ');
+  },locale,current);
+}
+
+async function playKokoroInput(variant:KokoroVariant,readIpa:()=>string|Promise<string>,locale:'en-GB'|'en-US',current:()=>boolean) {
   context ??= new AudioContext();
   const output = context;
   // Start audio during the click, before waiting for model loading or inference.
   await output.resume();
-  const wave = await kokoroAudio(variant,ipa,locale);
+  const wave = await kokoroAudio(variant,await readIpa(),locale);
   if (!current()) return;
   const buffer = await output.decodeAudioData(wave);
   if (!current()) return;

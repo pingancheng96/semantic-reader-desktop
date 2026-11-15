@@ -15,9 +15,9 @@ function showLibraryDialog(dialog:HTMLDialogElement|null) {
   if (dialog && !dialog.open) dialog.showModal();
 }
 
-export function TextLibrary({documents,recent,busy,visible,imports,open,rename}:{
+export function TextLibrary({documents,recent,busy,visible,imports,open,rename,remove}:{
   documents:DocumentItem[]; recent:Record<string,number>; busy:boolean; visible:boolean; imports:ReactNode;
-  open:(id:string)=>void; rename:(id:string,title:string,done:()=>void)=>void;
+  remove:(id:string,done:()=>void)=>void; open:(id:string)=>void; rename:(id:string,title:string,done:()=>void)=>void;
 }) {
   const [collections,setCollections] = React.useState<Collection[]>(()=>{
     try { return JSON.parse(readReaderPreference(collectionKey)) || []; }
@@ -31,6 +31,7 @@ export function TextLibrary({documents,recent,busy,visible,imports,open,rename}:
   const [selecting,setSelecting] = React.useState(false);
   const [folderEdit,setFolderEdit] = React.useState<{id:string;name:string;parent?:string}|null>(null);
   const [titleEdit,setTitleEdit] = React.useState<{id:string;title:string}|null>(null);
+  const [deleteTarget,setDeleteTarget] = React.useState<DocumentItem|null>(null);
   const [assign,setAssign] = React.useState<string[]>([]);
   const [destination,setDestination] = React.useState('');
   const [newCategory,setNewCategory] = React.useState('');
@@ -219,6 +220,18 @@ export function TextLibrary({documents,recent,busy,visible,imports,open,rename}:
           || collections.some(item=>!item.parent && item.name===newCategory.trim()))}>加入</button>
         <button type="button" onClick={()=>setAssign([])}>取消</button>
       </form></dialog>}
+      {deleteTarget && <dialog className="library-dialog" ref={showLibraryDialog}
+        aria-label="确认删除文本" onCancel={()=>setDeleteTarget(null)}>
+        <div className="text-library-editor">
+          <p>删除《{displayTitle(deleteTarget.title)}》及其原文标注和随标注保存的学习提示？词库义项会保留。删除后无法在应用内撤销。</p>
+          <button type="button" autoFocus disabled={busy} onClick={()=>setDeleteTarget(null)}>取消</button>
+          <button type="button" className="delete-document" disabled={busy} onClick={()=>remove(deleteTarget.id,()=>{
+            update(collections.map(item=>({...item,documents:item.documents.filter(id=>id!==deleteTarget.id)})));
+            setSelected(current=>current.filter(id=>id!==deleteTarget.id));
+            setDeleteTarget(null);
+          })}>确认删除</button>
+        </div>
+      </dialog>}
       {titleEdit && <dialog className="library-dialog" ref={showLibraryDialog}
         aria-label="重命名" onCancel={()=>setTitleEdit(null)}>
       <form className="text-library-editor" onSubmit={event=>{
@@ -287,6 +300,8 @@ export function TextLibrary({documents,recent,busy,visible,imports,open,rename}:
             ? {...item,documents:item.documents.filter(id=>id!==menu.doc.id)} : item));
           setMenu(null);
         }}>从当前分类移除</button>}
+        <button type="button" className="delete-document" disabled={busy}
+          onClick={()=>{setDeleteTarget(menu.doc);setMenu(null);}}>删除文本</button>
       </div>}
       {shown.length>0 && <p className="muted library-management-hint">右键管理文档</p>}
       {!shown.length && <p className="muted">{normalizedQuery ? '没有匹配结果' : '这里还没有文本'}</p>}

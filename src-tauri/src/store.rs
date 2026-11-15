@@ -1721,6 +1721,22 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
                 &[key,json!(page)])?["layer"].clone())
         }
         "pdf_index_page" => db.transaction(|| save_pdf_page(db, p)),
+        "sil_related_senses" => {
+            let key = id(p, "id")?;
+            let mut categories = db.query(
+                "SELECT code FROM sense_sil_memberships WHERE sense_id=?1 ORDER BY code",
+                &[key.clone()],
+            )?;
+            for category in &mut categories {
+                category["senses"] = json!(db.query(
+                    "SELECT s.id,e.lemma,s.meaning FROM sense_sil_memberships m
+                     JOIN senses s ON s.id=m.sense_id JOIN expressions e ON e.id=s.expression_id
+                     WHERE m.code=?1 AND s.id<>?2 ORDER BY e.lemma COLLATE NOCASE,s.id",
+                    &[category["code"].clone(),key.clone()],
+                )?);
+            }
+            Ok(json!(categories))
+        }
         "sil_senses" => {
             let code = field(p,"code",32,false)?;
             let query = field(p,"q",200,false)?;

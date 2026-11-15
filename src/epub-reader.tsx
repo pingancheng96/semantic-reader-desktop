@@ -1,7 +1,7 @@
-import {ReaderToolbar} from './reader-toolbar.js';
+import {ReaderToolbar,pageTurnDirection} from './reader-toolbar.js';
 import {ReaderNavigation, readReaderPreference, saveReaderPreference, type ReaderNavigationState} from './reader-navigation.js';
 import {readerGestures} from './reader-gestures.js';
-import {React, call} from './runtime.js';
+import {React, call, setNativeEpubKeys} from './runtime.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import type {WebNode} from './web-captions.js';
 
@@ -58,6 +58,8 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
   id:string;content:string;layout:string;marks:M[];focused:string;visible:boolean;toolbar:HTMLElement|null;navigation:ReaderNavigationState;
   onSelect:(selection:{document_id:string;surface:string;start:number;end:number},double:boolean)=>void;onMark:(mark:M)=>void;
 }) {
+  const isVisible=useRef(visible);
+  isVisible.current=visible;
   const host=useRef<HTMLDivElement>(null);
   const view=useRef<View|null>(null);
   const sections=useRef(new Map<number,Anchor[]>());
@@ -111,6 +113,11 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
   const searchVersion=useRef(0);
   useArticleSearchShortcut(visible,()=>setSearchOpen(true));
 
+  function turnPage(direction:number) {
+    const reader = view.current;
+    if (reader) navigate(()=>direction<0 ? reader.prev() : reader.next());
+  }
+
   function navigate(action:()=>Promise<unknown>) {
     void action().catch(()=>setError('无法跳转到这个位置'));
   }
@@ -140,6 +147,19 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
       const zoom=event.type.startsWith('gesture') || (event as WheelEvent).ctrlKey;
       return zoom && (pointerOverBook || Boolean(renderer.renderer?.getContents().some(({doc})=>doc.hasFocus())));
     });
+    window.addEventListener('keydown',event=>{
+      if (!isVisible.current || !['ArrowLeft','ArrowRight'].includes(event.key)) return;
+      const direction = pageTurnDirection(event);
+      if (direction && view.current?.lastLocation) {
+        event.preventDefault();
+        turnPage(direction);
+      }
+    },{capture:true,signal:listeners.signal});
+    for (const [name,direction] of [['previous',-1],['next',1]] as const) {
+      window.addEventListener('semantic-reader-epub-'+name,()=>{
+        if (isVisible.current && view.current?.lastLocation) turnPage(direction);
+      },{signal:listeners.signal});
+    }
     const chapterNodes=(JSON.parse(layout) as {nodes:WebNode[]}).nodes;
     void (async()=>{
       const module=new URL('./foliate/view.js',import.meta.url).href;
@@ -164,6 +184,32 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
       function attach({doc,index}:{doc:Document;index:number}) {
         if (attached.has(doc) || !doc.body) return;
         attached.add(doc);
+        doc.addEventListener('mouseup',event=>{
+          if (event.button!==0) return;
+          const target = event.target as Element | null;
+          if (target?.closest?.('a, button, input, textarea, select, [contenteditable], [tabindex]')) return;
+          window.requestAnimationFrame(()=>{
+            if (alive && isVisible.current && doc.getSelection()?.isCollapsed!==false) {
+              host.current?.focus({preventScroll:true});
+            }
+          });
+        },true);
+        doc.addEventListener('keydown',(event:Event)=>{
+          if (!('key' in event)) return;
+          if (!alive) return;
+          const key = event as KeyboardEvent;
+          const direction = pageTurnDirection(key);
+          const reader = view.current;
+          if (direction && reader && isVisible.current) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            turnPage(direction);
+            return;
+          }
+          if ((key.metaKey || key.ctrlKey) && key.key.toLowerCase()==='f') {
+            event.preventDefault();setSearchOpen(true);
+          }
+        },true);
         if (renderer) applyZoom(renderer,doc);
         doc.addEventListener('pointermove',()=>{pointerOverBook=true;},{signal:listeners.signal});
         gestures.bind(doc,listeners.signal,()=>alive);
@@ -267,11 +313,7 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
           else if (event.detail<2) capture(false);
         },true);
         doc.addEventListener('dblclick',doubleClick,true);
-        doc.addEventListener('keydown',event=>{
-          if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase()==='f') {
-            event.preventDefault();setSearchOpen(true);
-          }
-        });
+
       }
       renderer.addEventListener('show-annotation',event=>{
         const {value,range}=(event as CustomEvent<{value:string;range:Range}>).detail;
@@ -373,14 +415,27 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
       {item.subitems?.length ? renderToc(item.subitems) : null}
     </li>)}</ul>;
   }
+  useEffect(()=>{
+    if (!visible || !ready) return;
+    const update = ()=>{
+      const editing = document.activeElement?.closest('input, textarea, select, [contenteditable], dialog');
+      void setNativeEpubKeys(!editing).catch(()=>setError('无法启用 EPUB 系统翻页键'));
+    };
+    document.addEventListener('focusin',update);
+    update();
+    return ()=>{
+      document.removeEventListener('focusin',update);
+      void setNativeEpubKeys(false).catch(()=>{});
+    };
+  },[visible,ready]);
   const saved=bookmarks.some(item=>item.cfi===location?.cfi);
   return <div className={navigation.open ? 'pdf-reader has-outline' : 'pdf-reader'}>
-    <ReaderToolbar target={toolbar} disabled={!ready} zoom={zoom} changeZoom={changeZoom}
+    <ReaderToolbar target={toolbar} keyboard={false} disabled={!ready} zoom={zoom} changeZoom={changeZoom}
       bookmark={{active:saved,disabled:!location,toggle:()=>{
         if (location) saveBookmarks(saved ? bookmarks.filter(item=>item.cfi!==location.cfi) :
           [...bookmarks,{cfi:location.cfi,label:location.tocItem?.label || `书签 ${bookmarks.length+1}`}]);
       }}}
-      previous={()=>navigate(()=>view.current!.prev())} next={()=>navigate(()=>view.current!.next())}>
+      previous={()=>turnPage(-1)} next={()=>turnPage(1)}>
       <button type="button" disabled={!ready} aria-label="书内搜索" onClick={()=>setSearchOpen(!searchOpen)}>⌕</button>
     </ReaderToolbar>
     {navigation.open && <ReaderNavigation navigation={navigation} bookmarks={<>
@@ -400,7 +455,7 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
         </form>
         {results.map((result,index)=><button key={index} onClick={()=>navigate(()=>view.current!.goTo(result.cfi))}>{result.excerpt.match}</button>)}
       </div>}
-      <div className="epub-native-host" ref={host}/>
+      <div className="epub-native-host" ref={host} tabIndex={-1}/>
     </div>
   </div>;
 }

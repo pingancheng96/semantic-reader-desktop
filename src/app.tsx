@@ -9,10 +9,9 @@ import {useArticleSearchShortcut} from './article-search.js';
 import {PdfReader} from './pdf-reader.js';
 import {waitForVoice} from './speech-voices.js';
 import type {ClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode} from 'react';
-import {React, ReactDOM, call, exportFile, importLocalFile, restoreBackupFile} from './runtime.js';
+import {React, ReactDOM, call, exportFile, importLocalFile, importDroppedFiles, listenForFileDrop, restoreBackupFile} from './runtime.js';
 import {articleMatches, changedRanges, keepUnchanged, readingLines, selectedOffsets, type Piece} from './reading.js';
 import {captionNodes, type WebNode} from './web-captions.js';
-import {dictionaryLookupWord} from './dictionary-word.js';
 const {useState, useEffect, useLayoutEffect, useMemo, useRef} = React;
 
 type Item = {id: string; title: string; format: 'md' | 'txt'; source_url?: string | null};
@@ -253,6 +252,35 @@ function SenseSilEditor({current,busy,save}:{
   </div> : <button type="button" disabled={busy} onClick={()=>{setCode(current);setOpen(true);}}>更改 SIL 分类</button>;
 }
 
+function SilRelatedSenses({id,domains,openCategory}:{
+  id:string;domains:SilDomain[];openCategory:(code:string)=>void;
+}) {
+  type Category = {code:string;senses:Pick<Sense,'id'|'lemma'|'meaning'>[]};
+  const [categories,setCategories] = useState<Category[]>([]);
+  const [error,setError] = useState('');
+  useEffect(()=>{
+    let active = true;
+    void call<Category[]>('sil_related_senses',{id}).then(
+      rows=>{if (active) setCategories(rows);},
+      ()=>{if (active) setError('无法读取同类词。');}
+    );
+    return ()=>{active=false;};
+  },[id]);
+  if (error) return <p role="status">{error}</p>;
+  if (!categories.length) return null;
+  return <section>
+    <h3>同类词</h3>
+    {categories.map(({code,senses})=><section key={code}>
+      <button type="button" className="quiet" title={silPath(domains,code)} onClick={()=>openCategory(code)}>
+        {domains.find(domain=>domain.code===code)?.name ?? code} ↗
+      </button>
+      {senses.length ? <ul>{senses.map(sense=><li key={sense.id}>
+        <b lang="en">{sense.lemma}</b> · {sense.meaning}
+      </li>)}</ul> : <p className="muted">此分类暂无其他义项。</p>}
+    </section>)}
+  </section>;
+}
+
 function SilSenseList({category,query,library,busy,onCount,openCategory,openDocument,move,remove,directOnly}:{
   category:string;query:string;library:Library;busy:boolean;onCount:(count:number)=>void;openCategory:(code:string)=>void;openDocument:(id:string,mark:string)=>void;move:(sense:Sense,code:string)=>void;remove:(sense:Sense,code:string)=>void;directOnly:boolean;
 }) {
@@ -290,18 +318,17 @@ function SilSenseList({category,query,library,busy,onCount,openCategory,openDocu
             <pre style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}>{JSON.stringify(row.sil_diagnostic,null,2)}</pre>
           </details>}
           {row.context && <blockquote>{row.context}</blockquote>}
-          <div className="row">
-            <div className="row" aria-label="所属分类">
+          <div className="row sil-membership-actions" role="group" aria-label="所属分类">
               {row.categories.length ? row.categories.map(code=>{
                 const name = domains.find(domain=>domain.code===code)?.name ?? code;
-                return <span className="row" key={code}>
+                return <span className="sil-membership" key={code}>
                   <button type="button" title={silPath(domains,code)} onClick={()=>openCategory(code)}>{name} ↗</button>
                   <button type="button" className="quiet" disabled={busy} aria-label={'移除 '+name}
                     title={'移除 '+name} onClick={()=>remove(row,code)}>×</button>
                 </span>;
               }) : <button type="button" onClick={()=>openCategory('unclassified')}>未归类 ↗</button>}
-            </div>
-            <SilPicker code={null} change={code=>{if(code)move(row,code);}}/>
+            <DestinationSelect domains={domains} row={{code:null}} parent="" existing={row.categories}
+              disabled={busy || !domains.length} change={code=>{if(code)move(row,code);}}/>
           </div>
           {row.links?.map(link=><div className="backlink" key={link.id}>
             <button className="quiet" disabled={busy} onClick={()=>openDocument(link.document_id,link.id)}>{link.title} ↗</button>
@@ -318,11 +345,16 @@ type SilAuditChange = Pick<Sense,'id'|'lemma'|'meaning'> & {
   categories:string[]; add:string[]; remove:string[]; reason:string;
 };
 
+type SilAuditResult = {
+  count:number;changes:SilAuditChange[];tokens:number;usage_incomplete:boolean;
+  invalid_codes:{lemma:string;meaning:string;action:'add'|'remove';value:unknown}[];
+};
+
 function SilAudit({code,descendants,count,domains,config,busy,configured,task,refresh}:{
   code:string;descendants:boolean;count:number;domains:SilDomain[];config:object;busy:boolean;configured:boolean;
   task:(action:()=>Promise<void>)=>Promise<void>;refresh:()=>Promise<void>;
 }) {
-  const [result,setResult] = useState<{count:number;changes:SilAuditChange[];tokens:number;usage_incomplete:boolean;invalid_codes:number}|null>(null);
+  const [result,setResult] = useState<SilAuditResult|null>(null);
   const [selected,setSelected] = useState<string[]>([]);
   const selectionKey = (id:string,action:string,category:string)=>[id,action,category].join('/');
   const picked = (row:SilAuditChange,action:'add'|'remove') =>
@@ -332,13 +364,19 @@ function SilAudit({code,descendants,count,domains,config,busy,configured,task,re
   return <section aria-label="AI 审查分类">
     <p>将审查{descendants ? '整个分支的' : '直属的'} {count} 个义项。</p>
     <button type="button" disabled={busy || !configured || !count} onClick={()=>void task(async()=>{
-      const preview = await call<{count:number;changes:SilAuditChange[];tokens:number;usage_incomplete:boolean;invalid_codes:number}>('sil_audit',{...config,code,descendants});
+      const preview = await call<SilAuditResult>('sil_audit',{...config,code,descendants});
       setResult(preview);
       setSelected(preview.changes.flatMap(row=>row.add.map(category=>selectionKey(row.id,'add',category))));
     })}>{result ? '重新审查' : '开始审查'}</button>
     {result && <>
-      <p role="status">已审查 {result.count} 个义项，{result.changes.length ? result.changes.length+' 个义项有调整建议' : result.invalid_codes ? '没有有效的调整建议' : '无需调整'}。{result.usage_incomplete && !result.tokens ? '服务未报告 token 用量。' :
-        `已报告 ${result.tokens.toLocaleString()} token${result.usage_incomplete ? '（部分批次未报告）' : ''}。`}{result.invalid_codes>0 && `已跳过 ${result.invalid_codes} 个无效分类编号。`}</p>
+      <p role="status">已审查 {result.count} 个义项，{result.changes.length ? result.changes.length+' 个义项有调整建议' : result.invalid_codes.length ? '没有有效的调整建议' : '无需调整'}。{result.usage_incomplete && !result.tokens ? '服务未报告 token 用量。' :
+        `已报告 ${result.tokens.toLocaleString()} token${result.usage_incomplete ? '（部分批次未报告）' : ''}。`}{result.invalid_codes.length>0 && `已跳过 ${result.invalid_codes.length} 个无效分类编号。`}</p>
+      {result.invalid_codes.length>0 && <details>
+        <summary>查看被跳过的分类编号</summary>
+        <ul>{result.invalid_codes.map((entry,index)=><li key={index}>
+          <b lang="en">{entry.lemma}</b> · {entry.meaning} · {entry.action==='add' ? '新增' : '移除'} · <code>{JSON.stringify(entry.value)}</code>
+        </li>)}</ul>
+      </details>}
       {result.changes.map(row=>{
         const pending = changes.find(change=>change.id===row.id);
         const becomesUnclassified = pending && !pending.add.length &&
@@ -956,7 +994,6 @@ function App() {
   const [suggesting,setSuggesting] = useState(false);
   const selectionRequest = useRef(0);
   const autoAnalysis = useRef(false);
-  const [autoLemma,setAutoLemma] = useState(()=>localStorage.getItem('autoDictionaryLemma')!=='off');
   const [lemma,setLemma] = useState('');
   const [meaning,setMeaning] = useState('');
   const [contextMeaning,setContextMeaning] = useState('');
@@ -982,6 +1019,7 @@ function App() {
   const [endpoint,setEndpoint] = useState(savedAi.endpoint);
   const [model,setModel] = useState(savedAi.model);
   const [keyState,setKeyState] = useState('尚未配置');
+  const [autoIpa,setAutoIpa] = useState(()=>localStorage.getItem('autoDictionaryLemma')!=='off');
   const [pronunciationLibrary,setPronunciationLibrary] = useState(()=>localStorage.getItem('pronunciationLibrary') ?? '');
   const [keyRevision,setKeyRevision] = useState(0);
   const aiConfigured = Boolean(savedAi.endpoint && savedAi.model);
@@ -1016,6 +1054,29 @@ function App() {
     catch (e) { setError(typeof e === 'string' ? e : e instanceof Error ? e.message : '操作失败'); }
     finally { lock.current = false; setBusy(false); }
   }
+  useEffect(()=>{
+    if (mode!=='texts') return;
+    let active = true;
+    let unlisten: (()=>void)|undefined;
+    void listenForFileDrop(paths=>{
+      if (!active || !paths.length) return;
+      if (lock.current) {
+        setError('正在处理其他操作，请完成后重新拖入文件。');
+        return;
+      }
+      void task(async()=>{
+        const result = await importDroppedFiles(paths);
+        if (result.imported) {
+          await refresh();
+          setNotice(`已导入 ${result.imported} 个文件`);
+        }
+        if (result.errors.length) setError(result.errors.join('；'));
+      });
+    }).then(stop=>{if (active) unlisten=stop; else stop();})
+      .catch(error=>{if (active) setError(String(error));});
+    return ()=>{active=false;unlisten?.();};
+  },[mode]);
+
   async function refresh() {
     setLib(await call<Library>('list'));
   }
@@ -1087,7 +1148,10 @@ function App() {
   }
   async function deleteDocument(id: string) {
     await call('document_delete',{id});
-    setRead(null); setMode('texts'); setDeleteDocId(''); setFocus(''); resetSelection();
+    if (read?.document.id===id) {
+      setRead(null); setFocus(''); resetSelection();
+    }
+    setMode('texts'); setDeleteDocId('');
     await refresh();
     setNotice('文章已删除');
   }
@@ -1160,8 +1224,6 @@ function App() {
   }
   const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()];
   const selectedSense = candidateSenses.find(sense=>sense.id===attachSense);
-  const lookupWord = selection ? dictionaryLookupWord(selection.surface,lemma,
-    candidateSenses.find(sense=>sense.id===attachSense)?.lemma,undefined) : '';
   const silDomains = useSilCatalog();
   const [silFilter,setSilFilter] = useState('');
   const [directOnly,setDirectOnly] = useState(false);
@@ -1213,6 +1275,7 @@ function App() {
       <div className="text-library-view" hidden={mode!=='texts'}>
         <TextLibrary documents={lib.documents} recent={recentDocuments} busy={busy} visible={mode==='texts'}
           open={id=>void task(()=>openDoc(id))}
+          remove={(id,done)=>void task(async()=>{await deleteDocument(id);done();})}
           rename={(id,title,done)=>void task(async()=>{
             const savedTitle = await call<string>('document_rename',{id,title});
             setRead(previous=>previous?.document.id===id
@@ -1349,8 +1412,7 @@ function App() {
 
             <WordHeading surface={activeMark.surface} pos={(markSuggestion?.id === activeMark.id ? markSuggestion.learning : activeLearning)?.part_of_speech}/>
             <PronunciationPanel id={pronunciationLibrary} word={activeMark.surface}
-              base={activeMark.lemma} pos={activeLearning?.part_of_speech} context={activeMark.context}
-              ai={aiConfigured && autoLemma ? savedAi : undefined}/>
+              pos={activeLearning?.part_of_speech} context={activeMark.context} ai={aiConfigured && autoIpa ? savedAi : undefined}/>
             <section className="word-meaning">
               <h3>本句释义</h3>
               <p>{activeMark.context_meaning?.trim() || <span className="muted">沿用通用释义</span>}</p>
@@ -1360,6 +1422,10 @@ function App() {
                 <> <small>原形 · <b lang="en">{activeMark.lemma}</b></small></>}</h3>
               <p>{activeMark.meaning}</p>
             </section>
+            <SilRelatedSenses key={activeMark.sense_id} id={activeMark.sense_id} domains={silDomains}
+              openCategory={code=>{
+                setQuery('');setFilter('');setDirectOnly(false);setSilOrganizerCategory(null);setSilFilter(code);setMode('library');
+              }}/>
             <button className="primary" disabled={busy} onClick={()=>openLibrarySense(activeMark.lemma)}>在语义库查看 →</button>
             <DeleteMark key={activeMark.id} busy={busy} remove={()=>void task(async()=>{
               const deletedSense = await call<boolean>('mark_delete',{id:activeMark.id,document_id:activeMark.document_id});
@@ -1369,7 +1435,7 @@ function App() {
               setNotice(deletedSense ? '已删除最后一处标注及其义项' : '已删除此处标注');
             })}/>
 
-            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
+            {activeLearning && markSuggestion?.id !== activeMark.id && <LearningPanel hidePos hideIpa learning={activeLearning} word={activeMark.lemma || activeMark.surface}/>}
             {(!activeLearning?.part_of_speech || !activeLearning.usage_note || (activeLearning.etymology === undefined && activeLearning.mnemonic === undefined)) && markSuggestion?.id !== activeMark.id && <p>
               <button disabled={busy || !aiConfigured} onClick={()=>void task(async()=>{
                 const result = await call<Suggestion>('suggest',{
@@ -1388,7 +1454,7 @@ function App() {
               })}>补充学习笔记</button>
             </p>}
             {markSuggestion?.id === activeMark.id && <>
-              <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
+              <LearningPanel hidePos hideIpa learning={markSuggestion.learning} word={activeMark.lemma || activeMark.surface}/>
               <button disabled={busy} onClick={()=>void task(async()=>{
                 const updated = {...activeMark,learning:JSON.stringify(markSuggestion.learning)};
                 await call('learning_save',{id:activeMark.id,learning:markSuggestion.learning});
@@ -1399,14 +1465,13 @@ function App() {
           </> : selection ? <>
             <WordHeading surface={selection.surface} pos={learning?.part_of_speech}/>
             <PronunciationPanel id={pronunciationLibrary} word={selection.surface}
-              base={lookupWord} pos={learning?.part_of_speech} context={candidate?.context}
-              ai={aiConfigured && autoLemma ? savedAi : undefined}/>
+              pos={learning?.part_of_speech} context={candidate?.context} ai={aiConfigured && autoIpa ? savedAi : undefined}/>
             {candidate?.notes.length ? <section className="saved-notes">
               <h3>词库笔记</h3>
               {candidate.notes.length > 1 && <p className="muted">找到多个义项，请按当前语境查看。</p>}
               {candidate.notes.map(note=><div className="saved-note" key={note.id}>
                 <b>{note.lemma}</b><p>{note.meaning}</p>
-                {note.learning && <LearningPanel hideIpa={Boolean(pronunciationLibrary)} learning={readLearning(note.learning)!} word={note.lemma}/>}
+                {note.learning && <LearningPanel hideIpa learning={readLearning(note.learning)!} word={note.lemma}/>}
                 <div className="row">
                   <button className="quiet" disabled={busy} onClick={()=>openLibrarySense(note.lemma)}>在语义库查看 →</button>
                   <button disabled={busy || suggesting} onClick={()=>{setAttachSense(note.id);setLearning(null);}}>复用此义项</button>
@@ -1419,7 +1484,7 @@ function App() {
             </button>
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
             {aiNote && <p className="muted" role="status">{aiNote}</p>}
-            {learning && <LearningPanel hidePos hideIpa={Boolean(pronunciationLibrary)} learning={learning} word={lookupWord}/>}
+            {learning && <LearningPanel hidePos hideIpa learning={learning} word={selection.surface}/>}
             <form onSubmit={e=>submit(e,async ()=>{
               const savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
               await call('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
@@ -1442,7 +1507,8 @@ function App() {
               </section>}
               {!attachSense && <>
                 <label>原形或表达<input value={lemma} required maxLength={240} onChange={e=>setLemma(e.target.value)}/></label>
-                <label>通用释义<textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
+                <label><span>通用释义{lemma.trim() && lemma.trim().toLowerCase()!==selection.surface.trim().toLowerCase() &&
+                  <> <small>原形 · <b lang="en">{lemma.trim()}</b></small></>}</span><textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
                 <p className="muted">新义项将收录到「未归类」。</p>
               </>}
               <button className="primary full" disabled={busy}>确认收录</button>
@@ -1506,8 +1572,8 @@ function App() {
         </section>
         <PronunciationSettings active={pronunciationLibrary} select={id=>{
           setPronunciationLibrary(id);localStorage.setItem('pronunciationLibrary',id);
-        }} autoIpa={autoLemma} setAutoIpa={enabled=>{
-          setAutoLemma(enabled);localStorage.setItem('autoDictionaryLemma',enabled?'on':'off');
+        }} autoIpa={autoIpa} setAutoIpa={enabled=>{
+          setAutoIpa(enabled);localStorage.setItem('autoDictionaryLemma',enabled?'on':'off');
         }}/>
         <LibraryGlossOrganizer busy={busy} configured={aiConfigured}
           scan={(resume,receive,stopped)=>void task(async()=>{

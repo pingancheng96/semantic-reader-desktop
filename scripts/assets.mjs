@@ -24,3 +24,6 @@ for (const name of ['ort.wasm.min.mjs','ort-wasm-simd-threaded.mjs','ort-wasm-si
   await copyFile('node_modules/onnxruntime-web/dist/'+name,'dist/ort/'+name);
 }
 await cp('vendor/foliate','dist/foliate',{recursive:true});
+
+const {build} = await import('esbuild');
+await build({entryPoints:['node_modules/phonemize/dist/index.mjs'],bundle:true,format:'esm',minify:true,outfile:'dist/phonemize.mjs'});

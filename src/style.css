@@ -433,3 +433,7 @@ button.delete-document { color: #a22f29; }
 .sil-section-link:hover {
   text-decoration: underline;
 }
+
+.sil-membership-actions, .sil-membership { align-items: center; }
+.sil-membership { display: inline-flex; gap: .4rem; }
+.sil-membership-actions > .sil-destination-field { flex: 0 0 auto; }

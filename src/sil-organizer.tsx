@@ -43,8 +43,9 @@ function completedProgress(progress:Progress,parent:string,labels:Map<string,str
   return progress;
 }
 
-export function DestinationSelect({domains,row,parent,disabled,change}:{
+export function DestinationSelect({domains,row,parent,disabled,change,existing}:{
   domains:Domain[];row:Pick<Row,'code'|'needs_review'|'manual'>;parent:string;disabled:boolean;change:(code:string|null)=>void;
+  existing?:readonly string[];
 }) {
   const dialog = React.useRef<HTMLDialogElement>(null);
   const [query,setQuery] = React.useState('');
@@ -58,6 +59,8 @@ export function DestinationSelect({domains,row,parent,disabled,change}:{
   const options = term ? domains.filter(domain=>
     domain.code.startsWith(term) || path(domain.code).toLowerCase().includes(term)).slice(0,40)
     : domains.filter(domain=>domain.code.split('.').slice(0,-1).join('.')===branch);
+  const adding = existing !== undefined;
+  const alreadyAdded = choice!==null && existing?.includes(choice);
   const destination = row.code==='unclassified' ? '退回未归类' : row.code ? path(row.code) || row.code : row.needs_review && !row.manual ? '未选择分类' : '保留在当前类';
   return <div className="sil-destination-field">
     <button type="button" className="quiet sil-change" aria-haspopup="dialog" disabled={disabled}
@@ -66,13 +69,13 @@ export function DestinationSelect({domains,row,parent,disabled,change}:{
         setBranch(row.code && labels.has(row.code) ? row.code : parent);
         setChoice(row.code ?? null);
         dialog.current?.showModal();
-      }}>更改去向</button>
+      }}>{adding ? '添加 SIL 分类' : '更改去向'}</button>
     {ReactDOM.createPortal(<dialog ref={dialog} className="library-dialog sil-choice-dialog" aria-label="选择 SIL 分类">
       <form method="dialog" onSubmit={event=>{
         event.stopPropagation();
-        if ((event.nativeEvent as SubmitEvent).submitter?.getAttribute('value')==='choose') change(choice);
+        if ((event.nativeEvent as SubmitEvent).submitter?.getAttribute('value')==='choose' && (!adding || (choice && !alreadyAdded))) change(choice);
       }}>
-        <h2>选择 SIL 分类</h2>
+        <h2>{adding ? '添加 SIL 分类' : '选择 SIL 分类'}</h2>
         <input type="search" autoFocus aria-label="搜索全部分类" placeholder="搜索英文类名或编号" value={query}
           onChange={event=>setQuery(event.target.value)}/>
         {!term && <nav className="sil-choice-path" aria-label="分类路径">
@@ -90,18 +93,18 @@ export function DestinationSelect({domains,row,parent,disabled,change}:{
           {!options.length && term && <li className="muted">没有匹配分类</li>}
           {!options.length && !term && <li className="muted">没有下级分类</li>}
         </ul>
-        <div className="row sil-choice-actions">
+        {!adding && <div className="row sil-choice-actions">
           <button type="button" onClick={()=>setChoice(null)}>保留在当前类</button>
           {parent && <button type="button" onClick={()=>setChoice('unclassified')}>退回未归类</button>}
-        </div>
-        <p className="sil-choice-current">去向 · {choice==='unclassified' ? '未归类' : choice ? path(choice) : '保留在当前类'}</p>
+        </div>}
+        <p className="sil-choice-current">{adding ? (choice ? path(choice)+(alreadyAdded ? '（已添加）' : '') : '请选择一个分类') : <>去向 · {choice==='unclassified' ? '未归类' : choice ? path(choice) : '保留在当前类'}</>}</p>
         <div className="row sil-choice-actions">
           <button type="submit" value="cancel">取消</button>
-          <button type="submit" className="primary" value="choose">确认去向</button>
+          <button type="submit" className="primary" value="choose" disabled={adding && (!choice || alreadyAdded)}>{adding ? '确认添加' : '确认去向'}</button>
         </div>
       </form>
     </dialog>,document.body)}
-    <span className="sil-current-destination">{destination}</span>
+    {!adding && <span className="sil-current-destination">{destination}</span>}
   </div>;
 }
 
