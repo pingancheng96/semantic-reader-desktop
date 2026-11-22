@@ -5,22 +5,59 @@ use dom_query::Document;
 use url::Url;
 use zip::ZipArchive;
 
-pub const TEXT_LIMIT: usize = 10_000_000;
-const ENTRY_LIMIT: usize = 8_000_000;
 
 fn read_entry<R: Read + Seek>(zip: &mut ZipArchive<R>, path: &str) -> Result<String, String> {
-    let entry = zip
+    let mut entry = zip
         .by_name(path)
         .map_err(|_| format!("EPUB 缺少文件：{path}"))?;
     let mut bytes = Vec::new();
     entry
-        .take(ENTRY_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "无法解压 EPUB 内容")?;
-    if bytes.len() > ENTRY_LIMIT {
-        return Err("EPUB 单个解压文件超过 8 MB".into());
-    }
     String::from_utf8(bytes).map_err(|_| "EPUB 章节必须使用 UTF-8 编码".into())
+}
+
+pub fn cover(bytes: &[u8]) -> Result<Option<String>, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut zip = ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e|e.to_string())?;
+    let container = read_entry(&mut zip,"META-INF/container.xml")?;
+    let xml = roxmltree::Document::parse(&container).map_err(|e|e.to_string())?;
+    let package = xml.descendants().find(|node|node.has_tag_name("rootfile"))
+        .and_then(|node|node.attribute("full-path")).ok_or("缺少 EPUB 清单")?;
+    let opf = read_entry(&mut zip,package)?;
+    let xml = roxmltree::Document::parse(&opf).map_err(|e|e.to_string())?;
+    let legacy = xml.descendants().find(|node|node.has_tag_name("meta") && node.attribute("name")==Some("cover"))
+        .and_then(|node|node.attribute("content"));
+    let items = xml.descendants().filter(|node|node.has_tag_name("item")).collect::<Vec<_>>();
+    let image = items.iter().find(|node|node.attribute("properties").unwrap_or_default().split_whitespace().any(|value|value=="cover-image"))
+        .or_else(||items.iter().find(|node|legacy.is_some() && node.attribute("id")==legacy))
+        .or_else(||items.iter().find(|node|node.attribute("media-type").unwrap_or_default().starts_with("image/") &&
+            node.attribute("href").unwrap_or_default().to_lowercase().contains("cover")));
+    let Some(image) = image else { return Ok(None); };
+    let mime = image.attribute("media-type").unwrap_or_default();
+    if !matches!(mime,"image/jpeg"|"image/png"|"image/webp"|"image/gif"|"image/avif") { return Ok(None); }
+    let mut base = Url::parse("https://epub.invalid/").unwrap();
+    base.set_path(&format!("/{package}"));
+    let url = base.join(image.attribute("href").ok_or("封面路径无效")?).map_err(|e|e.to_string())?;
+    if url.origin()!=base.origin() { return Err("封面必须位于书内".into()); }
+    let path = percent_encoding::percent_decode_str(url.path().trim_start_matches('/')).decode_utf8().map_err(|e|e.to_string())?;
+    let mut data = Vec::new();
+    zip.by_name(&path).map_err(|e|e.to_string())?.read_to_end(&mut data).map_err(|e|e.to_string())?;
+    Ok(Some(format!("data:{mime};base64,{}",STANDARD.encode(data))))
+}
+
+fn remove_xhtml_scripts(html: &str) -> String {
+    // HTML parsers treat XHTML's self-closing script elements as opening tags.
+    // Remove scripts using XML ranges before passing valid XHTML to the HTML parser.
+    let Ok(document) = roxmltree::Document::parse(html) else { return html.to_owned(); };
+    let mut output = html.to_owned();
+    let ranges = document.descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "script")
+        .filter(|node| !node.ancestors().skip(1).any(|parent|
+            parent.is_element() && parent.tag_name().name() == "script"))
+        .map(|node| node.range()).collect::<Vec<_>>();
+    for range in ranges.into_iter().rev() { output.replace_range(range, ""); }
+    output
 }
 
 fn shift_nodes(nodes: &mut [Node], offset: usize) {
@@ -78,6 +115,7 @@ pub fn read<R: Read + Seek>(file: R) -> Result<(String, Layout), String> {
             .decode_utf8()
             .map_err(|_| "EPUB 章节路径编码无效")?;
         let html = read_entry(&mut zip, &path)?;
+        let html = remove_xhtml_scripts(&html);
         let chapter = Document::from(html.as_str());
         chapter
             .select("script, style, template, noscript, img, svg")
@@ -122,9 +160,6 @@ pub fn read<R: Read + Seek>(file: R) -> Result<(String, Layout), String> {
             content.push_str("\n\n");
             offset += 2;
         }
-        if content.len() > TEXT_LIMIT {
-            return Err("EPUB 正文超过 10 MB".into());
-        }
     }
     if content.is_empty() {
         return Err("EPUB 没有可导入的正文。受保护或仅含图片的电子书无法导入。".into());
@@ -143,6 +178,28 @@ pub fn read<R: Read + Seek>(file: R) -> Result<(String, Layout), String> {
 mod tests {
     use std::io::{Cursor, Write};
     use zip::{write::SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn preserves_body_after_xhtml_self_closing_script() {
+        let html = r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><script src="book.js"/></head><body><p>Real chapter text.</p></body></html>"#;
+        let cleaned = super::remove_xhtml_scripts(html);
+        assert!(!cleaned.contains("<script"));
+        let document = dom_query::Document::from(cleaned.as_str());
+        assert!(document.select("body").text().contains("Real chapter text."));
+    }
+
+    #[test]
+    fn inspect_requested_epub() {
+        let Ok(path) = std::env::var("SEMANTIC_READER_TEST_EPUB") else { return; };
+        let bytes = std::fs::read(&path).unwrap();
+        let cover = super::cover(&bytes).unwrap().expect("book cover");
+        assert!(cover.starts_with("data:image/"));
+        eprintln!("Cover response {} bytes for EPUB {} bytes",cover.len(),bytes.len());
+        let (text, layout) = super::read(std::fs::File::open(path).unwrap()).unwrap();
+        assert!(text.contains("BATTLE OF THE GENERATIONS"));
+        assert!(text.len()>100_000);
+        eprintln!("Extracted {} bytes across {} sections",text.len(),layout.nodes.len());
+    }
 
     #[test]
     fn imports_spine_order_and_ignores_active_markup() {

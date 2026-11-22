@@ -7,12 +7,12 @@ let pending = Promise.resolve();
 
 async function loadCover(id:string,format:string):Promise<Blob|null> {
   if (format==='epub') {
-    const module = new URL('./foliate/view.js',import.meta.url).href;
-    const [{makeBook},encoded] = await Promise.all([import(module),call<string>('epub_original',{id})]);
-    const bytes = Uint8Array.from(atob(encoded),character=>character.charCodeAt(0));
-    const book = await makeBook(new File([bytes],'book.epub'));
-    try { return await book.getCover(); }
-    finally { book.destroy(); }
+    const image = await call<string|null>('epub_cover',{id});
+    if (!image) return null;
+    const separator = image.indexOf(',');
+    const mime = image.slice(5,image.indexOf(';'));
+    const bytes = Uint8Array.from(atob(image.slice(separator+1)),character=>character.charCodeAt(0));
+    return new Blob([bytes],{type:mime});
   }
   const {length} = await call<{length:number}>('pdf_load',{id});
   const task = await loadPdf(id,length,()=>{});

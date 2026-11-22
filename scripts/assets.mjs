@@ -1,4 +1,8 @@
-import {copyFile, cp, mkdir} from 'node:fs/promises';
+import {transform} from 'esbuild';
+import {copyFile, cp, mkdir, readFile} from 'node:fs/promises';
+const css = await readFile('src/style.css','utf8');
+const checkedCss = await transform(css,{loader:'css',logLevel:'silent'});
+if (checkedCss.warnings.length) throw new Error('Invalid CSS: '+checkedCss.warnings.map(warning=>warning.text).join('; '));
 for (const [from,to] of [
   ['index.html','index.html'], ['src/style.css','style.css'], ['src-tauri/icons/icon.png','icon.png'],
   ['node_modules/react/umd/react.production.min.js','react.js'],

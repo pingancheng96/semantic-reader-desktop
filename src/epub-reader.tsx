@@ -1,7 +1,7 @@
 import {ReaderToolbar,pageTurnDirection} from './reader-toolbar.js';
 import {ReaderNavigation, readReaderPreference, saveReaderPreference, type ReaderNavigationState} from './reader-navigation.js';
 import {readerGestures} from './reader-gestures.js';
-import {React, call, setNativeEpubKeys} from './runtime.js';
+import {React, call, readEpubEntry, setNativeEpubKeys} from './runtime.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import type {WebNode} from './web-captions.js';
 
@@ -163,18 +163,28 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
     const chapterNodes=(JSON.parse(layout) as {nodes:WebNode[]}).nodes;
     void (async()=>{
       const module=new URL('./foliate/view.js',import.meta.url).href;
-      const [encoded]=await Promise.all([call<string>('epub_original',{id}),import(module)]);
+      const epubModule=new URL('./foliate/epub.js',import.meta.url).href;
+      const [entries,,{EPUB}]=await Promise.all([
+        call<{name:string;size:number}[]>('epub_entries',{id}),import(module),import(epubModule),
+      ]);
       if (!alive) return;
-      const bytes=Uint8Array.from(atob(encoded),character=>character.charCodeAt(0));
+      const sizes=new Map(entries.map(entry=>[entry.name,entry.size]));
+      const decoder=new TextDecoder();
+      const book=await new EPUB({
+        getSize:(name:string)=>sizes.get(name) ?? 0,
+        loadText:async(name:string)=>sizes.has(name) ? decoder.decode(await readEpubEntry(id,name)) : null,
+        loadBlob:async(name:string,type?:string)=>sizes.has(name) ? new Blob([await readEpubEntry(id,name)],{type}) : null,
+      }).init();
+      if (!alive) {book.destroy();return;}
       renderer=document.createElement('foliate-view') as View;
       view.current=renderer;host.current?.append(renderer);
       renderer.addEventListener('external-link',event=>event.preventDefault());
       renderer.addEventListener('relocate',event=>{
-        if (alive) {
+        if (alive && isVisible.current) {
           const current = (event as CustomEvent<Location>).detail;
           setLocation(current);
           if (current.cfi) saveReaderPreference(positionKey,current.cfi);
-          const percent = typeof current.fraction==='number' ? `${Math.round(current.fraction*100)}%` : '';
+          const percent = typeof current.fraction==='number' && Number.isFinite(current.fraction) ? `${Math.round(current.fraction*100)}%` : '';
           const progress = [current.tocItem?.label,percent].filter(Boolean).join(' · ');
           if (progress) saveReaderPreference(`readingProgress:${id}`,progress);
         }
@@ -323,6 +333,7 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
       });
       renderer.addEventListener('load',event=>attach((event as CustomEvent<{doc:Document;index:number}>).detail));
       poll=window.setInterval(()=>{
+        if (!isVisible.current) return;
         for (const section of renderer?.renderer?.getContents() ?? []) {
           attach(section);
           selectionReaders.get(section.doc)?.();
@@ -354,7 +365,7 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
           return group;
         });
       });
-      await renderer.open(new File([bytes], 'book.epub',{type:'application/epub+zip'}));
+      await renderer.open(book);
       if (!alive) {renderer.close();return;}
       setToc(renderer.book.toc ?? []);
       await renderer.init({lastLocation:readReaderPreference(positionKey)});
@@ -435,6 +446,8 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
         if (location) saveBookmarks(saved ? bookmarks.filter(item=>item.cfi!==location.cfi) :
           [...bookmarks,{cfi:location.cfi,label:location.tocItem?.label || `书签 ${bookmarks.length+1}`}]);
       }}}
+      pageIndicator={typeof location?.fraction==='number' && Number.isFinite(location.fraction) &&
+        <span className="reader-progress" title={location.tocItem?.label}>全书 {Math.round(location.fraction*100)}%</span>}
       previous={()=>turnPage(-1)} next={()=>turnPage(1)}>
       <button type="button" disabled={!ready} aria-label="书内搜索" onClick={()=>setSearchOpen(!searchOpen)}>⌕</button>
     </ReaderToolbar>

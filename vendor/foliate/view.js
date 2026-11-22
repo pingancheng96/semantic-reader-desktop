@@ -328,6 +328,13 @@ export class View extends HTMLElement {
     }
     #onRelocate({ reason, range, index, fraction, size }) {
         const progress = this.#sectionProgress?.getProgress(index, fraction, size) ?? {}
+        if (!Number.isFinite(progress.fraction) && this.book.sections.length) {
+            const withinSection = (Number.isFinite(fraction) ? fraction : 0)
+                + (Number.isFinite(size) ? size : 0)
+            progress.fraction = (index + Math.max(0, Math.min(1, withinSection))) / this.book.sections.length
+        }
+        if (Number.isFinite(progress.fraction))
+            progress.fraction = Math.max(0, Math.min(1, progress.fraction))
         const tocItem = this.#tocProgress?.getProgress(index, range)
         const pageItem = this.#pageProgress?.getProgress(index, range)
         const cfi = this.getCFI(index, range)

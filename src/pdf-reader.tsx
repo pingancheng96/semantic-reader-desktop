@@ -576,7 +576,7 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,to
         <input type="text" inputMode="numeric" aria-label="输入页码，回车跳转" disabled={!pdf}
           value={pageDraft ?? String(page)} onFocus={event=>event.currentTarget.select()}
           onChange={event=>setPageDraft(event.target.value)} onBlur={()=>setPageDraft(null)}/>
-        <span>/ {pdf?.numPages ?? '…'} 页</span>
+        <span>/ {pdf?.numPages ?? '…'} 页{pdf && <> · {Math.round(100*page/pdf.numPages)}%</>}</span>
       </form>}/>
     {find && <div className="article-search" role="search" aria-label="文章内搜索" onKeyDown={event=>{
       if (event.key==='Escape' && !event.nativeEvent.isComposing) {

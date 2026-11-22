@@ -116,6 +116,7 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
   const [offline,setOffline] = useState(false);
   const variant = chosenModel();
   useEffect(()=>{void call<KokoroStatus>('kokoro_status').then(status=>setOffline(status[variant]),()=>{});},[variant]);
+  const [reload,setReload] = useState(0);
   const [sounds,setSounds] = useState<Sound[]|null>(null);
   const [choice,setChoice] = useState('');
   const [error,setError] = useState('');
@@ -125,7 +126,7 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
   const generation = useRef(0);
   useEffect(()=>{
     let current = true;
-    setSounds(null);setError('');setChoice('');setLoading(null);
+    setSounds(null);setError('');setLoading(null);
     if (!id) setSounds([]);
     else void call<Sound[]>('pronunciation_lookup',{id,word}).then(
       value=>{if(current)setSounds(value.filter(sound=>sound.word===word.trim().toLowerCase()));},
@@ -136,6 +137,7 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
       audio.current?.pause();audio.current=null;localAudio.current?.stop();localAudio.current=null;
     };
   },[id,word]);
+  useEffect(()=>setChoice(''),[id,word]);
   const allPositions = [...new Set((sounds ?? []).map(sound=>sound.pos).filter(Boolean))];
   const hinted = allPositions.find(label=>label===pos || positions[label]===pos);
   const selected = allPositions.includes(choice) ? choice : hinted || allPositions[0] || '';
@@ -146,7 +148,7 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
   const model = ai?.model;
   const role = selected || pos;
   const needsEstimate = Boolean(endpoint && model && (!uk?.ipa || !us?.ipa));
-  const [suggestion,setSuggestion] = useState<{word:string;context?:string;role?:string|null;value:Estimate|null}|null>(null);
+  const [suggestion,setSuggestion] = useState<{word:string;context?:string;role?:string|null;value:Estimate|null;error?:string}|null>(null);
   const requestMatches = suggestion?.word===word && suggestion.context===context && suggestion.role===role;
   const estimate = requestMatches && needsEstimate ? suggestion.value : null;
   useEffect(()=>{
@@ -156,11 +158,11 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
     const timer = window.setTimeout(()=>{
       void call<Estimate>('pronunciation_estimate',{endpoint,model,word,context,pos:role}).then(
         value=>{if (active) setSuggestion({word,context,role,value});},
-        error=>{if (active) {setSuggestion({word,context,role,value:null});setError(String(error));}}
+        error=>{if (active) setSuggestion({word,context,role,value:null,error:String(error)});}
       );
     },250);
     return ()=>{active=false;window.clearTimeout(timer);};
-  },[sounds,needsEstimate,endpoint,model,word,context,role]);
+  },[sounds,needsEstimate,endpoint,model,word,context,role,reload]);
   async function play(region:Accent,sound:Sound|undefined,ipa:string|undefined|null) {
     const request = ++generation.current;
     setLoading(region);setError('');audio.current?.pause();localAudio.current?.stop();localAudio.current=null;
@@ -184,6 +186,12 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
       if (request===generation.current) setLoading(null);
     }
   }
+  const ukFailed = needsEstimate && requestMatches && !uk?.ipa && !estimate?.ipa_uk;
+  const usFailed = needsEstimate && requestMatches && !us?.ipa && !estimate?.ipa_us;
+  function retryIpa() {
+    return <button type="button" className="quiet ipa-retry" title={suggestion?.error || '重试 AI 音标'}
+      onClick={()=>{setSuggestion(null);setReload(value=>value+1);}}>↻ 重试</button>;
+  }
   function row(region:Accent,sound:Sound|undefined,estimated?:string|null) {
     const label = region==='UK' ? '英式' : '美式';
     const usesEstimate = !sound?.ipa && Boolean(estimated);
@@ -191,7 +199,7 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
     const recording = usesEstimate ? undefined : sound;
     const waiting = !sound?.ipa && needsEstimate && !requestMatches;
     return <div className="pronunciation-row">
-      <span>{label}</span><span lang="en">{ipa || '—'}</span>
+      <span>{label}</span><span><span lang="en">{ipa || '—'}</span>{ukFailed!==usFailed && (region==='UK' ? ukFailed : usFailed) && retryIpa()}</span>
       <button type="button" aria-label={`播放${label}发音`} disabled={!sounds || waiting || Boolean(loading) || (!recording?.audio && !offline)}
         onClick={()=>void play(region,recording,ipa)}>{loading===region ? '载入中…' : '🔊'}</button>
       {waiting ? <small>正在请求 AI 音标…</small> : !recording?.audio && <small>{usesEstimate ? 'AI 建议 · ' : ''}{offline ? 'Kokoro 合成' : '需下载 Kokoro'}</small>}
@@ -203,6 +211,7 @@ export function PronunciationPanel({id,word,pos,context,ai}: {
     </select></label>}
     {row('UK',uk,estimate?.ipa_uk)}{row('US',us,estimate?.ipa_us)}
     {!sounds && <small>正在查询发音词典…</small>}
+    {ukFailed && usFailed && <small role="status">AI 音标未加载 {retryIpa()}</small>}
     {error && <p role="status">{error}</p>}
   </div>;
 }

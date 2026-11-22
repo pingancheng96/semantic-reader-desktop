@@ -287,6 +287,42 @@ async fn pronunciation_folder(app: tauri::AppHandle) -> Result<Value> {
 }
 
 #[tauri::command]
+async fn browser_open(app: tauri::AppHandle, url: String) -> Result<()> {
+    let url = web_import::parse_url(&url)?;
+    if let Some(window) = app.get_webview_window("web-import") {
+        window.navigate(url).map_err(|e|e.to_string())?;
+        window.set_focus().map_err(|e|e.to_string())?;
+    } else {
+        tauri::WebviewWindowBuilder::new(&app, "web-import", tauri::WebviewUrl::External(url))
+            .title("加载文章后，回到 Semantic Reader 点击「导入已打开的页面」")
+            .inner_size(1100.0,800.0)
+            .on_navigation(|url|matches!(url.scheme(),"http"|"https"))
+            .build().map_err(|e|e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_import(app: tauri::AppHandle, state: State<'_, Database>) -> Result<Value> {
+    let window = app.get_webview_window("web-import").ok_or("请先打开浏览窗口")?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let send = std::sync::Mutex::new(Some(send));
+    window.eval_with_callback(
+        "({url:location.href,html:document.documentElement.outerHTML})",
+        move |value| { if let Ok(mut sender) = send.lock() { if let Some(sender) = sender.take() { let _ = sender.send(value); } } },
+    ).map_err(|e|e.to_string())?;
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(20),receive).await
+        .map_err(|_|"读取浏览页面超时")?.map_err(|_|"读取浏览页面失败")?;
+    let captured: Value = serde_json::from_str(&raw).map_err(|_|"浏览页面返回内容无效")?;
+    let mut page = web_import::browser_page(captured["url"].as_str().ok_or("无法读取网页地址")?,
+        captured["html"].as_str().ok_or("无法读取网页正文")?)?;
+    web_import::fill_images(&mut page).await;
+    let path = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || store::import_web(&Db::open(&path)?,page))
+        .await.map_err(|_|"保存网页失败")?
+}
+
+#[tauri::command]
 async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Result<Value> {
     use tauri_plugin_dialog::DialogExt;
     let database = state.0.clone();
@@ -323,28 +359,21 @@ fn import_local_path(database: &std::path::Path, path: &std::path::Path) -> Resu
     }
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
     if !path.is_file() { return Err("请选择本地文件".into()); }
-    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
     let db = Db::open(&database)?;
     let id = match extension.as_str() {
         "epub" => {
             let mut bytes = Vec::new();
-            file.take(30_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-            if bytes.len() > 30_000_000 { return Err("EPUB 文件最大 30 MB".into()); }
+            file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
             let (content, layout) = epub::read(std::io::Cursor::new(&bytes))?;
             store::import_rich_text(&db, title, &content, &layout, &bytes)?
         }
         "pdf" => {
-            if file.metadata().map_err(|e| e.to_string())?.len() > store::PDF_MAX_BYTES {
-                return Err("PDF 文件最大 100 MB".into());
-            }
             store::import_pdf(&db, title, file)?
         }
         "md" | "markdown" | "txt" => {
             let mut bytes = Vec::new();
-            file.take(2_000_001).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-            if bytes.len() > 2_000_000 {
-                return Err("文件最大 2 MB".into());
-            }
+            file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
             let content = std::str::from_utf8(&bytes).map_err(|_| "请选择 UTF-8 文本文件")?;
             store::import(&db, title, if extension == "txt" { "txt" } else { "md" }, content)?
         }
@@ -368,6 +397,24 @@ async fn restore_backup_file(app: tauri::AppHandle, state: State<'_, Database>) 
         store::run(&Db::open(&database)?, "restore", &backup)?;
         Ok(true)
     }).await.map_err(|_| "恢复备份文件失败")?
+}
+
+#[tauri::command]
+async fn epub_entry(state: State<'_, Database>, id: String, name: String) -> Result<tauri::ipc::Response> {
+    use std::io::Read;
+    let path = state.0.clone();
+    let data = tauri::async_runtime::spawn_blocking(move || {
+        let db = Db::open(&path)?;
+        let key = serde_json::json!(id);
+        let path = store::epub_path(&db,&key)?;
+        let file = std::fs::File::open(path).map_err(|e|e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e|e.to_string())?;
+        let mut entry = zip.by_name(&name).map_err(|e|e.to_string())?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+        Ok::<_,String>(bytes)
+    }).await.map_err(|_| "无法读取 EPUB 资源")??;
+    Ok(tauri::ipc::Response::new(data))
 }
 
 #[tauri::command]
@@ -538,10 +585,13 @@ fn main() {
             request,
             export_file,
             import_file,
+            browser_open,
+            browser_import,
             import_dropped_files,
             epub_keyboard,
             restore_backup_file,
             pdf_range,
+            epub_entry,
             pronunciation_folder,
             kokoro_install,
             kokoro_read

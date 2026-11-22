@@ -325,6 +325,17 @@ fn charset(parameters: &str) -> Option<&'static Encoding> {
     })
 }
 
+pub fn browser_page(url: &str, html: &str) -> Result<Page> {
+    if html.len() > MAX_HTML { return Err("网页内容过大".into()); }
+    let doc = Document::from(html);
+    let title = doc.select_single("title").text().to_lowercase();
+    if title.contains("just a moment") || title.contains("attention required") ||
+        !doc.select("#challenge-running, #challenge-stage").nodes().is_empty() {
+        return Err("网页仍在进行浏览器验证，请完成后再导入".into());
+    }
+    extract(parse_url(url)?, "text/html; charset=utf-8", "text/html", html.as_bytes())
+}
+
 fn extract(url: Url, content_type: &str, media_type: &str, bytes: &[u8]) -> Result<Page> {
     let encoding = Encoding::for_bom(bytes)
         .map(|(encoding, _)| encoding)
@@ -364,7 +375,16 @@ fn extract(url: Url, content_type: &str, media_type: &str, bytes: &[u8]) -> Resu
         let doc = Document::from(text.as_ref());
         doc.select("script, style, noscript, template, nav, footer, aside, form, iframe, svg, [hidden], [aria-hidden='true'], [role='navigation'], [role='banner'], [role='contentinfo']").remove();
         let title = doc.select_single("head title").text();
-        let root = ["main article", "article", "main, [role='main']", "body"]
+        let wikipedia = url.host_str().is_some_and(|host| host=="wikipedia.org" || host.ends_with(".wikipedia.org"));
+        if wikipedia {
+            doc.select("#p-lang-btn, #p-lang, .mw-portlet-lang, .interlanguage-link, .mw-editsection").remove();
+        }
+        let selectors = if wikipedia {
+            vec!["#mw-content-text .mw-parser-output", "#mw-content-text", "main article", "article", "main", "body"]
+        } else {
+            vec!["main article", "article", "main, [role='main']", "body"]
+        };
+        let root = selectors
             .into_iter()
             .find_map(|selector| {
                 doc.select(selector)
@@ -416,6 +436,19 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn wikipedia_uses_article_body_without_language_menu() {
+        let html = br#"<html><head><title>Christmas</title></head><body><main>
+          <div id="p-lang-btn"><ul><li class="interlanguage-link">Language list noise</li></ul></div>
+          <div id="mw-content-text"><div class="mw-parser-output"><h2>History</h2><p>Article text.</p></div></div>
+          <div>Other interface text</div></main></body></html>"#;
+        let page = extract(Url::parse("https://en.wikipedia.org/wiki/Christmas").unwrap(),
+            "text/html; charset=utf-8", "text/html",html).unwrap();
+        assert!(page.content.contains("Article text."));
+        assert!(!page.content.contains("Language list noise"));
+        assert!(!page.content.contains("Other interface text"));
+    }
+
     #[test]
     fn macos_can_resize_supported_images_and_reject_invalid_content() {
         let bytes = include_bytes!("../icons/icon.png");

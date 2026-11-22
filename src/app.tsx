@@ -9,7 +9,7 @@ import {useArticleSearchShortcut} from './article-search.js';
 import {PdfReader} from './pdf-reader.js';
 import {waitForVoice} from './speech-voices.js';
 import type {ClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode} from 'react';
-import {React, ReactDOM, call, exportFile, importLocalFile, importDroppedFiles, listenForFileDrop, restoreBackupFile} from './runtime.js';
+import {React, ReactDOM, call, exportFile, importLocalFile, openImportBrowser, importBrowserPage, importDroppedFiles, listenForFileDrop, restoreBackupFile} from './runtime.js';
 import {articleMatches, changedRanges, keepUnchanged, readingLines, selectedOffsets, type Piece} from './reading.js';
 import {captionNodes, type WebNode} from './web-captions.js';
 const {useState, useEffect, useLayoutEffect, useMemo, useRef} = React;
@@ -285,6 +285,7 @@ function SilSenseList({category,query,library,busy,onCount,openCategory,openDocu
   category:string;query:string;library:Library;busy:boolean;onCount:(count:number)=>void;openCategory:(code:string)=>void;openDocument:(id:string,mark:string)=>void;move:(sense:Sense,code:string)=>void;remove:(sense:Sense,code:string)=>void;directOnly:boolean;
 }) {
   const domains = useSilCatalog();
+  const [sort,setSort] = useState(()=>readReaderPreference('senseListSort') || 'category');
   const [data,setData] = useState<{rows:(Sense & {context:string|null;categories:string[];links?:Mark[];sil_diagnostic?:unknown})[]; error:string}|null>(null);
   useEffect(()=>{
     let active = true;
@@ -297,22 +298,40 @@ function SilSenseList({category,query,library,busy,onCount,openCategory,openDocu
   if (!data) return <p role="status">正在读取义项…</p>;
   if (data.error) return <p role="alert">{data.error}</p>;
   const sections = new Map<string,typeof data.rows>();
-  for (const row of data.rows) {
-    const code = row.categories.find(code=>code===category) ??
+  const ordered = [...data.rows].sort((a,b)=>{
+    const difference = (a.links?.length ?? 0)-(b.links?.length ?? 0);
+    return (sort==='links-asc' ? difference : sort==='links-desc' ? -difference : 0)
+      || a.lemma.localeCompare(b.lemma,'en') || a.id.localeCompare(b.id);
+  });
+  for (const row of ordered) {
+    const code = sort!=='category' ? category : row.categories.find(code=>code===category) ??
       row.categories.find(code=>code.startsWith(category+'.')) ?? category;
     const section = sections.get(code) ?? [];
     section.push(row);
     sections.set(code,section);
   }
   return <section aria-label="分类义项">
-    <p className="muted">{data.rows.length} 个{directOnly ? '直属' : ''}义项</p>
+    <div className="sense-list-controls">
+      <p className="muted">{data.rows.length} 个{directOnly ? '直属' : ''}义项</p>
+      <label>排序<select value={sort} onChange={event=>{
+        setSort(event.target.value);saveReaderPreference('senseListSort',event.target.value);
+      }}>
+        <option value="category">按分类</option>
+        <option value="links-asc">链接数从少到多</option>
+        <option value="links-desc">链接数从多到少</option>
+      </select></label>
+    </div>
     {[...sections].map(([code,rows])=><section key={code} className="sil-senses">
       {code!==category && <h2><button type="button" className="quiet sil-section-link"
         title={silPath(domains,code)} onClick={()=>openCategory(code)}>
         {silPath(domains,code).split(' › ').at(-1)} <span aria-hidden="true">↗</span>
       </button></h2>}
       <ul>{rows.map(row=><li key={row.id}>
-        <details><summary><b lang="en">{row.lemma}</b> <span>{row.meaning}</span></summary>
+        <details><summary><b lang="en">{row.lemma}</b> <span>{row.meaning}</span>
+          <small className="sense-link-count" title={`来自 ${new Set(row.links?.map(link=>link.document_id)).size} 篇文本；展开可查看原文`}>
+            {row.links?.length ?? 0} 处链接
+          </small>
+        </summary>
           {row.sil_diagnostic != null && <details>
             <summary>查看上次 AI 分类排错记录</summary>
             <pre style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}>{JSON.stringify(row.sil_diagnostic,null,2)}</pre>
@@ -330,10 +349,10 @@ function SilSenseList({category,query,library,busy,onCount,openCategory,openDocu
             <DestinationSelect domains={domains} row={{code:null}} parent="" existing={row.categories}
               disabled={busy || !domains.length} change={code=>{if(code)move(row,code);}}/>
           </div>
-          {row.links?.map(link=><div className="backlink" key={link.id}>
+          {row.links?.map(link=><div className="backlink sense-backlink" key={link.id}>
             <button className="quiet" disabled={busy} onClick={()=>openDocument(link.document_id,link.id)}>{link.title} ↗</button>
             <p>{link.context}</p>
-            {link.context_meaning && <p>本句释义 · {link.context_meaning}</p>}
+            <p className="backlink-meaning">{link.context_meaning && <>本句释义 · {link.context_meaning}</>}</p>
           </div>)}
         </details>
       </li>)}</ul>
@@ -628,6 +647,25 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
     scrollPosition.current = area.scrollTop;
     saveReaderPreference(`textReadingPosition:${id}`,String(area.scrollTop));
   },[navigation.open,notesCollapsed,zoom,visible,id,readingAnchor,scrollPosition]);
+  const showProgress = Boolean(data.document.source_url || web_layout);
+  const [readingPercent,setReadingPercent] = useState<number|null>(null);
+  function updateProgress(area:HTMLElement) {
+    const distance = area.scrollHeight - area.clientHeight;
+    const percent = distance>0 ? Math.round(100*area.scrollTop/distance) : 100;
+    const bounded = Math.max(0,Math.min(100,percent));
+    setReadingPercent(bounded);
+    saveReaderPreference(`readingProgress:${id}`,`${bounded}%`);
+  }
+  useLayoutEffect(()=>{
+    const area = scrollArea.current;
+    const content = ref.current;
+    if (!visible || editing || !showProgress || !area || !content) return;
+    updateProgress(area);
+    const observer = new ResizeObserver(()=>updateProgress(area));
+    observer.observe(area);
+    observer.observe(content);
+    return ()=>observer.disconnect();
+  },[visible,editing,showProgress,id,zoom]);
   const web = useMemo(() => web_layout ? JSON.parse(web_layout) as WebLayout : null,[web_layout]);
   const captions = useMemo(() => captionNodes(web?.nodes ?? [],content), [web,content]);
   const lines = useMemo(() => web ? [] : readingLines(content, format === 'md'), [content,format,web]);
@@ -891,6 +929,7 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
       </> : null}
     </div>
     {!editing && <ReaderToolbar target={toolbar} zoom={zoom} changeZoom={changeZoom}
+      pageIndicator={showProgress && readingPercent!==null && <span className="reader-progress">全文 {readingPercent}%</span>}
       previous={()=>turn(-1)} next={()=>turn(1)} bookmark={{toggle:()=>{
         addBookmark();
         if (!navigation.open && scrollArea.current) readingAnchor.current = captureReadingAnchor(scrollArea.current);
@@ -935,11 +974,8 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
       if (visible) {
         scrollPosition.current = event.currentTarget.scrollTop;
         if (!editing) {
-          const area = event.currentTarget;
-          const distance = area.scrollHeight - area.clientHeight;
-          const percent = distance>0 ? Math.round(100*area.scrollTop/distance) : 100;
           saveReaderPreference(`textReadingPosition:${id}`,String(scrollPosition.current));
-          saveReaderPreference(`readingProgress:${id}`,`${Math.max(0,Math.min(100,percent))}%`);
+          updateProgress(event.currentTarget);
         }
       }
     }}>
@@ -961,6 +997,7 @@ function App() {
   const [mode,setMode] = useState<'texts'|'reader'|'library'|'settings'|'help'>('texts');
   const [lib,setLib] = useState<Library>(empty);
   const [webUrl,setWebUrl] = useState('');
+  const webImportDialog = useRef<HTMLDialogElement>(null);
   const [query,setQuery] = useState('');
   const [filter,setFilter] = useState('');
   const [read,setRead] = useState<Read | null>(null);
@@ -1286,16 +1323,37 @@ function App() {
           })}
           imports={<>
             <button className="primary" disabled={busy} onClick={()=>void task(importFile)}>＋ 导入文件</button>
-            <details className="library-web-import"><summary>从网址导入</summary>
-              <form className="web-import" onSubmit={e=>submit(e,async()=>{
+            <button type="button" disabled={busy} onClick={()=>webImportDialog.current?.showModal()}>导入网页</button>
+            {ReactDOM.createPortal(<dialog ref={webImportDialog} className="web-import-dialog" aria-labelledby="web-import-title">
+              <form onSubmit={e=>submit(e,async()=>{
                 const id = await call<string>('import_web',{url:webUrl.trim()});
-                setWebUrl(''); await refresh(); await openDoc(id); setNotice('网页已导入');
+                webImportDialog.current?.close();setWebUrl('');
+                await refresh();await openDoc(id);setNotice('网页已导入');
               })}>
-                <label>网页地址<input type="url" placeholder="https://example.com/article" value={webUrl}
+                <div className="web-import-heading">
+                  <h2 id="web-import-title">导入网页</h2>
+                  <button type="button" className="quiet" aria-label="关闭" onClick={()=>webImportDialog.current?.close()}>×</button>
+                </div>
+                <label>网页地址<input type="url" autoFocus placeholder="https://example.com/article" value={webUrl}
                   maxLength={4096} required disabled={busy} onChange={e=>setWebUrl(e.target.value)}/></label>
-                <button disabled={busy || !webUrl.trim()}>导入网页</button>
+                <button className="primary" disabled={busy || !webUrl.trim()}>导入</button>
+                <details className="web-import-alternative">
+                  <summary>网页需要验证或登录？</summary>
+                  <p className="muted">在浏览窗口打开文章，完成验证后回到这里导入。</p>
+                  <div className="row">
+                    <button type="button" disabled={busy || !webUrl.trim()} onClick={()=>void task(async()=>{
+                      await openImportBrowser(webUrl.trim());
+                    })}>打开浏览窗口</button>
+                    <button type="button" disabled={busy} onClick={()=>void task(async()=>{
+                      const id = await importBrowserPage();
+                      webImportDialog.current?.close();
+                      await refresh();await openDoc(id);setNotice('网页已导入');
+                    })}>导入已打开的页面</button>
+                  </div>
+                </details>
+                {error && <p role="alert">{error}</p>}
               </form>
-            </details>
+            </dialog>,document.body)}
           </>}/>
       </div>
       {mode==='library' && <aside className="shelf">
@@ -1383,9 +1441,9 @@ function App() {
             {read.document.pdf ? <PdfReader key={read.document.id} id={read.document.id} marks={read.marks}
               focused={focus} selection={selection} visible={mode==='reader'} toolbar={mode==='reader' ? readerToolbar : null} navigation={navigation} onSelect={capture} onClearSelection={resetSelection}
               onMark={openMarkNote}/> :
-            read.document.epub && read.document.web_layout ? <EpubReader key={read.document.id} id={read.document.id}
+            read.document.epub && read.document.web_layout ? (mode==='reader' && <EpubReader key={read.document.id} id={read.document.id}
               content={read.document.content} layout={read.document.web_layout} marks={read.marks} focused={focus}
-              visible={mode==='reader'} toolbar={mode==='reader' ? readerToolbar : null} navigation={navigation} onSelect={capture} onMark={openMarkNote}/> :
+              visible={mode==='reader'} toolbar={mode==='reader' ? readerToolbar : null} navigation={navigation} onSelect={capture} onMark={openMarkNote}/>) :
             <Reader key={read.document.id + (editing ? ':edit' : '')} data={read} visible={mode==='reader'}
               focused={focus} editing={editing} busy={busy} toolbar={mode==='reader' ? readerToolbar : null} navigation={navigation} readingAnchor={readingAnchor} notesCollapsed={notesCollapsed} scrollPosition={readerScroll} cancel={()=>setEditing(false)}
               beginEdit={()=>{resetSelection();setFocus('');setDeleteDocId('');setEditing(true);}}
@@ -1487,11 +1545,18 @@ function App() {
             {learning && <LearningPanel hidePos hideIpa learning={learning} word={selection.surface}/>}
             <form onSubmit={e=>submit(e,async ()=>{
               const savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
-              await call('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
+              const markId = await call<string>('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
                 sense_id:attachSense || null,group_id:attachGroup || null,
                 ungrouped_capture:true});
               window.getSelection()?.removeAllRanges();
-              await refresh(); await openDoc(selection.document_id);setNotice('标注已保存');
+              const updated = await call<Read>('document',{id:selection.document_id});
+              const savedMark = updated.marks.find(mark=>mark.id===markId);
+              setFocus('');
+              setRead(updated);
+              if (savedMark) openMarkNote(savedMark);
+              else resetSelection();
+              await refresh();
+              setNotice('标注已保存');
             })}>
               <fieldset className="annotation-fields" disabled={suggesting}>
               {candidateSenses.length > 0 && <label>复用既有义项<select value={attachSense} onChange={e=>setAttachSense(e.target.value)}>

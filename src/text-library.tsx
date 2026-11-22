@@ -11,6 +11,14 @@ function displayTitle(title:string) {
   return title.replace(/\.(md|markdown|txt|pdf|epub)$/i,'') || title;
 }
 
+function bookProgress(doc:DocumentItem): number|null {
+  const saved = readReaderPreference(`readingProgress:${doc.id}`) ?? '';
+  const pages = doc.format==='pdf' ? /^第 (\d+) \/ (\d+) 页$/.exec(saved) : null;
+  const percent = (doc.format==='epub' || doc.source_url) ? /(?:^| · )(\d+)%$/.exec(saved) : null;
+  const value = pages ? 100*Number(pages[1])/Number(pages[2]) : percent ? Number(percent[1]) : NaN;
+  return Number.isFinite(value) ? Math.round(Math.max(0,Math.min(100,value))) : null;
+}
+
 function showLibraryDialog(dialog:HTMLDialogElement|null) {
   if (dialog && !dialog.open) dialog.showModal();
 }
@@ -250,7 +258,9 @@ export function TextLibrary({documents,recent,busy,visible,imports,open,rename,r
         </button>)}
       </div>}
       <ul className={`text-library-items library-${view}`}>
-        {shown.map(doc=><li key={doc.id} className={selecting ? 'library-selecting' : undefined}>
+        {shown.map(doc=>{
+          const percent = bookProgress(doc);
+          return <li key={doc.id} className={selecting ? 'library-selecting' : undefined}>
           <button className="library-document" type="button" disabled={busy} onClick={()=>open(doc.id)}
             onContextMenu={event=>{
               event.preventDefault();
@@ -266,13 +276,15 @@ export function TextLibrary({documents,recent,busy,visible,imports,open,rename,r
               <strong>{displayTitle(doc.title)}</strong>
             </BookCover>}
             <span className="library-document-title">{displayTitle(doc.title)}</span>
-            {current==='recent' && <small className="library-document-meta">{progress(doc)}</small>}
+            {percent!==null ? <span className="library-reading-progress" title={progress(doc)}>
+              <progress value={percent} max={100} aria-label="上次阅读位置"/><small>{percent}%</small>
+            </span> : current==='recent' && <small className="library-document-meta">{progress(doc)}</small>}
           </button>
           {view==='list' && <small className="library-document-meta">{format(doc)}{recent[doc.id] ? ` · ${new Date(recent[doc.id]).toLocaleDateString()}` : ''}</small>}
           {selecting ? <input type="checkbox" aria-label={`选择 ${displayTitle(doc.title)}`} checked={selected.includes(doc.id)}
             onChange={event=>setSelected(event.target.checked ? [...selected,doc.id] : selected.filter(id=>id!==doc.id))}/>
             : null}
-        </li>)}
+        </li>;})}
       </ul>
       {menu && <div ref={menuRef} className="reader-document-menu-panel library-context-menu"
         role="group" aria-label={`${displayTitle(menu.doc.title)} 的管理操作`}

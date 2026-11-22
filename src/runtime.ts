@@ -41,3 +41,11 @@ export const importDroppedFiles = (paths:string[]) =>
   tauri.core.invoke<{imported:number;errors:string[]}>('import_dropped_files',{paths});
 
 export const setNativeEpubKeys = (enabled:boolean) => tauri.core.invoke<void>('epub_keyboard',{enabled});
+
+export async function readEpubEntry(id:string,name:string) {
+  const data = await tauri.core.invoke<ArrayBuffer|number[]>('epub_entry',{id,name});
+  return data instanceof ArrayBuffer ? new Uint8Array(data) : Uint8Array.from(data);
+}
+
+export const openImportBrowser = (url:string) => tauri.core.invoke<void>('browser_open',{url});
+export const importBrowserPage = () => tauri.core.invoke<string>('browser_import',{});

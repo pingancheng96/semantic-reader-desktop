@@ -7,6 +7,21 @@ use crate::{
 use serde_json::{json, Value as V};
 use uuid::Uuid;
 
+pub fn epub_path(db: &Db, key: &V) -> Result<std::path::PathBuf> {
+    let value = key.as_str().ok_or("书籍编号无效")?;
+    Uuid::parse_str(value).map_err(|_| "书籍编号无效")?;
+    let directory = db.path().with_file_name("epub-originals");
+    let path = directory.join(format!("{value}.epub"));
+    if path.is_file() { return Ok(path); }
+    let row = db.one("SELECT data FROM epub_files WHERE document_id=?1", &[key.clone()])?;
+    let bytes = STANDARD.decode(row["data"].as_str().ok_or("缺少 EPUB 文件")?).map_err(|e|e.to_string())?;
+    std::fs::create_dir_all(&directory).map_err(|e|e.to_string())?;
+    let temporary = directory.join(format!("{}.tmp",Uuid::new_v4()));
+    std::fs::write(&temporary,bytes).map_err(|e|e.to_string())?;
+    std::fs::rename(&temporary,&path).map_err(|e|e.to_string())?;
+    Ok(path)
+}
+
 pub fn init(db: &Db) -> Result<()> {
     init_schema(db, true)
 }
@@ -92,7 +107,7 @@ fn migrate_pdf_storage(db: &Db) -> Result<()> {
         PRAGMA user_version=10;")
 }
 
-pub const PDF_MAX_BYTES: u64 = 100_000_000;
+const PDF_RANGE_MAX_BYTES: u64 = 100_000_000;
 
 fn pdf_directory(db: &Db) -> std::path::PathBuf {
     db.path().with_file_name("pdf-originals")
@@ -117,11 +132,7 @@ fn write_pdf(db: &Db, mut source: impl std::io::Read) -> Result<(String, std::pa
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
             .open(&path).map_err(|e| e.to_string())?;
         file.write_all(&prefix).map_err(|e| e.to_string())?;
-        let remainder = std::io::copy(&mut source.take(PDF_MAX_BYTES + 1 - prefix.len() as u64), &mut file)
-            .map_err(|e| e.to_string())?;
-        if remainder + prefix.len() as u64 > PDF_MAX_BYTES {
-            return Err("PDF 文件最大 100 MB".into());
-        }
+        std::io::copy(&mut source, &mut file).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())
     })();
     if let Err(error) = result {
@@ -182,7 +193,7 @@ pub fn pdf_range(db: &Db, p: &V, begin: u64, end: u64) -> Result<Vec<u8>> {
     let file = db.one("SELECT storage FROM pdf_files WHERE document_id=?1", &[key])?;
     let path = pdf_path(db,file["storage"].as_str().ok_or("PDF 尚未准备就绪")?)?;
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if end <= begin || end - begin > PDF_MAX_BYTES || end > file.metadata().map_err(|e| e.to_string())?.len() {
+    if end <= begin || end - begin > PDF_RANGE_MAX_BYTES || end > file.metadata().map_err(|e| e.to_string())?.len() {
         return Err("PDF 读取范围无效".into());
     }
     let mut bytes = vec![0; (end-begin) as usize];
@@ -486,10 +497,9 @@ fn insert_document(
         || title.chars().count() > 255
         || !matches!(format, "md" | "txt")
         || content.trim().is_empty()
-        || content.len() > if layout.is_null() || source.is_some() { 2_000_000 } else { crate::epub::TEXT_LIMIT }
         || content.contains('\0')
     {
-        return Err("请选择非空 UTF-8 Markdown/TXT 文件（最大 2 MB）".into());
+        return Err("请选择非空 UTF-8 Markdown/TXT 文件".into());
     }
     let key = uuid();
     db.write(
@@ -576,10 +586,10 @@ fn edit_document(db: &Db, p: &V) -> Result<V> {
     if old["content"] != p["original"] {
         return Err("文章已更新，请重新打开后编辑".into());
     }
-    let limit = if old["web_layout"].is_string() && old["source_url"].is_null() { crate::epub::TEXT_LIMIT } else { 2_000_000 };
     let content = p["content"].as_str()
-        .filter(|s| !s.trim().is_empty() && s.len() <= limit && !s.contains('\0'))
-        .ok_or_else(|| format!("正文不能为空，且最大为 {} MB", limit / 1_000_000))?;
+        .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
+        .ok_or("正文不能为空或包含空字符")?;
+    let limit = old["content"].as_str().unwrap_or_default().encode_utf16().count().max(content.encode_utf16().count());
     if old["content"] == content {
         return Ok(json!(0));
     }
@@ -1577,12 +1587,12 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                         };
                     }
                     if table == "epub_files" && col == "data" {
-                        return row[col].as_str().filter(|text| text.len() <= 40_000_000)
+                        return row[col].as_str()
                             .filter(|text| STANDARD.decode(text).is_ok())
                             .map(|text| json!(text)).ok_or_else(|| "EPUB 备份文件无效".into());
                     }
                     if matches!(table, "pdf_files" | "pdf_pages") {
-                        let limit = match col { "data" => 133_333_336, "layer" => 12_000_000, _ => 2_000_000 };
+                        let limit = match col { "data" => usize::MAX, "layer" => 12_000_000, _ => 2_000_000 };
                         return row[col].as_str().filter(|value| value.len() <= limit && !value.contains('\0'))
                             .map(|value| json!(value)).ok_or_else(|| format!("PDF 备份字段 {col} 无效"));
                     }
@@ -1590,7 +1600,7 @@ fn restore(db: &Db, p: &V) -> Result<V> {
                         let text = row[col]
                             .as_str()
                             .filter(|s| {
-                                s.len() <= crate::epub::TEXT_LIMIT && !s.contains('\0') && (!s.trim().is_empty()
+                                !s.contains('\0') && (!s.trim().is_empty()
                                     || p["pdf_files"].as_array().is_some_and(|rows|
                                         rows.iter().any(|pdf| pdf["document_id"] == row["id"])))
                             })
@@ -1659,7 +1669,7 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
     match op {
         "list" => {
             let q = field(p, "q", 200, false)?;
-            let docs = db.query("SELECT id,title,CASE WHEN EXISTS(SELECT 1 FROM pdf_files WHERE document_id=documents.id) THEN 'pdf' WHEN EXISTS(SELECT 1 FROM epub_files WHERE document_id=documents.id) THEN 'epub' ELSE format END AS format,source_url FROM documents WHERE instr(lower(title),lower(?1))>0 OR instr(lower(coalesce(source_url,'')),lower(?1))>0 ORDER BY created_at DESC, rowid DESC",&[json!(q)])?;
+            let docs = db.query("SELECT id,title,CASE WHEN EXISTS(SELECT 1 FROM pdf_files WHERE document_id=documents.id) THEN 'pdf' WHEN EXISTS(SELECT 1 FROM epub_files WHERE document_id=documents.id) OR (web_layout IS NOT NULL AND source_url IS NULL) THEN 'epub' ELSE format END AS format,source_url FROM documents WHERE instr(lower(title),lower(?1))>0 OR instr(lower(coalesce(source_url,'')),lower(?1))>0 ORDER BY created_at DESC, rowid DESC",&[json!(q)])?;
             let undo = db.one(
                 "SELECT EXISTS(SELECT 1 FROM operation_history) AS available",
                 &[],
@@ -1817,6 +1827,33 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
             db.batch("DELETE FROM operation_history")?;
             Ok(V::Null)
         }),
+        "epub_cover" => {
+            let key = id(p,"id")?;
+            let cache = db.path().with_file_name("epub-covers");
+            let path = cache.join(format!("{}.json",key.as_str().unwrap()));
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(value) = serde_json::from_slice::<Option<String>>(&bytes) { return Ok(json!(value)); }
+            }
+            let encoded = db.one("SELECT data FROM epub_files WHERE document_id=?1",&[key])?;
+            let bytes = STANDARD.decode(encoded["data"].as_str().ok_or("缺少 EPUB 文件")?).map_err(|e|e.to_string())?;
+            let cover = crate::epub::cover(&bytes)?;
+            std::fs::create_dir_all(&cache).map_err(|e|e.to_string())?;
+            let temporary = cache.join(format!("{}.tmp",Uuid::new_v4()));
+            std::fs::write(&temporary,serde_json::to_vec(&cover).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            std::fs::rename(&temporary,&path).map_err(|e|e.to_string())?;
+            Ok(json!(cover))
+        }
+        "epub_entries" => {
+            let path = epub_path(db,&id(p,"id")?)?;
+            let file = std::fs::File::open(path).map_err(|e|e.to_string())?;
+            let mut zip = zip::ZipArchive::new(file).map_err(|e|e.to_string())?;
+            let mut entries = Vec::new();
+            for index in 0..zip.len() {
+                let entry = zip.by_index(index).map_err(|e|e.to_string())?;
+                if !entry.is_dir() { entries.push(json!({"name":entry.name(),"size":entry.size()})); }
+            }
+            Ok(json!(entries))
+        }
         "epub_original" => {
             Ok(db.one("SELECT data FROM epub_files WHERE document_id=?1", &[id(p, "id")?])?["data"].clone())
         }

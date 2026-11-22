@@ -437,3 +437,29 @@ button.delete-document { color: #a22f29; }
 .sil-membership-actions, .sil-membership { align-items: center; }
 .sil-membership { display: inline-flex; gap: .4rem; }
 .sil-membership-actions > .sil-destination-field { flex: 0 0 auto; }
+
+.reader-progress { font-size: .85rem; }
+.library-reading-progress { display: flex; align-items: center; gap: .4rem; margin-top: .25rem; color: #586762; }
+.library-reading-progress progress { width: 4rem; max-width: 55%; height: .4rem; accent-color: #56886b; }
+.pronunciation-panel .ipa-retry { margin-inline-start: .3rem; padding: 0 .2rem; font-size: .8rem; }
+.web-import-dialog { width: min(30rem,calc(100vw - 3rem)); border: 1px solid #cbd3c9; border-radius: .8rem; padding: 1.4rem; color: #243434; background: #f8f7ef; }
+.web-import-dialog::backdrop { background: #14282166; }
+.web-import-dialog form { display: grid; gap: 1rem; }
+.web-import-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.web-import-heading h2 { margin: 0; }
+.web-import-dialog label { margin: 0; }
+.web-import-dialog input { width: 100%; box-sizing: border-box; }
+.web-import-dialog form > .primary { justify-self: end; }
+.web-import-alternative { border-top: 1px solid #dce0d7; padding-top: 1rem; }
+.web-import-alternative summary { cursor: pointer; font-size: .85rem; }
+.web-import-alternative p { font-size: .85rem; }
+.sense-link-count { margin-inline-start: .65rem; color: #66766d; font-size: .8rem; font-weight: normal; white-space: nowrap; }
+.sense-list-controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .6rem; }
+.sense-list-controls label { display: flex; align-items: center; gap: .5rem; margin: 0; font-size: .85rem; }
+.sense-list-controls select { width: auto; margin: 0; }
+.sense-backlink { display: grid; grid-template-columns: minmax(6rem, 1fr) minmax(0, 5fr) minmax(10rem, 2fr); align-items: start; gap: .8rem; }
+.sense-backlink > * { min-width: 0; overflow-wrap: anywhere; }
+.sense-backlink > button { text-align: left; padding-inline: .25rem; }
+@media (max-width: 1050px) {
+  .sense-backlink { grid-template-columns: minmax(0, 1fr); gap: .3rem; }
+}
