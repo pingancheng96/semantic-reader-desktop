@@ -1,3 +1,4 @@
+import {currentLanguage} from './languages.js';
 import {ReaderToolbar,pageTurnDirection} from './reader-toolbar.js';
 import {ReaderNavigation, readReaderPreference, saveReaderPreference, type ReaderNavigationState} from './reader-navigation.js';
 import {readerGestures} from './reader-gestures.js';
@@ -82,6 +83,7 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
     setZoom(zoomValue.current);
   }
   function applyZoom(reader:View, doc:Document) {
+    doc.documentElement.lang=currentLanguage().code;
     if (reader.isFixedLayout) {
       const value = zoomValue.current===1 ? 'fit-page' : String(zoomValue.current);
       if (reader.renderer?.getAttribute('zoom')!==value) reader.renderer?.setAttribute('zoom',value);
@@ -243,12 +245,13 @@ export function EpubReader<M extends Mark>({id,content,layout,marks,focused,visi
           if (!point || offsetAtPoint===undefined || !target) return false;
           const anchor = anchors.find(item=>item.node===point);
           if (!anchor) return false;
-          for (const word of anchor.node.data.matchAll(/[\p{L}\p{M}\p{N}]+(?:[’'-][\p{L}\p{M}\p{N}]+)*/gu)) {
-            const first = word.index!;
-            const last = first + word[0].length;
+          for (const word of new Intl.Segmenter(currentLanguage().code,{granularity:'word'}).segment(anchor.node.data)) {
+            if (!word.isWordLike) continue;
+            const first = word.index;
+            const last = first + word.segment.length;
             if (offsetAtPoint<first || offsetAtPoint>last) continue;
             const start = anchor.offsets[first], end = anchor.offsets[last];
-            if (start<0 || end<=start || content.slice(start,end)!==word[0]) continue;
+            if (start<0 || end<=start || content.slice(start,end)!==word.segment) continue;
             const existing = callbacks.current.marks.find(mark=>mark.start<=start && mark.end>=end);
             if (existing) callbacks.current.onMark(existing);
             else callbacks.current.onSelect({document_id:id,start,end,surface:content.slice(start,end)},true);

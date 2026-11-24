@@ -63,7 +63,9 @@ fn init_schema(db: &Db, seed: bool) -> Result<()> {
         }
         Ok(())
     })?;
-    db.batch("CREATE TABLE IF NOT EXISTS sense_sil (
+    db.batch("CREATE TABLE IF NOT EXISTS workspace_language (id INTEGER PRIMARY KEY CHECK(id=1), code TEXT NOT NULL);
+    INSERT OR IGNORE INTO workspace_language VALUES(1,'en');
+    CREATE TABLE IF NOT EXISTS sense_sil (
         sense_id TEXT NOT NULL REFERENCES senses(id) ON DELETE CASCADE,
         code TEXT NOT NULL, PRIMARY KEY(sense_id,code)
     );
@@ -934,41 +936,86 @@ fn inflection_keys(word: &str) -> Vec<String> {
     keys
 }
 
+// Candidate retrieval only: Danish endings can be ambiguous and do not establish sense identity.
+fn danish_inflection_keys(word: &str) -> Vec<String> {
+    let word=normalize(word);
+    let mut keys=vec![word.clone()];
+    if !word.chars().all(char::is_alphabetic) { return keys; }
+    for suffix in ["erne","ene","er","en","et","e","rne","r","n","t"] {
+        let Some(stem)=word.strip_suffix(suffix) else {continue;};
+        if stem.chars().count()<3 {continue;}
+        if matches!(suffix,"rne"|"r"|"n"|"t") && !stem.ends_with('e') {continue;}
+        if !keys.iter().any(|key|key==stem) {keys.push(stem.to_owned());}
+        // forskellen -> forskell -> forskel; katten -> katt -> kat.
+        if suffix.len()>1 || suffix=="e" {
+            let mut letters=stem.chars().rev();
+            if let (Some(last),Some(previous))=(letters.next(),letters.next()) {
+                if last==previous && "bdgklmnpst".contains(last) {
+                    let single=&stem[..stem.len()-last.len_utf8()];
+                    if single.chars().count()>=3 && !keys.iter().any(|key|key==single) {keys.push(single.to_owned());}
+                }
+            }
+        }
+    }
+    keys
+}
+
 fn matching_inflections(db: &Db, word: &str) -> Result<Vec<V>> {
-    let keys = inflection_keys(word);
-    Ok(db
+    let language = crate::languages::current(db)?;
+    let forms = |word:&str| match language.as_str() {
+        "en"=>inflection_keys(word), "da"=>danish_inflection_keys(word), _=>vec![normalize(word)],
+    };
+    let keys = forms(word);
+    let mut matches:Vec<V> = db
         .query("SELECT normalized FROM expressions", &[])?
         .into_iter()
         .filter_map(|row| {
             let normalized = row["normalized"].as_str()?;
-            inflection_keys(normalized)
-                .iter()
-                .any(|key| keys.contains(key))
-                .then(|| row["normalized"].clone())
+            let matches=if language=="da" {
+                // Require a direct form-to-headword relation, rather than two unrelated shared stems.
+                keys.iter().any(|key|key==normalized) || forms(normalized).contains(&normalize(word))
+            } else {forms(normalized).iter().any(|key|keys.contains(key))};
+            matches.then(|| row["normalized"].clone())
         })
-        .collect())
+        .collect();
+    // Confirmed annotations are the persistent surface-to-expression dictionary for every language.
+    // Derive it from occurrences so edits, deletion, merge, backup and restore stay consistent.
+    let surface=normalize(word);
+    for row in db.query("SELECT DISTINCT o.surface,e.normalized FROM occurrences o JOIN senses s ON s.id=o.sense_id JOIN expressions e ON e.id=s.expression_id", &[])? {
+        if normalize(row["surface"].as_str().unwrap_or_default())==surface && !matches.contains(&row["normalized"]) {
+            matches.push(row["normalized"].clone());
+        }
+    }
+    Ok(matches)
 }
 
 pub fn candidates(db: &Db, p: &V) -> Result<V> {
     let (doc, start, end, surface, context) = selection(db, p)?;
+    let forced=if p["force_lemma"]==true {normalize(field(p,"user_lemma",240,true)?)} else {String::new()};
     let saved_sense = db.query(
         "SELECT e.lemma,s.meaning FROM occurrences o JOIN senses s ON s.id=o.sense_id
          JOIN expressions e ON e.id=s.expression_id WHERE o.document_id=?1 AND o.start=?2 AND o.end=?3",
         &[doc,start,end],
     )?.into_iter().next();
-    let forms = matching_inflections(db, &surface)?;
+    let mut forms = matching_inflections(db, &surface)?;
+    let lookup_lemma=field(p,"lookup_lemma",240,false)?;
+    let user_lemma=field(p,"user_lemma",240,false)?;
+    for lemma in [lookup_lemma,user_lemma].into_iter().filter(|lemma|!lemma.is_empty()) {
+        let normalized=json!(normalize(lemma));
+        if !forms.contains(&normalized) { forms.push(normalized); }
+    }
     let exact = db.query(
         &format!(
-            "{SENSES} WHERE e.normalized IN (SELECT value FROM json_each(?1)) OR e.id IN (
+            "{SENSES} WHERE (e.normalized IN (SELECT value FROM json_each(?1)) OR e.id IN (
             SELECT prior.expression_id FROM occurrences o JOIN senses prior ON prior.id=o.sense_id
             WHERE o.surface=?2 COLLATE NOCASE
-        ) ORDER BY (e.normalized=?3) DESC,s.meaning,s.id LIMIT 30"
+        )) AND (?4='' OR e.normalized=?4) ORDER BY (e.normalized=?3) DESC,s.meaning,s.id LIMIT 30"
         ),
-        &[json!(V::Array(forms).to_string()), json!(surface), json!(normalize(&surface))],
+        &[json!(V::Array(forms).to_string()), json!(surface), json!(normalize(&surface)),json!(forced)],
     )?;
     let reused = db.query("SELECT DISTINCT s.id, s.group_id, s.meaning, e.lemma
         FROM occurrences o JOIN senses s ON s.id=o.sense_id JOIN expressions e ON e.id=s.expression_id
-        WHERE o.surface=?1 AND o.context=?2 ORDER BY s.id LIMIT 5", &[json!(surface),json!(context)])?;
+        WHERE o.surface=?1 AND o.context=?2 AND (?3='' OR e.normalized=?3) ORDER BY s.id LIMIT 5", &[json!(surface),json!(context),json!(forced)])?;
     let mut notes = Vec::new();
     for sense in reused.iter().chain(exact.iter()) {
         if notes.iter().any(|note: &V| note["id"] == sense["id"]) {
@@ -1013,7 +1060,7 @@ pub fn candidates(db: &Db, p: &V) -> Result<V> {
         g["vocabulary"] = json!(vocabulary(db, &g["id"])?);
     }
     Ok(
-        json!({"surface":surface,"context":context,"exact":exact,"reused":reused,"groups":result,"saved_sense":saved_sense,"notes":notes}),
+        json!({"surface":surface,"lookup_lemma":lookup_lemma,"context":context,"exact":exact,"reused":reused,"groups":result,"saved_sense":saved_sense,"notes":notes}),
     )
 }
 
@@ -1036,10 +1083,16 @@ fn annotate(db: &Db, p: &V) -> Result<V> {
     if !conflict.is_empty() {
         return Err("选区与已有标注重叠，请在语义库中重新分类".into());
     }
+    let forced=if p["force_lemma"]==true {Some(field(p,"user_lemma",240,true)?)} else {None};
     let sense = if !p["sense_id"].is_null() {
-        id(p, "sense_id")?
+        let key=id(p,"sense_id")?;
+        if let Some(lemma)=forced {
+            let note=db.one(&format!("{SENSES} WHERE s.id=?1"),&[key.clone()])?;
+            if normalize(note["lemma"].as_str().unwrap_or_default())!=normalize(lemma) {return Err("所选义项与固定原形不一致，请选择该原形下的义项或填写新义项".into());}
+        }
+        key
     } else {
-        let lemma = field(p, "lemma", 240, true)?;
+        let lemma = match forced {Some(lemma)=>lemma,None=>field(p, "lemma", 240, true)?};
         let meaning = field(p, "meaning", 1200, true)?;
         let group = if p["ungrouped_capture"] == true {
             let existing = db.query("SELECT id FROM semantic_groups WHERE name='未归类' AND sil_code IS NULL ORDER BY id LIMIT 1", &[])?;
@@ -1060,7 +1113,7 @@ fn annotate(db: &Db, p: &V) -> Result<V> {
             id(p, "group_id")?
         };
         let normalized = json!(normalize(lemma));
-        let forms = matching_inflections(db, lemma)?;
+        let forms = if forced.is_some() {vec![json!(normalize(lemma))]} else {matching_inflections(db, lemma)?};
         let existing = db.query(
             &format!(
                 "{SENSES} WHERE s.group_id=?1 AND s.meaning=?2
@@ -1139,6 +1192,30 @@ pub fn gloss_batch(db: &Db, p: &V) -> Result<V> {
         V::Null
     };
     Ok(json!({"rows":rows,"next":next}))
+}
+
+pub fn sense_gloss_input(db:&Db,p:&V) -> Result<V> {
+    let key=id(p,"id")?;
+    let sense=db.one(&format!("{SENSES} WHERE s.id=?1"),&[key.clone()])?;
+    let contexts=db.query("SELECT DISTINCT surface,context,context_meaning FROM occurrences WHERE sense_id=?1 ORDER BY context LIMIT 6",&[key])?;
+    Ok(json!({"id":sense["id"],"lemma":sense["lemma"],"meaning":sense["meaning"],"contexts":contexts}))
+}
+
+fn update_sense_meaning(db:&Db,p:&V) -> Result<V> {
+    let key=id(p,"id")?;
+    let previous=field(p,"previous",1200,true)?;
+    let meaning=field(p,"meaning",1200,true)?.trim();
+    let old=db.one("SELECT meaning,group_id,expression_id FROM senses WHERE id=?1",&[key.clone()])?;
+    if old["meaning"]!=previous {return Err("通用释义已发生变化，请重新打开编辑后保存".into());}
+    if old["meaning"]==meaning {return Ok(json!({"id":key,"meaning":meaning}));}
+    if !db.query("SELECT id FROM senses WHERE group_id=?1 AND expression_id=?2 AND meaning=?3 AND id<>?4",
+        &[old["group_id"].clone(),old["expression_id"].clone(),json!(meaning),key.clone()])?.is_empty() {
+        return Err("该词已有相同释义的义项，请使用合并义项功能".into());
+    }
+    db.write("UPDATE senses SET meaning=?1 WHERE id=?2",&[json!(meaning),key.clone()])?;
+    reindex(db,&old["group_id"])?;
+    db.batch("DELETE FROM operation_history")?;
+    Ok(json!({"id":key,"meaning":meaning}))
 }
 
 fn apply_glosses(db: &Db, p: &V) -> Result<V> {
@@ -1475,7 +1552,7 @@ const BACKUP_TABLES: &[(&str, &[&str])] = &[
 ];
 
 pub fn backup_data(db: &Db) -> Result<V> {
-    let mut data = json!({"version":9});
+    let mut data = json!({"version":9,"language":crate::languages::current(db)?});
     for &(table, _) in BACKUP_TABLES {
         data[table] = json!(db.query(&format!("SELECT * FROM {table}"), &[])?);
     }
@@ -1500,6 +1577,9 @@ pub fn replace_backup(db: &Db, data: &V) -> Result<V> {
 }
 
 fn restore(db: &Db, p: &V) -> Result<V> {
+    if p["language"].as_str().unwrap_or("en") != crate::languages::current(db)? {
+        return Err("备份语言与当前学习空间不一致".into());
+    }
     if !matches!(p["version"].as_u64(), Some(1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9)) {
         return Err("JSON 导出版本不兼容".into());
     }
@@ -1682,7 +1762,8 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
         }
         "document" => {
             let key = id(p, "id")?;
-            let doc = db.one("SELECT documents.*,EXISTS(SELECT 1 FROM pdf_files WHERE document_id=id) AS pdf,EXISTS(SELECT 1 FROM epub_files WHERE document_id=id) AS epub FROM documents WHERE id=?1", &[key.clone()])?;
+            let mut doc = db.one("SELECT documents.*,EXISTS(SELECT 1 FROM pdf_files WHERE document_id=id) AS pdf,EXISTS(SELECT 1 FROM epub_files WHERE document_id=id) AS epub FROM documents WHERE id=?1", &[key.clone()])?;
+            doc["language"] = json!(crate::languages::current(db)?);
             let marks = db.query(
                 &format!("{MARKS} WHERE o.document_id=?1 ORDER BY o.start"),
                 &[key],
@@ -1873,6 +1954,7 @@ pub fn run(db: &Db, op: &str, p: &V) -> Result<V> {
              ORDER BY g.name,s.meaning,s.id",
             &[id(p,"id")?],
         )?)),
+        "sense_meaning_update" => db.transaction(||update_sense_meaning(db,p)),
         "gloss_apply" => db.transaction(|| apply_glosses(db, p)),
         "sense_merge" => db.transaction(|| merge_senses(db, p)),
         "mark_delete" => db.transaction(|| {
@@ -2021,6 +2103,95 @@ mod tests {
         data["lemma"] = json!("plunge");
         data["meaning"] = json!(meaning);
         run(db, "annotate", &data).unwrap()
+    }
+
+    #[test]
+    fn forced_headword_is_not_replaced_by_inflection_matching_or_a_different_sense() {
+        let db=memory();let doc=import(&db,"Example","txt","was was was").unwrap();
+        run(&db,"annotate",&json!({"document_id":doc,"start":0,"end":3,"lemma":"be","meaning":"是","ungrouped_capture":true})).unwrap();
+        let original=run(&db,"document",&json!({"id":doc})).unwrap()["marks"][0]["sense_id"].clone();
+        let options=candidates(&db,&json!({"document_id":doc,"start":4,"end":7,"user_lemma":"was","force_lemma":true})).unwrap();
+        assert!(options["notes"].as_array().unwrap().is_empty());
+        assert!(run(&db,"annotate",&json!({"document_id":doc,"start":4,"end":7,"sense_id":original,"force_lemma":true,"user_lemma":"was"})).is_err());
+        run(&db,"annotate",&json!({"document_id":doc,"start":4,"end":7,"lemma":"be","meaning":"是","force_lemma":true,"user_lemma":"was","ungrouped_capture":true})).unwrap();
+        let marks=run(&db,"document",&json!({"id":doc})).unwrap()["marks"].as_array().unwrap().clone();
+        assert_eq!(marks[1]["lemma"],"was");assert_ne!(marks[0]["sense_id"],marks[1]["sense_id"]);
+        assert!(run(&db,"annotate",&json!({"document_id":doc,"start":8,"end":11,"lemma":"be","meaning":"是","force_lemma":true,"user_lemma":"","ungrouped_capture":true})).is_err());
+    }
+
+    #[test]
+    fn editing_general_gloss_preserves_context_links_and_rejects_stale_or_duplicate_edits() {
+        let db=memory();
+        let doc=import(&db,"Example","txt","word word").unwrap();
+        let first=run(&db,"annotate",&json!({"document_id":doc,"start":0,"end":4,"lemma":"word","meaning":"原来的释义","context_meaning":"本句专属释义","ungrouped_capture":true})).unwrap();
+        let before=run(&db,"document",&json!({"id":doc})).unwrap();
+        let sense=before["marks"][0]["sense_id"].clone();
+        run(&db,"annotate",&json!({"document_id":doc,"start":5,"end":9,"sense_id":sense})).unwrap();
+        let occurrences=db.query("SELECT * FROM occurrences ORDER BY id",&[]).unwrap();
+        db.write("INSERT INTO sense_sil VALUES(?1,'3.5')",&[sense.clone()]).unwrap();
+        let input=sense_gloss_input(&db,&json!({"id":sense})).unwrap();
+        assert_eq!(input["lemma"],"word");assert_eq!(input["contexts"].as_array().unwrap().len(),2);
+        run(&db,"sense_meaning_update",&json!({"id":sense,"previous":"原来的释义","meaning":"更准确的通用释义"})).unwrap();
+        let after=run(&db,"document",&json!({"id":doc})).unwrap();
+        assert!(after["marks"].as_array().unwrap().iter().all(|mark|mark["meaning"]=="更准确的通用释义"));
+        assert_eq!(db.query("SELECT * FROM occurrences ORDER BY id",&[]).unwrap(),occurrences);
+        assert_eq!(after["marks"][0]["id"],first);
+        assert!(run(&db,"sense_meaning_update",&json!({"id":sense,"previous":"原来的释义","meaning":"过期编辑"})).is_err());
+        assert!(run(&db,"sense_meaning_update",&json!({"id":sense,"previous":"更准确的通用释义","meaning":"   "})).is_err());
+        let group=after["marks"][0]["group_id"].clone();
+        let expression=db.one("SELECT expression_id FROM senses WHERE id=?1",&[sense.clone()]).unwrap()["expression_id"].clone();
+        upsert_sense(&db,&expression,&group,&json!("重复目标")).unwrap();
+        assert!(run(&db,"sense_meaning_update",&json!({"id":sense,"previous":"更准确的通用释义","meaning":"重复目标"})).is_err());
+        assert_eq!(db.one("SELECT meaning FROM senses WHERE id=?1",&[sense.clone()]).unwrap()["meaning"],"更准确的通用释义");
+        assert_eq!(db.one("SELECT code FROM sense_sil_memberships WHERE sense_id=?1",&[sense]).unwrap()["code"],"3.5");
+    }
+
+    #[test]
+    fn lemma_followup_and_confirmed_forms_work_across_languages_and_backups() {
+        for (language,lemma,surface) in [("fr","manger","mangeaient"),("de","gehen","ging"),("ja","食べる","食べた"),("ru","человек","люди"),("da","være","var")] {
+            let db=memory();
+            db.write("UPDATE workspace_language SET code=?1 WHERE id=1",&[json!(language)]).unwrap();
+            let root=import(&db,"Headword","txt",lemma).unwrap();
+            run(&db,"annotate",&json!({"document_id":root,"start":0,"end":lemma.encode_utf16().count(),"lemma":lemma,"meaning":"已有释义","ungrouped_capture":true})).unwrap();
+            let doc=import(&db,"New passage","txt",surface).unwrap();
+            let selection=json!({"document_id":doc,"start":0,"end":surface.encode_utf16().count()});
+            assert!(candidates(&db,&selection).unwrap()["notes"].as_array().unwrap().is_empty(),"{language}");
+            let mut lookup=selection.clone();lookup["lookup_lemma"]=json!(lemma);
+            let options=candidates(&db,&lookup).unwrap();
+            assert_eq!(options["notes"].as_array().unwrap().len(),1,"{language}");
+            assert_eq!(options["notes"][0]["lemma"],lemma);
+            assert!(options["reused"].as_array().unwrap().is_empty());
+            assert!(candidates(&db,&selection).unwrap()["notes"].as_array().unwrap().is_empty(),"lookup must not learn unconfirmed mappings");
+            let mut confirmed=selection.clone();confirmed["sense_id"]=options["notes"][0]["id"].clone();
+            run(&db,"annotate",&confirmed).unwrap();
+            let next=import(&db,"Another passage","txt",surface).unwrap();
+            let next_selection=json!({"document_id":next,"start":0,"end":surface.encode_utf16().count()});
+            assert_eq!(candidates(&db,&next_selection).unwrap()["notes"][0]["lemma"],lemma,"learned form {language}");
+            let backup=backup_data(&db).unwrap();
+            let restored=memory();restored.write("UPDATE workspace_language SET code=?1 WHERE id=1",&[json!(language)]).unwrap();
+            run(&restored,"restore",&backup).unwrap();
+            assert_eq!(candidates(&restored,&next_selection).unwrap()["notes"][0]["lemma"],lemma,"restored mapping {language}");
+        }
+    }
+
+    #[test]
+    fn danish_noun_forms_retrieve_existing_senses_without_cross_language_rules() {
+        let db=memory();
+        db.batch("UPDATE workspace_language SET code='da' WHERE id=1").unwrap();
+        let doc=import(&db,"Dansk","txt","forskel forskellen forskelle forskellene forskellig").unwrap();
+        run(&db,"annotate",&json!({"document_id":doc,"start":0,"end":7,"lemma":"forskel","meaning":"区别","ungrouped_capture":true})).unwrap();
+        for form in ["forskellen","forskelle","forskellene"] {
+            let content=db.one("SELECT content FROM documents WHERE id=?1",&[doc.clone()]).unwrap();
+            let start=content["content"].as_str().unwrap().find(form).unwrap();
+            let rows=candidates(&db,&json!({"document_id":doc,"start":start,"end":start+form.len()})).unwrap();
+            assert_eq!(rows["notes"][0]["lemma"],"forskel","{form}");
+        }
+        assert!(matching_inflections(&db,"forskellig").unwrap().is_empty());
+        for (form,lemma) in [("bilen","bil"),("huset","hus"),("katten","kat"),("skolen","skole"),("æblet","æble"),("bilerne","bil")] {
+            assert!(danish_inflection_keys(form).contains(&lemma.to_owned()),"{form}");
+        }
+        db.batch("UPDATE workspace_language SET code='fr' WHERE id=1").unwrap();
+        assert!(matching_inflections(&db,"forskellen").unwrap().is_empty());
     }
 
     #[test]

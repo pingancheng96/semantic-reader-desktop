@@ -9,8 +9,9 @@ export function waitForVoice(speech: SpeechSynthesis, locale: string, signal: Ab
       resolve(voice);
     }
     function check() {
-      const voice = speech.getVoices().find(candidate =>
-        candidate.localService && candidate.lang.replace('_','-').toLowerCase() === language);
+      const local=speech.getVoices().filter(candidate=>candidate.localService);
+      const voice = local.find(candidate=>candidate.lang.replace('_','-').toLowerCase()===language)
+        ?? (language.startsWith('en-') ? undefined : local.find(candidate=>candidate.lang.replace('_','-').toLowerCase().split('-')[0]===language.split('-')[0]));
       if (voice) finish(voice);
     }
     function abort() { finish(); }

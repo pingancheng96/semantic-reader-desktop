@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod languages;
 mod epub;
 mod kokoro;
+mod piper;
 mod mdict;
 mod pronunciation;
 mod snapshots;
@@ -24,22 +26,33 @@ struct Database(PathBuf);
 
 #[tauri::command]
 async fn request(state: State<'_, Database>, op: String, payload: Value) -> Result<Value> {
-    let path = state.0.clone();
+    let language = payload["language"].as_str().unwrap_or("en");
+    languages::validate(language)?;
+    let shared = state.0.clone();
+    if op=="workspace_open" {
+        let root=shared.clone(); let code=language.to_owned();
+        return tauri::async_runtime::spawn_blocking(move || {
+            languages::prepare(&root,&code)?;
+            Ok(serde_json::json!({"language":code}))
+        }).await.map_err(|_|"无法打开学习空间")?;
+    }
+    let path = languages::path(&shared, language)?;
     match op.as_str() {
         "sil_catalog" => Ok(sil::catalog()),
         "update_info" => Ok(updates::info()),
         "update_check" => updates::check().await,
         "update_open_link" => updates::open_link(payload["url"].as_str().unwrap_or_default()),
+        "piper_status" => Ok(serde_json::json!({"installed":piper::installed(&shared.with_file_name(piper::DIRECTORY)),"size":piper::ASSETS[0].2})),
         "kokoro_status" => {
             let installed = |variant: kokoro::Variant| {
-                kokoro::installed(&path.with_file_name(variant.directory()), variant)
+                kokoro::installed(&shared.with_file_name(variant.directory()), variant)
             };
             Ok(serde_json::json!({"fp32":installed(kokoro::Variant::Fp32),"int8":installed(kokoro::Variant::Int8)}))
         }
         "pronunciation_list" | "pronunciation_install" | "pronunciation_remove"
         | "pronunciation_lookup" | "pronunciation_audio" => {
             tauri::async_runtime::spawn_blocking(move || {
-                let root = path.with_file_name("pronunciation-dictionaries");
+                let root = shared.with_file_name("pronunciation-dictionaries");
                 let field = |key, max| store::field(&payload, key, max, true);
                 match op.as_str() {
                     "pronunciation_list" => pronunciation::list(&root),
@@ -53,7 +66,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
         "pronunciation_estimate" => {
             let word = store::field(&payload, "word", 240, true)?;
             let context = store::field(&payload, "context", 6000, false)?;
-            let key = ai::request_key(&path, &payload)?;
+            let key = ai::request_key(&shared, &payload)?;
             ai::estimate_pronunciation(&payload, key, word, context).await
         }
         "import_web" => {
@@ -94,7 +107,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             let (input, key) = tauri::async_runtime::spawn_blocking(move || {
                 let db = Db::open(&path)?;
                 let input = db.snapshot(|| store::comparison_input(&db, &params))?;
-                Ok::<_, String>((input, ai::request_key(&path, &params)?))
+                Ok::<_, String>((input, ai::request_key(&shared, &params)?))
             })
             .await
             .map_err(|_| "读取同组词项失败")??;
@@ -110,7 +123,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
                 let parent = params["parent"].as_str().unwrap();
                 if !review { return Ok::<_, String>((store::sil_count(&db,parent)?,None)); }
                 let batch = db.snapshot(|| store::sil_batch(&db,params["cursor"].as_str().unwrap_or_default(),parent))?;
-                Ok((batch,ai::request_key(&path,&params)?))
+                Ok((batch,ai::request_key(&shared,&params)?))
             }).await.map_err(|_| "无法读取当前分类")??;
             if review { ai::review_sil(&payload,key,batch,parent).await } else { Ok(batch) }
         }
@@ -120,16 +133,24 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
                 let code = params["code"].as_str().filter(|code| sil::valid(code)).ok_or("分类编号无效")?;
                 let db = Db::open(&path)?;
                 let rows = db.snapshot(|| store::sil_audit_rows(&db, code, params["descendants"] == true))?;
-                Ok::<_, String>((rows, ai::request_key(&path, &params)?))
+                Ok::<_, String>((rows, ai::request_key(&shared, &params)?))
             }).await.map_err(|_| "无法读取当前分类")??;
             ai::audit_sil(&payload, key, rows).await
+        }
+        "sense_gloss_suggest" => {
+            let params=payload.clone();
+            let (input,key)=tauri::async_runtime::spawn_blocking(move || {
+                let db=Db::open(&path)?;
+                Ok::<_,String>((db.snapshot(||store::sense_gloss_input(&db,&params))?,ai::request_key(&shared,&params)?))
+            }).await.map_err(|_|"无法读取义项释义")??;
+            ai::suggest_sense_gloss(&payload,key,input).await
         }
         "organize_glosses" => {
             let params = payload.clone();
             let (input, key) = tauri::async_runtime::spawn_blocking(move || {
                 let db = Db::open(&path)?;
                 let input = db.snapshot(|| store::gloss_batch(&db, &params))?;
-                Ok::<_, String>((input, ai::request_key(&path, &params)?))
+                Ok::<_, String>((input, ai::request_key(&shared, &params)?))
             })
             .await
             .map_err(|_| "读取释义候选失败")??;
@@ -140,7 +161,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             let (input, key) = tauri::async_runtime::spawn_blocking(move || {
                 let db = Db::open(&path)?;
                 let input = db.snapshot(|| store::organization_input(&db, &params))?;
-                Ok::<_, String>((input, ai::request_key(&path, &params)?))
+                Ok::<_, String>((input, ai::request_key(&shared, &params)?))
             })
             .await
             .map_err(|_| "读取整理候选失败")??;
@@ -152,7 +173,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             let (local, key) = tauri::async_runtime::spawn_blocking(move || {
                 let db = Db::open(&read_path)?;
                 let local = db.snapshot(|| store::candidates(&db, &params))?;
-                let key = ai::request_key(&read_path, &params)?;
+                let key = ai::request_key(&shared, &params)?;
                 Ok::<_, String>((local, key))
             })
             .await
@@ -160,7 +181,37 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
             let previous = local["groups"].clone();
             let context = local["context"].clone();
             let saved = !local["saved_sense"].is_null();
+            let initial_ids:Vec<Value>=local["notes"].as_array().into_iter().flatten().map(|note|note["id"].clone()).collect();
             let mut response = ai::suggest(payload.clone(), local, key.clone()).await?;
+            if !saved {
+                let mut params=payload.clone();
+                params["lookup_lemma"]=response["suggestion"]["lemma"].clone();
+                let lookup_path=path.clone();
+                let lookup=tauri::async_runtime::spawn_blocking(move || {
+                    let db=Db::open(&lookup_path)?;
+                    db.snapshot(||store::candidates(&db,&params))
+                }).await;
+                match lookup {
+                    Ok(Ok(candidates))=>{
+                        let notes=candidates["notes"].as_array().cloned().unwrap_or_default();
+                        let new_candidates=notes.iter().any(|note|!initial_ids.contains(&note["id"]));
+                        if response["suggestion"]["sense_id"].is_null() && new_candidates {
+                            match ai::match_lemma_sense(&payload,key.clone(),&response["suggestion"],&notes,&context).await {
+                                Ok((matched,usage))=>{
+                                    response["usage"]=ai::combined_usage(&response["usage"],&usage);
+                                    if let Some(note)=matched {ai::apply_sense_match(&mut response["suggestion"],&note);}
+                                }
+                                Err(_)=>{
+                                    response["lemma_check_failed"]=Value::Bool(true);
+                                    response["usage"]=Value::Null;
+                                }
+                            }
+                        }
+                        response["candidates"]=candidates;
+                    }
+                    _=>response["lemma_check_failed"]=Value::Bool(true),
+                }
+            }
             if payload["ungrouped_capture"] != true && !saved && response["suggestion"]["group_id"].is_null() {
                 let name = response["suggestion"]["group_name"]
                     .as_str()
@@ -190,7 +241,7 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
                     Ok(Ok((None, groups))) if !groups.is_empty() => {
                         match ai::reconsider_group(
                             &payload,
-                            key,
+                            key.clone(),
                             &response["suggestion"],
                             &context,
                             &groups,
@@ -212,15 +263,16 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
                     _ => response["group_check_failed"] = Value::Bool(true),
                 }
             }
+            ai::lemma_decision(&payload,key,&mut response,&context).await;
             Ok(response)
         }
         "key_status" => {
-            tauri::async_runtime::spawn_blocking(move || ai::key_status(&path, &payload))
+            tauri::async_runtime::spawn_blocking(move || ai::key_status(&shared, &payload))
                 .await
                 .map_err(|_| "无法检查密钥状态")?
         }
         "key_save" | "key_remove" => tauri::async_runtime::spawn_blocking(move || {
-            ai::key_action(&path, &payload, op == "key_remove")
+            ai::key_action(&shared, &payload, op == "key_remove")
         })
         .await
         .map_err(|_| "密钥操作失败")?,
@@ -259,6 +311,20 @@ async fn request(state: State<'_, Database>, op: String, payload: Value) -> Resu
         .await
         .map_err(|_| "数据库操作失败")?,
     }
+}
+
+#[tauri::command]
+async fn piper_install(state: State<'_, Database>, language: String, progress: tauri::ipc::Channel<piper::Progress>) -> Result<()> {
+    if language!="da" { return Err("当前 Piper 模型仅适用于丹麦语".into()); }
+    piper::install(&state.0.with_file_name(piper::DIRECTORY),progress).await
+}
+
+#[tauri::command]
+async fn piper_read(state: State<'_, Database>, language: String, asset: usize, offset: u64, length: usize) -> Result<tauri::ipc::Response> {
+    if language!="da" { return Err("当前 Piper 模型仅适用于丹麦语".into()); }
+    let root=state.0.with_file_name(piper::DIRECTORY);
+    let data=tauri::async_runtime::spawn_blocking(move ||piper::read(&root,asset,offset,length)).await.map_err(|_|"无法读取 Piper 模型")??;
+    Ok(tauri::ipc::Response::new(data))
 }
 
 #[tauri::command]
@@ -303,7 +369,7 @@ async fn browser_open(app: tauri::AppHandle, url: String) -> Result<()> {
 }
 
 #[tauri::command]
-async fn browser_import(app: tauri::AppHandle, state: State<'_, Database>) -> Result<Value> {
+async fn browser_import(app: tauri::AppHandle, state: State<'_, Database>, language: Option<String>) -> Result<Value> {
     let window = app.get_webview_window("web-import").ok_or("请先打开浏览窗口")?;
     let (send, receive) = tokio::sync::oneshot::channel();
     let send = std::sync::Mutex::new(Some(send));
@@ -317,15 +383,15 @@ async fn browser_import(app: tauri::AppHandle, state: State<'_, Database>) -> Re
     let mut page = web_import::browser_page(captured["url"].as_str().ok_or("无法读取网页地址")?,
         captured["html"].as_str().ok_or("无法读取网页正文")?)?;
     web_import::fill_images(&mut page).await;
-    let path = state.0.clone();
+    let path = languages::path(&state.0, language.as_deref().unwrap_or("en"))?;
     tauri::async_runtime::spawn_blocking(move || store::import_web(&Db::open(&path)?,page))
         .await.map_err(|_|"保存网页失败")?
 }
 
 #[tauri::command]
-async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Result<Value> {
+async fn import_file(app: tauri::AppHandle, state: State<'_, Database>, language: Option<String>) -> Result<Value> {
     use tauri_plugin_dialog::DialogExt;
-    let database = state.0.clone();
+    let database = languages::path(&state.0, language.as_deref().unwrap_or("en"))?;
     tauri::async_runtime::spawn_blocking(move || {
         let Some(file) = app.dialog().file()
             .add_filter("Markdown, TXT, PDF, EPUB", &["md", "markdown", "txt", "pdf", "epub"])
@@ -336,8 +402,8 @@ async fn import_file(app: tauri::AppHandle, state: State<'_, Database>) -> Resul
 }
 
 #[tauri::command]
-async fn import_dropped_files(paths: Vec<PathBuf>, state: State<'_, Database>) -> Result<Value> {
-    let database = state.0.clone();
+async fn import_dropped_files(paths: Vec<PathBuf>, state: State<'_, Database>, language: Option<String>) -> Result<Value> {
+    let database = languages::path(&state.0, language.as_deref().unwrap_or("en"))?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut imported = 0;
         let mut errors = Vec::new();
@@ -394,15 +460,15 @@ async fn restore_backup_file(app: tauri::AppHandle, state: State<'_, Database>) 
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let backup = serde_json::from_reader(std::io::BufReader::new(file))
             .map_err(|e| format!("无法读取 JSON 备份：{e}"))?;
-        store::run(&Db::open(&database)?, "restore", &backup)?;
+        languages::restore_all(&database, &backup)?;
         Ok(true)
     }).await.map_err(|_| "恢复备份文件失败")?
 }
 
 #[tauri::command]
-async fn epub_entry(state: State<'_, Database>, id: String, name: String) -> Result<tauri::ipc::Response> {
+async fn epub_entry(state: State<'_, Database>, id: String, name: String, language: Option<String>) -> Result<tauri::ipc::Response> {
     use std::io::Read;
-    let path = state.0.clone();
+    let path = languages::path(&state.0, language.as_deref().unwrap_or("en"))?;
     let data = tauri::async_runtime::spawn_blocking(move || {
         let db = Db::open(&path)?;
         let key = serde_json::json!(id);
@@ -418,8 +484,8 @@ async fn epub_entry(state: State<'_, Database>, id: String, name: String) -> Res
 }
 
 #[tauri::command]
-async fn pdf_range(state: State<'_, Database>, id: String, begin: u64, end: u64) -> Result<tauri::ipc::Response> {
-    let path = state.0.clone();
+async fn pdf_range(state: State<'_, Database>, id: String, begin: u64, end: u64, language: Option<String>) -> Result<tauri::ipc::Response> {
+    let path = languages::path(&state.0, language.as_deref().unwrap_or("en"))?;
     tauri::async_runtime::spawn_blocking(move || {
         store::pdf_range(&Db::open(&path)?, &serde_json::json!({"id":id}), begin, end)
             .map(tauri::ipc::Response::new)
@@ -431,9 +497,11 @@ async fn export_file(
     app: tauri::AppHandle,
     state: State<'_, Database>,
     document_id: Option<String>,
+    language: Option<String>,
 ) -> Result<bool> {
     use tauri_plugin_dialog::DialogExt;
-    let path = state.0.clone();
+    let shared = state.0.clone();
+    let path = languages::path(&state.0, language.as_deref().unwrap_or("en"))?;
     tauri::async_runtime::spawn_blocking(move || {
         let db = Db::open(&path)?;
         let (name, text) = if let Some(id) = document_id {
@@ -461,7 +529,7 @@ async fn export_file(
                 text,
             )
         } else {
-            let backup = store::run(&db, "backup", &Value::Null)?;
+            let backup = languages::backup_all(&shared)?;
             (
                 "semantic-reader.json".into(),
                 serde_json::to_string_pretty(&backup).map_err(|e| e.to_string())?,
@@ -593,6 +661,8 @@ fn main() {
             pdf_range,
             epub_entry,
             pronunciation_folder,
+            piper_install,
+            piper_read,
             kokoro_install,
             kokoro_read
         ])
@@ -614,8 +684,9 @@ mod tests {
 
     #[test]
     fn ipc_import_and_read_one_hundred_marks() {
-        let path =
-            std::env::temp_dir().join(format!("semantic-reader-ipc-{}.sqlite3", Uuid::new_v4()));
+        let directory=std::env::temp_dir().join(format!("semantic-reader-ipc-{}",Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path=directory.join("library.sqlite3");
         store::init(&Db::open(&path).unwrap()).unwrap();
         let app = test::mock_builder()
             .manage(Database(path.clone()))
@@ -684,8 +755,74 @@ mod tests {
                 .len(),
             100
         );
+        call("workspace_open",json!({"language":"fr"}));
+        let french=call("import",json!({"language":"fr","title":"Français","format":"txt","content":"pain"}));
+        assert_eq!(call("list",json!({"language":"fr"}))["documents"].as_array().unwrap().len(),1);
+        assert_eq!(call("list",json!({"language":"en"}))["documents"].as_array().unwrap().len(),10);
+        assert_eq!(call("document",json!({"language":"fr","id":french}))["document"]["language"],"fr");
+        // Exercise the complete AI -> lemma lookup -> context match -> UI candidate response path.
+        let root=call("import",json!({"language":"fr","title":"Root","format":"txt","content":"manger"}));
+        call("annotate",json!({"language":"fr","document_id":root,"start":0,"end":6,"lemma":"manger","meaning":"吃","ungrouped_capture":true}));
+        let root_note=call("candidates",json!({"language":"fr","document_id":root,"start":0,"end":6}))["notes"][0].clone();
+        let target=call("import",json!({"language":"fr","title":"Passage","format":"txt","content":"mangeaient"}));
+        let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint=format!("http://{}/chat/completions",listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let expected=root_note["id"].clone();
+        let server=std::thread::spawn(move || {
+            use std::io::{Read,Write};
+            let base=json!({"lemma":"manger","meaning":"吃东西","context_meaning":"当时正在吃饭","sense_id":null,"group_id":null,"confidence":0.9,
+                "learning":{"part_of_speech":"动词","usage_note":"过去时","example":"Ils mangeaient.","related":[]}});
+            for index in 0..8 {
+                let deadline=std::time::Instant::now()+std::time::Duration::from_secs(15);
+                let mut stream=loop {
+                    match listener.accept() {Ok((stream,_))=>break stream,Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
+                        assert!(std::time::Instant::now()<deadline,"missing AI request {index}");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    },Err(error)=>panic!("{error}")}
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut headers=Vec::new();let mut byte=[0];
+                while !headers.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).unwrap();headers.push(byte[0]);assert!(headers.len()<16000);}
+                let headers=String::from_utf8(headers).unwrap();
+                let length=headers.lines().find_map(|line|line.split_once(':').filter(|(key,_)|key.eq_ignore_ascii_case("content-length")).map(|(_,value)|value.trim().parse::<usize>().unwrap())).unwrap();
+                let mut body=vec![0;length];stream.read_exact(&mut body).unwrap();
+                let input:Value=serde_json::from_slice(&body).unwrap();
+                let content:Value=serde_json::from_str(input["messages"][1]["content"].as_str().unwrap()).unwrap();
+                if index==0 || index==6 || index==7 {assert!(content["existing_senses"].as_array().unwrap().is_empty());}
+                else if index!=5 {assert_eq!(content["existing_senses"][0]["id"],expected);}
+                let mut answer=base.clone();
+                if index==1 {answer=json!({"sense_id":expected});}
+                if index==2 || index==3 || index==4 {answer["sense_id"]=expected.clone();}
+                if index==5 {assert_eq!(content["user_lemma"],"mangeaient");answer=json!({"reason":"原文是过去时变形，词典原形为 manger。"});}
+                if index==6 || index==7 {assert_eq!(content["force_lemma"],true);assert_eq!(content["user_lemma"],"mangeaient");}
+                if index==7 {answer["lemma"]=json!("mangeaient");}
+                if index==3 {assert_eq!(content["user_lemma"],"manger");}
+                let payload=json!({"choices":[{"message":{"content":answer.to_string()}}],"usage":{"total_tokens":10}}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",payload.len(),payload).unwrap();
+            }
+        });
+        let response=call("suggest",json!({"language":"fr","document_id":target,"start":0,"end":10,"surface":"mangeaient","ungrouped_capture":true,"endpoint":endpoint,"model":"mock"}));
+        assert_eq!(response["suggestion"]["sense_id"],root_note["id"]);
+        assert_eq!(response["candidates"]["notes"][0]["id"],root_note["id"]);
+        assert_eq!(response["suggestion"]["meaning"],"吃");assert_eq!(response["usage"]["total_tokens"],20);
+        call("annotate",json!({"language":"fr","document_id":target,"start":0,"end":10,"sense_id":root_note["id"]}));
+        let next=call("import",json!({"language":"fr","title":"Later passage","format":"txt","content":"mangeaient"}));
+        let response=call("suggest",json!({"language":"fr","document_id":next,"start":0,"end":10,"surface":"mangeaient","ungrouped_capture":true,"endpoint":endpoint,"model":"mock"}));
+        assert_eq!(response["suggestion"]["sense_id"],root_note["id"]);assert_eq!(response["usage"]["total_tokens"],10);
+        let hint_doc=call("import",json!({"language":"fr","title":"Manual headword","format":"txt","content":"mangèrent"}));
+        let response=call("suggest",json!({"language":"fr","document_id":hint_doc,"start":0,"end":9,"surface":"mangèrent","user_lemma":"manger","ungrouped_capture":true,"endpoint":endpoint,"model":"mock"}));
+        assert_eq!(response["suggestion"]["sense_id"],root_note["id"]);
+        assert_eq!(response["usage"]["total_tokens"],10);
+        let decision_doc=call("import",json!({"language":"fr","title":"Headword decision","format":"txt","content":"mangeaient"}));
+        let response=call("suggest",json!({"language":"fr","document_id":decision_doc,"start":0,"end":10,"surface":"mangeaient","user_lemma":"mangeaient","ungrouped_capture":true,"endpoint":endpoint,"model":"mock"}));
+        assert_eq!(response["lemma_decision"]["accepted"],false);assert_eq!(response["lemma_decision"]["reason"],"原文是过去时变形，词典原形为 manger。");assert_eq!(response["usage"]["total_tokens"],20);
+        let response=call("suggest",json!({"language":"fr","document_id":decision_doc,"start":0,"end":10,"surface":"mangeaient","user_lemma":"mangeaient","force_lemma":true,"ungrouped_capture":true,"endpoint":endpoint,"model":"mock"}));
+        assert_eq!(response["suggestion"]["lemma"],"mangeaient");assert_eq!(response["lemma_decision"]["forced"],true);assert_eq!(response["lemma_decision"]["accepted"],true);assert_eq!(response["usage"]["total_tokens"],20);
+        server.join().unwrap();
+        let _=std::fs::remove_dir_all(path.with_file_name("languages"));
         drop(window);
         drop(app);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

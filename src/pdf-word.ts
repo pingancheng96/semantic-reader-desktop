@@ -1,4 +1,5 @@
-const words = new Intl.Segmenter('en',{granularity:'word'});
+import {currentLanguage} from './languages.js';
+const words = new Intl.Segmenter(currentLanguage().code,{granularity:'word'});
 
 export function pdfWordAt(text:string, offset:number) {
   if (!Number.isInteger(offset) || offset<0 || offset>=text.length) return null;

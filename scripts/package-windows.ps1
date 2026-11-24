@@ -52,7 +52,13 @@ try {
     New-Item -ItemType Directory -Force $pluginDir | Out-Null
     Copy-Item $nsisPlugin $pluginDir -Force
     Invoke-Checked npx.cmd @('--yes', '@tauri-apps/cli@2.12.4', 'bundle', '--target', 'x86_64-pc-windows-msvc', '--bundles', 'nsis')
-    Get-ChildItem (Join-Path $buildDir 'x86_64-pc-windows-msvc/release/bundle/nsis') -Filter '*-setup.exe'
+    $version = (Get-Content -LiteralPath 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).version
+    $installerDirectory = Join-Path $buildDir 'x86_64-pc-windows-msvc/release/bundle/nsis'
+    $installerName = "Semantic-Reader-$version-Windows-x64-setup.exe"
+    Get-ChildItem -LiteralPath $installerDirectory -Filter "*_$($version)_x64-setup.exe" | ForEach-Object {
+        Move-Item -LiteralPath $_.FullName -Destination (Join-Path $installerDirectory $installerName) -Force
+    }
+    Get-ChildItem -LiteralPath $installerDirectory -Filter $installerName
 } finally {
     $env:SEMANTIC_READER_SQLITE_SOURCE = $previousSource
     $env:CARGO_TARGET_DIR = $previousTarget

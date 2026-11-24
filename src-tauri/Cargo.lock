@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "semantic-reader"
-version = "0.20.27"
+version = "0.20.28"
 dependencies = [
  "base64 0.22.1",
  "cc",

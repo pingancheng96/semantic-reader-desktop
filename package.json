@@ -1,6 +1,6 @@
 {
   "name": "semantic-reader",
-  "version": "0.20.27",
+  "version": "0.20.28",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "test": "npm run build && cargo test --locked --manifest-path src-tauri/Cargo.toml && node --test scripts/*.test.mjs"
   },
   "dependencies": {
+    "@diffusionstudio/piper-wasm": "1.0.0",
     "@tesseract.js-data/eng": "^1.0.0",
     "onnxruntime-web": "1.31.1",
     "pdfjs-dist": "^5.7.284",

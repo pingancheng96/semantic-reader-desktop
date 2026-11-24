@@ -1,3 +1,4 @@
+import {currentLanguage} from './languages.js';
 import {ReaderToolbar} from './reader-toolbar.js';
 import {ReaderNavigation, readReaderPreference, saveReaderPreference, type ReaderNavigationState} from './reader-navigation.js';
 import {readerGestures} from './reader-gestures.js';
@@ -263,6 +264,7 @@ export function PdfReader<M extends Mark>({id,marks,focused,selection,visible,to
     let cancelled = false;
     let worker:Promise<Worker>|undefined;
     function ocr() {
+      if (currentLanguage().code!=='en') throw Error('此语言暂未配置扫描 PDF 的 OCR；带文字层的 PDF 可以正常使用');
       const tesseract = (window as unknown as {Tesseract:typeof import('tesseract.js')}).Tesseract;
       worker ??= tesseract.createWorker('eng',1,{workerPath:assets('./ocr/worker.min.js'),
         corePath:assets('./ocr/tesseract-core-lstm.wasm.js'),langPath:assets('./ocr/'),

@@ -1,14 +1,15 @@
+import {languageKey} from './languages.js';
 import {React,ReactDOM,call} from './runtime.js';
 
 type Row = {classification_trace?:{index:number;returned:unknown[];mapped:{id:number;code:string;path:string}[]};codes?:string[];id:string;lemma:string;meaning:string;context:string|null;current_code?:string|null;code?:string|null;applied?:boolean;invalid_code?:boolean;returned_code?:string;outside?:boolean;manual?:boolean;alternative?:string;reason?:string;needs_review?:boolean;review_status?:string;ranked_move?:boolean;ranking?:string[];ranked_paths?:{code:string;path:string;score:number}[]};
 type Batch = {rows:Row[];next:string|null;usage?:{total_tokens?:number};usage_incomplete?:boolean};
 type Domain = {code:string;name:string};
 
-const progressPrefix = 'silDirectReviewV1:';
+const progressPrefix = languageKey('silDirectReviewV1:');
 export function clearSilProgress() {
   for (let i=localStorage.length-1; i>=0; i--) {
     const key = localStorage.key(i);
-    if (key?.startsWith(progressPrefix) || key==='silAiReviewV1') localStorage.removeItem(key);
+    if (key?.startsWith(progressPrefix) || key===languageKey('silAiReviewV1')) localStorage.removeItem(key);
   }
 }
 

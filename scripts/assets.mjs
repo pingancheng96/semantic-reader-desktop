@@ -31,3 +31,11 @@ await cp('vendor/foliate','dist/foliate',{recursive:true});
 
 const {build} = await import('esbuild');
 await build({entryPoints:['node_modules/phonemize/dist/index.mjs'],bundle:true,format:'esm',minify:true,outfile:'dist/phonemize.mjs'});
+
+await mkdir('dist/piper',{recursive:true});
+for(const name of ['piper_phonemize.wasm','piper_phonemize.data'])
+  await copyFile('node_modules/@diffusionstudio/piper-wasm/build/'+name,'dist/piper/'+name);
+const phonemizer=await readFile('node_modules/@diffusionstudio/piper-wasm/build/piper_phonemize.js','utf8');
+const {writeFile}=await import('node:fs/promises');
+await writeFile('dist/piper/phonemize.mjs',phonemizer+'\nexport {createPiperPhonemize};\n');
+await cp('vendor/piper','dist/piper/notices',{recursive:true});

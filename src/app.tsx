@@ -1,10 +1,11 @@
+import {languages,currentLanguage,explanationLanguage,languageKey} from './languages.js';
 import {DestinationSelect,SilOrganizer,clearSilProgress} from './sil-organizer.js';
 import {UpdateSettings} from './update-settings.js';
 import {TextLibrary} from './text-library.js';
 import {ReaderToolbar} from './reader-toolbar.js';
 import {ReaderNavigation, readReaderPreference, saveReaderPreference, useReaderNavigation, type ReaderNavigationState} from './reader-navigation.js';
 import {EpubReader} from './epub-reader.js';
-import {PronunciationPanel, PronunciationSettings} from './pronunciation.js';
+import {PronunciationPanel, PronunciationSettings, LanguageSpeechSettings} from './pronunciation.js';
 import {useArticleSearchShortcut} from './article-search.js';
 import {PdfReader} from './pdf-reader.js';
 import {waitForVoice} from './speech-voices.js';
@@ -29,13 +30,14 @@ type Read = {document: Item & {content: string; web_layout?: string | null; pdf?
 type Detail = {group: Group; senses: Sense[]; marks: Mark[]; vocabulary: Vocabulary[]};
 type Selection = {document_id: string; start: number; end: number; surface: string};
 type SavedNote = Sense & {group_name:string; learning?:string|null};
-type Candidates = {context: string; exact: Sense[]; reused: Sense[]; groups: Group[]; notes:SavedNote[]};
+type Candidates = {lookup_lemma?:string;context: string; exact: Sense[]; reused: Sense[]; groups: Group[]; notes:SavedNote[]};
 type GroupFields = {name: string; description: string; vocabulary: string; sil_code?:string|null};
 type Learning = {usage_note: string; example: string; etymology?:string|null; mnemonic?:string|null;
   ipa_uk?:string|null; ipa_us?:string|null; part_of_speech?:string|null;
   related: {expression: string; kind: 'synonym' | 'related' | 'collocation'; note: string}[]};
-type Suggestion = {suggestion: {lemma: string; meaning: string; context_meaning:string; group_id: string | null; sense_id?: string | null; group_reason?: string | null;
-  sil_code?:string|null; group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean};
+type LemmaDecision={requested:string;used:string;accepted:boolean;forced:boolean;reason:string;reason_missing:boolean};
+type Suggestion = {lemma_decision?:LemmaDecision;suggestion: {lemma: string; meaning: string; context_meaning:string; group_id: string | null; sense_id?: string | null; lemma_reason?:string|null; group_reason?: string | null;
+  sil_code?:string|null; group_name?: string; group_description?: string; group_vocabulary?: {expression:string; note:string}[]; confidence: number; learning: Learning}; usage?: {total_tokens?: number|null}; group_check_failed?:boolean; lemma_check_failed?:boolean; candidates?:Candidates};
 const blank = (): GroupFields => ({name: '', description: '', vocabulary: ''});
 const empty: Library = {documents: [], groups: [], undo: 0};
 
@@ -92,7 +94,7 @@ function Pronunciation({ipa, word, locale}: {ipa?:string|null; word:string; loca
 function WordHeading({surface,pos}: {surface:string;pos?:string|null}) {
   return <header className="word-heading">
     <p className="muted">原文词形{pos?.trim() && <> · {pos.trim()}</>}</p>
-    <h2 lang="en">{surface}</h2>
+    <h2 lang={currentLanguage().code}>{surface}</h2>
   </header>;
 }
 
@@ -100,7 +102,7 @@ function LearningPanel({learning, word, hideIpa, hidePos}: {learning: Learning; 
   const kinds = {synonym:'近义表达', related:'相关概念', collocation:'常见搭配'};
   return <section className="learning">
     {!hidePos && learning.part_of_speech && <p className="muted">语境词性（AI） · {learning.part_of_speech}</p>}
-    {!hideIpa && (learning.ipa_uk || learning.ipa_us) && <details className="legacy-ipa">
+    {!hideIpa && currentLanguage().code==='en' && (learning.ipa_uk || learning.ipa_us) && <details className="legacy-ipa">
       <summary>笔记保存的 AI 音标</summary>
       <dl className="word-details"><dt>英式</dt><dd><Pronunciation ipa={learning.ipa_uk} word={word} locale="en-GB"/></dd>
         <dt>美式</dt><dd><Pronunciation ipa={learning.ipa_us} word={word} locale="en-US"/></dd></dl>
@@ -113,9 +115,9 @@ function LearningPanel({learning, word, hideIpa, hidePos}: {learning: Learning; 
     {(learning.usage_note || learning.example || learning.related.length>0) && <>
     <h3>用法与相关表达</h3>
     <p>{learning.usage_note}</p>
-    <blockquote lang="en">{learning.example}</blockquote>
+    <blockquote lang={currentLanguage().code}>{learning.example}</blockquote>
     <ul>{learning.related.map((item,i)=><li key={i}>
-      <b lang="en">{item.expression}</b> <small>{kinds[item.kind]}</small><br/>{item.note}
+      <b lang={currentLanguage().code}>{item.expression}</b> <small>{kinds[item.kind]}</small><br/>{item.note}
     </li>)}</ul>
     </>}
   </section>;
@@ -160,7 +162,7 @@ function GroupSenses({groupId, exclude, lemma, meaning, ai}: {
     {senses?.length ? <ul>{senses.map(sense=>{
       const difference = currentComparison?.rows?.find(row=>row.id===sense.id);
       return <li key={sense.id}>
-        <b lang="en">{sense.lemma}</b> · {sense.meaning}
+        <b lang={currentLanguage().code}>{sense.lemma}</b> · {sense.meaning}
         {difference && <div className="muted">{difference.note}</div>}
       </li>;
     })}</ul> : <p className="muted" role="status">{senses ? '该组暂无其他已收录词项。' :
@@ -275,14 +277,50 @@ function SilRelatedSenses({id,domains,openCategory}:{
         {domains.find(domain=>domain.code===code)?.name ?? code} ↗
       </button>
       {senses.length ? <ul>{senses.map(sense=><li key={sense.id}>
-        <b lang="en">{sense.lemma}</b> · {sense.meaning}
+        <b lang={currentLanguage().code}>{sense.lemma}</b> · {sense.meaning}
       </li>)}</ul> : <p className="muted">此分类暂无其他义项。</p>}
     </section>)}
   </section>;
 }
 
-function SilSenseList({category,query,library,busy,onCount,openCategory,openDocument,move,remove,directOnly}:{
-  category:string;query:string;library:Library;busy:boolean;onCount:(count:number)=>void;openCategory:(code:string)=>void;openDocument:(id:string,mark:string)=>void;move:(sense:Sense,code:string)=>void;remove:(sense:Sense,code:string)=>void;directOnly:boolean;
+type SaveSenseMeaning=(id:string,previous:string,meaning:string)=>Promise<void>;
+function SenseGlossEditor({sense,ai,busy,onSave}:{sense:Sense;ai?:{endpoint:string;model:string};busy:boolean;onSave:SaveSenseMeaning}) {
+  const [editing,setEditing]=useState(false);
+  const [draft,setDraft]=useState(sense.meaning);
+  const [working,setWorking]=useState(false);
+  const [error,setError]=useState('');
+  const [status,setStatus]=useState('');
+  const generation=useRef(0);
+  useEffect(()=>()=>{generation.current++;},[sense.id]);
+  if(!editing)return <button type="button" className="quiet sense-gloss-edit" disabled={busy} onClick={()=>{
+    setDraft(sense.meaning);setError('');setStatus('');setEditing(true);
+  }}>编辑通用释义</button>;
+  return <div className="sense-gloss-editor" role="group" aria-label={`编辑 ${sense.lemma} 的通用释义`}>
+    <label>通用释义<textarea value={draft} maxLength={1200} disabled={busy || working} onChange={event=>setDraft(event.target.value)} autoFocus/></label>
+    <small className="muted">保存后会更新该义项的所有链接，本句释义单独保留。</small>
+    <div className="row">
+      {ai && <button type="button" disabled={busy || working} onClick={()=>void (async()=>{
+        setWorking(true);setError('');setStatus('正在生成 AI 建议…');const request=++generation.current;
+        try {
+          const result=await call<{meaning:string;usage?:{total_tokens?:number}}>('sense_gloss_suggest',{...ai,id:sense.id});
+          if(generation.current!==request)return;
+          setDraft(result.meaning);setStatus('AI 建议已填入，保存后生效'+(typeof result.usage?.total_tokens==='number' ? ` · ${result.usage.total_tokens} tokens` : ''));
+        }catch(error){if(generation.current===request){setError(String(error));setStatus('');}}
+        finally{if(generation.current===request)setWorking(false);}
+      })()}>AI 重新建议</button>}
+      <button type="button" className="primary" disabled={busy || working || !draft.trim() || draft.trim()===sense.meaning} onClick={()=>void (async()=>{
+        setWorking(true);setError('');
+        try {await onSave(sense.id,sense.meaning,draft.trim());setEditing(false);}
+        catch(error){setError(String(error));}finally{setWorking(false);}
+      })()}>保存</button>
+      <button type="button" disabled={busy || working} onClick={()=>{generation.current++;setEditing(false);}}>取消</button>
+    </div>
+    {status && <small role="status">{status}</small>}{error && <p role="alert">{error}</p>}
+  </div>;
+}
+
+function SilSenseList({category,query,library,busy,onCount,openCategory,openDocument,move,remove,directOnly,ai,editMeaning}:{
+  category:string;query:string;library:Library;busy:boolean;onCount:(count:number)=>void;openCategory:(code:string)=>void;openDocument:(id:string,mark:string)=>void;move:(sense:Sense,code:string)=>void;remove:(sense:Sense,code:string)=>void;directOnly:boolean;ai?:{endpoint:string;model:string};editMeaning:SaveSenseMeaning;
 }) {
   const domains = useSilCatalog();
   const [sort,setSort] = useState(()=>readReaderPreference('senseListSort') || 'category');
@@ -327,11 +365,12 @@ function SilSenseList({category,query,library,busy,onCount,openCategory,openDocu
         {silPath(domains,code).split(' › ').at(-1)} <span aria-hidden="true">↗</span>
       </button></h2>}
       <ul>{rows.map(row=><li key={row.id}>
-        <details><summary><b lang="en">{row.lemma}</b> <span>{row.meaning}</span>
+        <details><summary><b lang={currentLanguage().code}>{row.lemma}</b> <span>{row.meaning}</span>
           <small className="sense-link-count" title={`来自 ${new Set(row.links?.map(link=>link.document_id)).size} 篇文本；展开可查看原文`}>
             {row.links?.length ?? 0} 处链接
           </small>
         </summary>
+          <SenseGlossEditor sense={row} ai={ai} busy={busy} onSave={editMeaning}/>
           {row.sil_diagnostic != null && <details>
             <summary>查看上次 AI 分类排错记录</summary>
             <pre style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere'}}>{JSON.stringify(row.sil_diagnostic,null,2)}</pre>
@@ -393,7 +432,7 @@ function SilAudit({code,descendants,count,domains,config,busy,configured,task,re
       {result.invalid_codes.length>0 && <details>
         <summary>查看被跳过的分类编号</summary>
         <ul>{result.invalid_codes.map((entry,index)=><li key={index}>
-          <b lang="en">{entry.lemma}</b> · {entry.meaning} · {entry.action==='add' ? '新增' : '移除'} · <code>{JSON.stringify(entry.value)}</code>
+          <b lang={currentLanguage().code}>{entry.lemma}</b> · {entry.meaning} · {entry.action==='add' ? '新增' : '移除'} · <code>{JSON.stringify(entry.value)}</code>
         </li>)}</ul>
       </details>}
       {result.changes.map(row=>{
@@ -979,7 +1018,7 @@ function Reader({data, visible, focused, onMark, onSelect, editing, busy, beginE
         }
       }
     }}>
-    <div className={web ? 'reading web-reading' + (data.document.source_url ? '' : ' epub-reading') : 'reading'} ref={ref} tabIndex={0} style={{zoom}}
+    <div className={web ? 'reading web-reading' + (data.document.source_url ? '' : ' epub-reading') : 'reading'} ref={ref} lang={currentLanguage().code} dir="auto" tabIndex={0} style={{zoom}}
     onMouseUp={e => {if(e.detail < 2) capture();}} onDoubleClick={() => capture(true)}
     onKeyUp={e => {if (e.shiftKey) capture();}}>
     {web ? web.nodes.map(renderWeb) : lines.map(line => <div key={line.start} className={'line ' + line.kind}>
@@ -1032,6 +1071,9 @@ function App() {
   const selectionRequest = useRef(0);
   const autoAnalysis = useRef(false);
   const [lemma,setLemma] = useState('');
+  const manualLemma=useRef<string|null>(null);
+  const [forceLemma,setForceLemma]=useState(false);
+  const [lemmaDecision,setLemmaDecision]=useState<LemmaDecision|null>(null);
   const [meaning,setMeaning] = useState('');
   const [contextMeaning,setContextMeaning] = useState('');
   const [attachGroup,setAttachGroup] = useState('');
@@ -1057,7 +1099,7 @@ function App() {
   const [model,setModel] = useState(savedAi.model);
   const [keyState,setKeyState] = useState('尚未配置');
   const [autoIpa,setAutoIpa] = useState(()=>localStorage.getItem('autoDictionaryLemma')!=='off');
-  const [pronunciationLibrary,setPronunciationLibrary] = useState(()=>localStorage.getItem('pronunciationLibrary') ?? '');
+  const [pronunciationLibrary,setPronunciationLibrary] = useState(()=>localStorage.getItem(languageKey('pronunciationLibrary')) ?? '');
   const [keyRevision,setKeyRevision] = useState(0);
   const aiConfigured = Boolean(savedAi.endpoint && savedAi.model);
   const [key,setKey] = useState('');
@@ -1149,6 +1191,7 @@ function App() {
   function resetSelection() {
     invalidateSuggestion();
     autoAnalysis.current = false;
+    manualLemma.current=null;setForceLemma(false);setLemmaDecision(null);
     setSelection(null); setCandidate(null); setActiveMark(null); setAiNote(''); setLearning(null); setMarkSuggestion(null);
   }
   async function openDoc(id: string, markId = '') {
@@ -1176,6 +1219,21 @@ function App() {
     if (!imported) return;
     await refresh(); await openDoc(imported.id); setNotice('已导入 ' + imported.title);
   }
+  async function updateSenseMeaning(id:string,previous:string,meaning:string) {
+    if(lock.current)throw Error('请等待当前操作完成');
+    lock.current=true;setBusy(true);
+    try {
+      await call('sense_meaning_update',{id,previous,meaning});
+      const changed=<T extends {sense_id?:string;id?:string;meaning:string}>(item:T):T=>
+        (item.sense_id ? item.sense_id===id : item.id===id) ? {...item,meaning} : item;
+      setRead(data=>data && {...data,marks:data.marks.map(changed)});
+      setActiveMark(mark=>mark && changed(mark));
+      setCandidate(data=>data && {...data,notes:data.notes.map(changed),exact:data.exact.map(changed),reused:data.reused.map(changed)});
+      setDetail(data=>data && {...data,senses:data.senses.map(changed),marks:data.marks.map(changed)});
+      await refresh();setNotice('通用释义已更新');
+    } finally {lock.current=false;setBusy(false);}
+  }
+
   async function deleteSense(id: string) {
     await call('sense_delete',{id});
     setRead(previous=>previous && {...previous,marks:previous.marks.filter(mark=>mark.sense_id!==id)});
@@ -1196,9 +1254,12 @@ function App() {
     setSuggesting(true);
     setAiNote('');
     try {
-      const response = await call<Suggestion>('suggest',{...chosen,...savedAi,ungrouped_capture:true});
+      const userLemma=(forceLemma ? lemma : manualLemma.current)?.trim() || '';
+      const response = await call<Suggestion>('suggest',{...chosen,...savedAi,ungrouped_capture:true,...(userLemma ? {user_lemma:userLemma,force_lemma:forceLemma} : {})});
       if (selectionRequest.current !== request) return;
       const s = response.suggestion;
+      manualLemma.current=null;setLemmaDecision(response.lemma_decision ?? null);
+      if (response.candidates) setCandidate(response.candidates);
       setLearning(s.learning);
       setLemma(s.lemma);setMeaning(s.meaning);setContextMeaning(s.context_meaning);setAttachSense(s.sense_id ?? '');setAttachGroup(s.group_id ?? '');
       if (!s.group_id) {
@@ -1214,7 +1275,9 @@ function App() {
       setAiNote((s.sense_id ? 'AI 建议复用已有义项 · 置信度 ' : 'AI 建议 · 置信度 ') + Math.round(s.confidence*100) + '%' +
         (typeof response.usage?.total_tokens === 'number' ? ' · ' + response.usage.total_tokens + ' tokens' : '') +
         (s.group_reason ? ' · ' + s.group_reason : '') +
-        (response.group_check_failed ? ' · 语义组补查未完成，请核对归组。' : ''));
+        (response.group_check_failed ? ' · 语义组补查未完成，请核对归组。' : '') +
+        (response.lemma_check_failed ? ' · 原形补查未完成，可手动选择已有义项。' : '') +
+        (userLemma ? (s.lemma_reason ? ' · '+s.lemma_reason : s.lemma.trim().toLowerCase()!==userLemma.toLowerCase() ? ' · AI 返回的原形与手填不同，请核对。' : ' · 已参考手填原形。') : ''));
     } catch (error) {
       if (selectionRequest.current === request) {
         setAiNote(error instanceof Error ? error.message : String(error));
@@ -1223,6 +1286,19 @@ function App() {
       if (selectionRequest.current === request) setSuggesting(false);
     }
   }
+
+  useEffect(()=>{
+    if (!selection || suggesting || !lemma.trim() || lemma.trim().toLowerCase()===selection.surface.trim().toLowerCase()) return;
+    if (candidate?.lookup_lemma?.trim().toLowerCase()===lemma.trim().toLowerCase()) return;
+    let active=true;
+    const request=selectionRequest.current;
+    const timer=window.setTimeout(()=>{
+      void call<Candidates>('candidates',{...selection,lookup_lemma:lemma.trim(),...(forceLemma ? {user_lemma:lemma.trim(),force_lemma:true} : {})}).then(options=>{
+        if(active && selectionRequest.current===request)setCandidate(options);
+      },()=>{});
+    },250);
+    return ()=>{active=false;window.clearTimeout(timer);};
+  },[selection,lemma,suggesting,forceLemma]);
 
   function openMarkNote(mark: Mark) {
     resetSelection();
@@ -1236,6 +1312,7 @@ function App() {
     const request = ++selectionRequest.current;
     const automatic = doubleClick && autoSuggest && aiConfigured;
     autoAnalysis.current = automatic;
+    manualLemma.current=null;setForceLemma(false);setLemmaDecision(null);
     setSuggesting(automatic);
     setSelection(s); setActiveMark(null); setCandidate(null); setAiNote(''); setLearning(null);
     setLemma(s.surface); setMeaning(''); setContextMeaning(''); setAttachGroup(''); setAttachSense(''); setNewFields(blank());
@@ -1243,7 +1320,7 @@ function App() {
       if (selectionRequest.current !== request) return;
       setCandidate(options);
       if (options.reused.length === 1) {
-        setAttachSense(options.reused[0].id);
+        setAttachSense(options.reused[0].id);setLemma(options.reused[0].lemma);
         setAiNote('找到相同语境的既有义项，请核对后保存。');
         setSuggesting(false);
       } else if (automatic) {
@@ -1259,7 +1336,8 @@ function App() {
     e.preventDefault();
     void task(action);
   }
-  const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()];
+  const candidateSenses = [...new Map([...(candidate?.reused ?? []),...(candidate?.exact ?? [])].map(s => [s.id,s])).values()]
+    .filter(sense=>!forceLemma || sense.lemma.trim().toLowerCase()===lemma.trim().toLowerCase());
   const selectedSense = candidateSenses.find(sense=>sense.id===attachSense);
   const silDomains = useSilCatalog();
   const [silFilter,setSilFilter] = useState('');
@@ -1303,7 +1381,9 @@ function App() {
         <button aria-current={mode==='help' ? 'page' : undefined} className={mode==='help'?'current':''}
           onClick={() => setMode('help')}>使用说明</button>
       </nav>
-      <span className="local">● 本地词汇库</span>
+      <label className="language-switch">学习语言<select value={currentLanguage().code} disabled={busy || suggesting || organizing || editing} onChange={event=>{
+        localStorage.setItem('learningLanguage',event.target.value);window.location.reload();
+      }}>{languages.map(language=><option key={language.code} value={language.code}>{language.name} · {language.native}</option>)}</select></label>
     </header>
     <div className="status" aria-live="polite">{error ? <span className="error" role="alert">{error}</span> : busy ? '处理中…' : notice}</div>
     <div className={mode==='reader'
@@ -1477,8 +1557,10 @@ function App() {
             </section>
             <section className="word-meaning">
               <h3>通用释义{activeMark.lemma && activeMark.lemma.trim().toLowerCase()!==activeMark.surface.trim().toLowerCase() &&
-                <> <small>原形 · <b lang="en">{activeMark.lemma}</b></small></>}</h3>
+                <> <small>原形 · <b lang={currentLanguage().code}>{activeMark.lemma}</b></small></>}</h3>
               <p>{activeMark.meaning}</p>
+              <SenseGlossEditor key={activeMark.sense_id} sense={{id:activeMark.sense_id,lemma:activeMark.lemma,meaning:activeMark.meaning,group_id:activeMark.group_id}}
+                ai={aiConfigured ? savedAi : undefined} busy={busy} onSave={updateSenseMeaning}/>
             </section>
             <SilRelatedSenses key={activeMark.sense_id} id={activeMark.sense_id} domains={silDomains}
               openCategory={code=>{
@@ -1527,27 +1609,43 @@ function App() {
             {candidate?.notes.length ? <section className="saved-notes">
               <h3>词库笔记</h3>
               {candidate.notes.length > 1 && <p className="muted">找到多个义项，请按当前语境查看。</p>}
-              {candidate.notes.map(note=><div className="saved-note" key={note.id}>
+              {candidate.notes.filter(note=>!forceLemma || note.lemma.trim().toLowerCase()===lemma.trim().toLowerCase()).map(note=><div className="saved-note" key={note.id}>
                 <b>{note.lemma}</b><p>{note.meaning}</p>
                 {note.learning && <LearningPanel hideIpa learning={readLearning(note.learning)!} word={note.lemma}/>}
                 <div className="row">
                   <button className="quiet" disabled={busy} onClick={()=>openLibrarySense(note.lemma)}>在语义库查看 →</button>
-                  <button disabled={busy || suggesting} onClick={()=>{setAttachSense(note.id);setLearning(null);}}>复用此义项</button>
+                  <button disabled={busy || suggesting} onClick={()=>{setAttachSense(note.id);setLemma(note.lemma);manualLemma.current=null;setLearning(null);}}>复用此义项</button>
                 </div>
               </div>)}
             </section> : null}
             {candidate && <blockquote>{candidate.context}</blockquote>}
-            <button disabled={busy || suggesting || !aiConfigured} onClick={()=>void suggestSelection(selection, selectionRequest.current)}>
-              {suggesting ? '正在请求 AI 建议…' : '请求 AI 建议'}
+            <label>原形或表达<input value={lemma} disabled={busy || suggesting} maxLength={240} onChange={e=>{
+              manualLemma.current=e.target.value;setLemma(e.target.value);setAttachSense('');setLemmaDecision(null);
+            }}/></label>
+            <label className="check"><input type="checkbox" checked={forceLemma} disabled={busy || suggesting || !lemma.trim()} onChange={e=>{
+              setForceLemma(e.target.checked);manualLemma.current=lemma;setAttachSense('');
+            }}/>固定此原形（AI 不能改写，保存也使用此原形）</label>
+            <button disabled={busy || suggesting || !aiConfigured} onClick={()=>void suggestSelection(selection, ++selectionRequest.current)}>
+              {suggesting ? '正在请求 AI 建议…' : forceLemma ? '按固定原形请求 AI 建议' : manualLemma.current?.trim() ? '按手填原形请求 AI 建议' : '请求 AI 建议'}
             </button>
+            {manualLemma.current?.trim() && <p className="muted">本次将参考手填原形：{manualLemma.current.trim()}</p>}
             {!aiConfigured ? <p className="muted">可在设置中配置 AI，或直接手动收录。</p> : null}
+            {lemmaDecision && <section className="lemma-decision" role="status">
+              <p><b>{lemmaDecision.forced ? '原形已固定' : lemmaDecision.accepted ? '已采用手填原形' : '未采用手填原形'}</b></p>
+              <p>手填：{lemmaDecision.requested} · 本次使用：{lemmaDecision.used}</p>
+              <p>{lemmaDecision.reason}</p>
+              {!lemmaDecision.accepted && <button type="button" disabled={busy || suggesting} onClick={()=>{
+                const requested=lemmaDecision.requested;manualLemma.current=requested;setLemma(requested);setForceLemma(true);
+                setAttachSense('');setAttachGroup('');setMeaning('');setContextMeaning('');setLearning(null);setAiNote('已固定手填原形，请重新请求 AI 建议，或手动填写释义。');setLemmaDecision(null);
+              }}>强制使用「{lemmaDecision.requested}」</button>}
+            </section>}
             {aiNote && <p className="muted" role="status">{aiNote}</p>}
             {learning && <LearningPanel hidePos hideIpa learning={learning} word={selection.surface}/>}
             <form onSubmit={e=>submit(e,async ()=>{
               const savedLearning = learning ?? readLearning(candidate?.notes.find(note=>note.id===attachSense)?.learning);
               const markId = await call<string>('annotate',{...selection,lemma,meaning,context_meaning:contextMeaning,learning:savedLearning,
                 sense_id:attachSense || null,group_id:attachGroup || null,
-                ungrouped_capture:true});
+                ...(forceLemma ? {force_lemma:true,user_lemma:lemma.trim()} : {}),ungrouped_capture:true});
               window.getSelection()?.removeAllRanges();
               const updated = await call<Read>('document',{id:selection.document_id});
               const savedMark = updated.marks.find(mark=>mark.id===markId);
@@ -1559,7 +1657,7 @@ function App() {
               setNotice('标注已保存');
             })}>
               <fieldset className="annotation-fields" disabled={suggesting}>
-              {candidateSenses.length > 0 && <label>复用既有义项<select value={attachSense} onChange={e=>setAttachSense(e.target.value)}>
+              {candidateSenses.length > 0 && <label>复用既有义项<select value={attachSense} onChange={e=>{setAttachSense(e.target.value);const chosen=candidateSenses.find(sense=>sense.id===e.target.value);if(chosen){setLemma(chosen.lemma);manualLemma.current=null;}}}>
                 <option value="">填写新义项</option>
                 {candidateSenses.map(s=><option key={s.id} value={s.id}>{s.lemma} · {s.meaning}</option>)}
               </select></label>}
@@ -1567,16 +1665,17 @@ function App() {
                 placeholder="可留空，沿用通用释义" onChange={e=>setContextMeaning(e.target.value)}/></label>
               {selectedSense && <section className="word-meaning">
                 <h3>通用释义{selectedSense.lemma.trim().toLowerCase()!==selection.surface.trim().toLowerCase() &&
-                  <> <small>原形 · <b lang="en">{selectedSense.lemma}</b></small></>}</h3>
+                  <> <small>原形 · <b lang={currentLanguage().code}>{selectedSense.lemma}</b></small></>}</h3>
                 <p>{selectedSense.meaning}</p>
+                <SenseGlossEditor key={selectedSense.id} sense={selectedSense} ai={aiConfigured ? savedAi : undefined} busy={busy} onSave={updateSenseMeaning}/>
               </section>}
               {!attachSense && <>
-                <label>原形或表达<input value={lemma} required maxLength={240} onChange={e=>setLemma(e.target.value)}/></label>
+
                 <label><span>通用释义{lemma.trim() && lemma.trim().toLowerCase()!==selection.surface.trim().toLowerCase() &&
-                  <> <small>原形 · <b lang="en">{lemma.trim()}</b></small></>}</span><textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
+                  <> <small>原形 · <b lang={currentLanguage().code}>{lemma.trim()}</b></small></>}</span><textarea value={meaning} required maxLength={1200} onChange={e=>setMeaning(e.target.value)}/></label>
                 <p className="muted">新义项将收录到「未归类」。</p>
               </>}
-              <button className="primary full" disabled={busy}>确认收录</button>
+              <button className="primary full" disabled={busy || !lemma.trim()}>确认收录</button>
               </fieldset>
             </form>
           </> : <p className="muted">双击词语查看词库笔记，或选中短语开始收录。</p>}
@@ -1595,7 +1694,7 @@ function App() {
             refresh={async()=>{await refresh();setNotice('分类调整已应用');}}/>)}
         <SilSenseList key={silFilter + ':' + directOnly + ':' + filter}
           directOnly={directOnly || silFilter==='unclassified'} category={silFilter} query={filter} library={lib} busy={busy}
-          onCount={setAuditCount}
+          onCount={setAuditCount} ai={aiConfigured ? savedAi : undefined} editMeaning={updateSenseMeaning}
           openCategory={code=>{
             setQuery('');setFilter('');setDirectOnly(false);setSilOrganizerCategory(null);setSilFilter(code);
           }}
@@ -1635,11 +1734,19 @@ function App() {
             await call('key_remove',savedAi);setKeyRevision(v=>v+1);setKey('');setNotice('已清除当前地址的密钥');
           })}>清除密钥</button></div>
         </section>
-        <PronunciationSettings active={pronunciationLibrary} select={id=>{
-          setPronunciationLibrary(id);localStorage.setItem('pronunciationLibrary',id);
+        <section><h2>语言</h2>
+          <p>当前学习语言：{currentLanguage().name}。文本和词库保存在此语言的独立空间中，导入文件使用当前语言。已有词库保留在英语空间。</p>
+          <label>释义语言<select defaultValue={explanationLanguage().code} disabled={busy} onChange={event=>{
+            localStorage.setItem('explanationLanguage',event.target.value);window.location.reload();
+          }}>{languages.map(language=><option key={language.code} value={language.code}>{language.name}</option>)}</select></label>
+          <p className="muted">切换释义语言影响之后的 AI 建议，已有释义会保留。JSON 导出包含全部语言空间，本地快照仅针对当前语言。</p>
+        </section>
+        <LanguageSpeechSettings/>
+        {currentLanguage().code==='en' ? <PronunciationSettings active={pronunciationLibrary} select={id=>{
+          setPronunciationLibrary(id);localStorage.setItem(languageKey('pronunciationLibrary'),id);
         }} autoIpa={autoIpa} setAutoIpa={enabled=>{
           setAutoIpa(enabled);localStorage.setItem('autoDictionaryLemma',enabled?'on':'off');
-        }}/>
+        }}/> : <section><h2>音标</h2><p>AI 音标与朗读独立，音标加载失败也可以播放发音。</p><label className="check"><input type="checkbox" checked={autoIpa} onChange={event=>{setAutoIpa(event.target.checked);localStorage.setItem('autoDictionaryLemma',event.target.checked?'on':'off');}}/>缺少音标时允许 AI 补充</label></section>}
         <LibraryGlossOrganizer busy={busy} configured={aiConfigured}
           scan={(resume,receive,stopped)=>void task(async()=>{
             if (!resume) setSnapshots(await call<Snapshot[]>('snapshot_create'));
@@ -1659,14 +1766,14 @@ function App() {
             setNotice(`已写入 ${result.applied} 条释义${result.conflicts ? `，跳过 ${result.conflicts} 条重复释义` : ''}`);
           })}/>
         <section><h2>备份与恢复</h2>
-          <p>快照保存在这台设备，包含文章、网页图片、语义库、标签、原文标注和学习笔记。</p>
+          <p>快照只保存当前语言，保存在这台设备，包含文章、网页图片、语义库、标签、原文标注和学习笔记。</p>
           <button disabled={busy} onClick={()=>void task(async()=>{
             const items = await call<Snapshot[]>('snapshot_create');
             setSnapshots(items);
             setSnapshotId(items[0]?.id ?? '');
             setConfirmSnapshot(null);setBackupPreview(null);
             setNotice('备份已自动保存');
-          })}>导出备份</button>
+          })}>保存当前语言快照</button>
           <button type="button" disabled={busy} onClick={()=>void task(async()=>{
             if (!window.confirm('把所有义项退回「未归类」？将先创建词库备份。语义组、释义和原文标注都会保留。')) return;
             const items = await call<Snapshot[]>('snapshot_create');
@@ -1726,6 +1833,7 @@ function App() {
           {backupPreview && <BackupPreview key={backupPreview.name} {...backupPreview} close={()=>setBackupPreview(null)}/>}
         </section>
         <section><h2>外部文件</h2>
+          <button disabled={busy} onClick={()=>void task(async()=>{if(await exportFile())setNotice('全部语言空间已导出');})}>导出全部语言备份</button>
           <button disabled={busy} onClick={()=>previewFile.current?.click()}>查看导出的 JSON</button>
           <input hidden ref={previewFile} type="file" accept=".json,application/json" onChange={e=>{
             const input=e.currentTarget.files?.[0];e.currentTarget.value='';
@@ -1736,7 +1844,7 @@ function App() {
           }}/>
           <button disabled={busy} onClick={()=>void task(async()=>{
             if (await restoreBackupFile()) {await refresh();setNotice('词汇库已恢复');}
-          })}>从 JSON 恢复到空词汇库</button>
+          })}>从 JSON 恢复各语言空间</button>
           {read && <button disabled={busy} onClick={()=>void task(async()=>{if(await exportFile(read.document.id)) setNotice('已导出原文');})}>导出当前原文</button>}
           {backupPreview && <BackupPreview key={backupPreview.name} {...backupPreview} close={()=>setBackupPreview(null)}/>}
         </section>
@@ -1754,6 +1862,15 @@ type BackupPreviewData = {
 };
 
 function parseBackupPreview(value:unknown):BackupPreviewData {
+  const bundle=value as {kind?:string;spaces?:unknown[]}|null;
+  if (bundle?.kind==='semantic-reader-languages') {
+    if (!Array.isArray(bundle.spaces)) throw Error('多语言备份无效');
+    const previews=bundle.spaces.map(parseBackupPreview);
+    return {
+      documents:previews.flatMap(item=>item.documents),semantic_groups:previews.flatMap(item=>item.semantic_groups),
+      expressions:previews.flatMap(item=>item.expressions),senses:previews.flatMap(item=>item.senses),occurrences:previews.flatMap(item=>item.occurrences)
+    };
+  }
   const data = value as Record<string,unknown> | null;
   const tables = {
     documents:['id','title','content'],semantic_groups:['id','name','description'],
@@ -1885,4 +2002,27 @@ function Reclassify({groups,selectedMarks,reclassMeaning,setReclassMeaning,busy,
   </form>;
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(<App/>);
+function LanguageStart() {
+  const [selected,setSelected]=useState(()=>localStorage.getItem('learningLanguage') || '');
+  const [draft,setDraft]=useState('en');
+  const [ready,setReady]=useState(false);
+  const [error,setError]=useState('');
+  const [retry,setRetry]=useState(0);
+  useEffect(()=>{
+    if (!selected) return;
+    let active=true;
+    void call('workspace_open').then(()=>{if(active)setReady(true);},error=>{if(active)setError(String(error));});
+    return ()=>{active=false;};
+  },[selected,retry]);
+  if (ready) return <App/>;
+  return <main className="language-start"><img src="./icon.png" alt=""/><h1>选择学习语言</h1>
+    <p>每种语言有独立的文本库和语义库，之后可以随时切换。已有数据保留在英语空间。</p>
+    {!selected && <form onSubmit={event=>{event.preventDefault();localStorage.setItem('learningLanguage',draft);window.location.reload();}}>
+      <label>学习语言<select value={draft} onChange={event=>setDraft(event.target.value)}>{languages.map(language=><option key={language.code} value={language.code}>{language.name} · {language.native}</option>)}</select></label>
+      <button className="primary">开始学习</button>
+    </form>}
+    {selected && !error && <p role="status">正在打开{currentLanguage().name}学习空间…</p>}
+    {error && <><p role="alert">{error}</p><button onClick={()=>{setError('');setRetry(value=>value+1);}}>重试</button></>}
+  </main>;
+}
+ReactDOM.createRoot(document.getElementById('root')!).render(<LanguageStart/>);

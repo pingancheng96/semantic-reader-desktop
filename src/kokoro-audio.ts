@@ -30,13 +30,13 @@ export function phonemeIds(ipa:string, locale:'en-GB'|'en-US') {
   return ids;
 }
 
-export function wave(samples:Float32Array) {
+export function wave(samples:Float32Array,sampleRate=24000) {
   const buffer = new ArrayBuffer(44+samples.length*2);
   const header = new DataView(buffer);
   const text = (offset:number,value:string)=>[...value].forEach((character,index)=>header.setUint8(offset+index,character.charCodeAt(0)));
   text(0,'RIFF');header.setUint32(4,buffer.byteLength-8,true);
   text(8,'WAVEfmt ');header.setUint32(16,16,true);header.setUint16(20,1,true);
-  header.setUint16(22,1,true);header.setUint32(24,24000,true);header.setUint32(28,48000,true);
+  header.setUint16(22,1,true);header.setUint32(24,sampleRate,true);header.setUint32(28,sampleRate*2,true);
   header.setUint16(32,2,true);header.setUint16(34,16,true);
   text(36,'data');header.setUint32(40,samples.length*2,true);
   samples.forEach((value,index)=>header.setInt16(44+index*2,Math.round(Math.max(-1,Math.min(1,value))*32767),true));

@@ -1,13 +1,14 @@
+import {languageKey} from './languages.js';
 import type {ReactNode} from 'react';
 import {React} from './runtime.js';
 
 export function readReaderPreference(key:string) {
-  try { return localStorage.getItem(key) ?? ''; }
+  try { return localStorage.getItem(languageKey(key)) ?? ''; }
   catch { return ''; }
 }
 
 export function saveReaderPreference(key:string,value:string) {
-  try { localStorage.setItem(key,value); }
+  try { localStorage.setItem(languageKey(key),value); }
   catch { /* Reading remains available if local storage is unavailable. */ }
 }
 
